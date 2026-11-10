@@ -1,0 +1,42 @@
+[workspace]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+name = "vnet"
+path = "src/lib.rs"
+
+[package]
+name = "vnet"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "vnet - UDP-first P2P tunnel with relay fallback, based on RFC 8445 (ICE) / RFC 8489 (STUN)"
+
+[[bin]]
+name = "vnet"
+path = "src/main.rs"
+
+[[bin]]
+name = "vnet-relay"
+path = "src/relay_server.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+x25519-dalek = "2"
+ed25519-dalek = "2"
+sha2 = "0.10"
+hmac = "0.12"
+bytes = "1"
+socket2 = "0.5"
+futures-util = "0.3"
+anyhow = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = true
+

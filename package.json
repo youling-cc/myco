@@ -1,0 +1,13 @@
+{
+  "name": "myco",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "npm run test:phone && npm run test:identity",
+    "test:phone": "cd apps/phone && npx vitest run",
+    "test:home-ui": "cd apps/home/ui && npx vitest run",
+    "test:identity": "cd services/identity-svc && node --test",
+    "test:rust": "cd apps/home/src-tauri && cargo test --no-default-features",
+    "test:all": "npm run test:phone && npm run test:home-ui && npm run test:identity && npm run test:rust"
+  }
+}

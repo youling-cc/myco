@@ -1,0 +1,22 @@
+{
+  "name": "@myco/ui-kit",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./biolum.css": "./src/biolum.css",
+    "./TitleBar": "./src/TitleBar.tsx",
+    "./scanAddOrder": "./src/scanAddOrder.ts",
+    "./cameraError": "./src/cameraError.ts",
+    "./backupMask": "./src/backupMask.ts"
+  },
+  "peerDependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.0.12"
+  }
+}

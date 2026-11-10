@@ -1,0 +1,23 @@
+# Build artifacts
+node_modules/
+target/
+dist/
+build/
+*.apk
+*.idsig
+*.exe
+*.log
+*.db
+*.sqlite
+# Rust
+# (Cargo.lock SHOULD be committed for apps)
+# Editor/OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+# Local experiments (never commit)
+.reply-*
+.notify-*
+.tmp*/
+*.tmp.md

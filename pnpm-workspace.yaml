@@ -1,0 +1,16 @@
+# S2 pnpm workspace(2026-08-18 起)
+# 显式名单而非 apps/*/ui 通配:phone(@phone alias 未收编)暂不入列,待 S2-b 收编——
+# 避免 workspace 重链 node_modules 打断在跑的 dev/exe 链路。
+# (2026-10-06 env 退役删除:env/ui 真依赖已 git mv 进 apps/home/ui/src,@wsui 指向自身)
+packages:
+  - 'packages/*'
+  - 'apps/fleet-web'
+  - 'apps/monitor/ui'
+  - 'apps/todo/ui'
+  - 'apps/board/ui'
+  - 'apps/dock/ui'
+  - 'apps/chatwin/ui'
+  - 'apps/home/ui'
+  - 'apps/term/ui'
+  - 'apps/graph/ui'
+  - 'apps/media/ui'

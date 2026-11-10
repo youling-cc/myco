@@ -1,0 +1,13 @@
+{
+  "name": "myco-identity-svc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "myco DID 身份 + presence + WebRTC 信令服务（零依赖，Node 内置模块）",
+  "engines": { "node": ">=22" },
+  "main": "identity-server.mjs",
+  "scripts": {
+    "start": "node identity-server.mjs",
+    "test": "node --test *.test.mjs identity/*.test.mjs"
+  }
+}

@@ -1,0 +1,3155 @@
+//! vnet connection manager - racing + continuous probing + auto-switching
+//! One process = one relay socket = one registered address.
+//! All threads share this socket so the relay always knows where to send data.
+
+use crate::vnet::pathpipe::{index_of, PathPipe, PipeKind, RPolicy};
+use crate::vnet::relay::RelayClient;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DataPath {
+    Relay,
+    P2PUdp,
+    P2PIpv6,
+}
+
+impl DataPath {
+    pub fn name(&self) -> &'static str {
+        match self {
+            DataPath::Relay => "Relay",
+            DataPath::P2PUdp => "P2P UDP",
+            DataPath::P2PIpv6 => "P2P IPv6",
+        }
+    }
+    pub fn is_direct(&self) -> bool { !matches!(self, DataPath::Relay) }
+}
+
+/// DataPath <-> PipeKind 映射（决策层只认 PipeKind，执行层只认 DataPath）
+fn data_path_kind(p: DataPath) -> PipeKind {
+    match p {
+        DataPath::Relay => PipeKind::Relay,
+        DataPath::P2PUdp => PipeKind::P2pV4,
+        DataPath::P2PIpv6 => PipeKind::P2pV6,
+    }
+}
+
+/// A（动作执行体）：把 pick_pipe 的决议落到 path / p2p 通道上。
+/// - Relay：直接切（清 P2P 通道，复用「P2P->Relay 清通道」既有语义）
+/// - 直连：目标族通道存在才切（Relay->P2p 由通道存在性决定）；
+///   首选族暂无通道、但现有通道族仍可选时，落到现有通道族（直连优先，下一事件再升级）
+/// 锁纪律：逐条获取、立即释放，绝不嵌套（RDV6 verify 块存在 p2p->path 序，反向嵌套会死锁）。
+/// 切换计数（path_switches）由本函数统一维护——「含义不变，只改由谁递增」。
+fn apply_decision(
+    pipes: &Arc<Mutex<Vec<PathPipe>>>,
+    policy: &RPolicy,
+    path: &Arc<Mutex<DataPath>>,
+    p2p: &Arc<Mutex<P2pRegistry>>,
+    switches: &Arc<Mutex<u32>>,
+) {
+    let pick = {
+        let mut ps = pipes.lock().unwrap();
+        for p in ps.iter_mut() {
+            p.update_derived(policy);
+        }
+        crate::vnet::pathpipe::pick_pipe(&ps, policy)
+    };
+    let cur_kind = data_path_kind(*path.lock().unwrap());
+    if pick == cur_kind {
+        // 稳定在同一选择 → 重置待定计数（防偶发抖动累积）
+        STABLE_PICK_COUNT.store(0, Ordering::Relaxed);
+        return;
+    }
+    // ── 滞回（hysteresis）：升级需连续 N 次同一选择才执行，降级立即 ──
+    // 场景：P2P 证据短暂波动导致 pick 在 Relay/P2P 间快速跳变。
+    // 不加这个，实测 1675 轮探测产生 15539 次切换（≈9 次/轮）。
+    if pick != PipeKind::Relay {
+        let prev = STABLE_PENDING_KIND.load(Ordering::Relaxed);
+        if prev == pick as u64 {
+            let cnt = STABLE_PICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if cnt < HYSTERESIS_N {
+                return; // 还不够稳定，继续等
+            }
+        } else {
+            STABLE_PENDING_KIND.store(pick as u64, Ordering::Relaxed);
+            STABLE_PICK_COUNT.store(1, Ordering::Relaxed);
+            return; // 第一次选它，从 1 开始计
+        }
+    } else {
+        // 降级到 Relay：立即执行，不等（数据面停滞不能多等）
+        STABLE_PICK_COUNT.store(0, Ordering::Relaxed);
+    }
+    // VNET_NO_P2P=1 诊断门：绝不升级离 Relay（纯中继对照语义）。
+    // 中央 choke 点——无论哪个线程的观察/调用，诊断开关全局成立。降级不受影响。
+    if pick != PipeKind::Relay
+        && std::env::var("VNET_NO_P2P").unwrap_or_default() == "1"
+    {
+        return;
+    }
+    // 黑盒回归修复：只认**已通过双向验证的通道**（REQUEST 敲门创建的未验证通道
+    // 不承载业务——管道级 verified 可能来自另一个 socket 的证据，不能背书槽内通道）
+    let chan_kind = p2p.lock().unwrap().active_channel().and_then(|ch| {
+        if !ch.verified.get() {
+            return None;
+        }
+        Some(if ch.is_ipv6 { PipeKind::P2pV6 } else { PipeKind::P2pV4 })
+    });
+    // 通道约束下的有效目标
+    let want = match pick {
+        PipeKind::Relay => Some(PipeKind::Relay),
+        k => {
+            if chan_kind == Some(k) {
+                Some(k)
+            } else if let Some(ck) = chan_kind {
+                // 首选族无通道：现有通道族仍可选则先用它（直连优先）
+                let selectable = {
+                    let ps = pipes.lock().unwrap();
+                    let pp = &ps[index_of(ck)];
+                    pp.s_selectable && pp.o_ack_ratio >= policy.r_min_ack_ratio
+                };
+                if selectable { Some(ck) } else { None }
+            } else {
+                None
+            }
+        }
+    };
+    let want = match want {
+        Some(k) if k != cur_kind => k,
+        _ => return,
+    };
+    let new_path = match want {
+        PipeKind::Relay => DataPath::Relay,
+        PipeKind::P2pV4 => DataPath::P2PUdp,
+        PipeKind::P2pV6 => DataPath::P2PIpv6,
+    };
+    *path.lock().unwrap() = new_path;
+    // 黑盒回归修复：证据降级不清 P2P 通道（与原 30s 兜底语义一致）。清通道 =
+    // ARQ 序号归零，对端在途流在 64 窗口内把新包全判重复吞掉（5/5 超时的
+    // 另一台发动机）。真死通道由调用方在调用点清（watchdog 停滞 / forward 发送失败）。
+    *switches.lock().unwrap() += 1;
+    println!("  [PATH] decision: {:?} -> {:?} (evidence-based)", cur_kind, want);
+}
+
+/// 黑盒回归修复（跨流污染）：收到密封数据帧的 socket 与槽内通道的 socket 不一致时，
+/// 该帧属于已被替换/已清掉的旧通道（对端旧流的残余重传）——用新流的接收器处理它
+/// 只会把幽灵包灌进乱序缓存、污染接收窗，把后续真包永远堵在缓存里。丢弃（限流打印）。
+fn drop_ghost(tag: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    if k < 3 {
+        println!("  [PATH] drop frame for foreign channel ({})", tag);
+    }
+}
+
+/// 多连接数据分发中心。
+///
+/// 背景：早期实现里客户端是「accept → forward()（阻塞跑完）→ 再 accept」，
+/// 只要有一条连接的对端不发 EOF（例如客户端进程挂住、socket 未关），
+/// up 线程就会永远自旋，forward() 永不返回，accept 循环被永久堵死，
+/// 整条隧道数据面卡死（30 分钟验收实测在第 2111 条连接后复现）。
+///
+/// 现在每条连接有自己的队列，accept 循环把 forward 丢到线程里，互不阻塞。
+/// 隧道只有一条对端流，所以按「最近一次上行发送的连接」作为 owner 路由下行数据，
+/// 避免多条连接互相偷数据。
+pub struct ConnHub {
+    next_id: u64,
+    owner: u64,
+    queues: std::collections::HashMap<u64, std::collections::VecDeque<Vec<u8>>>,
+}
+
+impl ConnHub {
+    pub fn new() -> Self {
+        Self { next_id: 0, owner: 0, queues: std::collections::HashMap::new() }
+    }
+    pub fn register(&mut self) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.queues.insert(id, std::collections::VecDeque::new());
+        id
+    }
+    pub fn unregister(&mut self, id: u64) {
+        self.queues.remove(&id);
+        if self.owner == id { self.owner = 0; }
+    }
+    /// 连接开始发上行数据 -> 成为 owner，下行数据归它
+    pub fn claim(&mut self, id: u64) { self.owner = id; }
+    /// 接收线程投递下行数据给当前 owner
+    pub fn push(&mut self, data: Vec<u8>) {
+        use std::sync::atomic::Ordering as DO;
+        let pn = DIAG_HUB_PUSH.fetch_add(1, DO::Relaxed);
+        if data.len() > 1100 || pn < 20 {
+            println!("  [DIAG] HUB_PUSH#{}: {}B owner={}",
+                pn, data.len(), self.owner);
+        }
+        // 防泄漏：ARQ ACK 帧头（type=2, 11 字节全零头）绝不该出现在应用载荷中。
+        // 极低频出现（2/~500 连接），根因疑似通道重建 + ARQ reset 时序竞争导致
+        // verify 的 ACK 帧被误交付。过滤并打日志，不清根因但保证应用面干净。
+        if data.len() == 11 && data[0] == 0x02 && data[1..11] == [0u8; 10] {
+            eprintln!("[HUB-LEAK] filtered ARQ ACK frame header from app payload");
+            return;
+        }
+        if let Some(q) = self.queues.get_mut(&self.owner) {
+            q.push_back(data);
+        }
+    }
+    pub fn pop(&mut self, id: u64) -> Option<Vec<u8>> {
+        self.queues.get_mut(&id).and_then(|q| q.pop_front())
+    }
+    pub fn pending(&self, id: u64) -> usize {
+        self.queues.get(&id).map(|q| q.len()).unwrap_or(0)
+    }
+}
+
+/// 运行态状态文件路径。`VNET_STATUS_FILE` 可覆盖，默认写到系统临时目录。
+/// 供 `vnet status` 读取——运行中的进程每秒刷新一次。
+pub fn status_file_path() -> std::path::PathBuf {
+    match std::env::var("VNET_STATUS_FILE") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::env::temp_dir().join("vnet-status.txt"),
+    }
+}
+
+/// 按 role+peer_id 分文件，避免同机多实例（server/client）互相覆盖。
+/// 之前只用单一 vnet-status.txt，server 不写、client 写，导致 `vnet status`
+/// 在 server 机器上读到的是历史残留的 client 文件（已实测踩到）。
+pub fn status_file_path_for(role: &str, peer_id: u32) -> std::path::PathBuf {
+    match std::env::var("VNET_STATUS_FILE") {
+        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::env::temp_dir().join(format!("vnet-status-{}-{}.txt", role, peer_id)),
+    }
+}
+
+/// 列出临时目录下所有 vnet 状态文件（供 `vnet status` 全量展示）
+pub fn list_status_files() -> Vec<std::path::PathBuf> {
+    let dir = std::env::temp_dir();
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("vnet-status") && name.ends_with(".txt") {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// 写运行态状态（key=value 每行一条）。失败静默——状态输出不该影响隧道。
+pub fn write_status(fields: &[(&str, String)]) {
+    write_status_at(&status_file_path(), fields);
+}
+
+/// 写到指定路径（server/client 各用不同文件名，互不覆盖）
+pub fn write_status_at(path: &std::path::Path, fields: &[(&str, String)]) {
+    let mut body = String::new();
+    for (k, v) in fields {
+        body.push_str(&format!("{}={}\n", k, v.replace('\n', " ")));
+    }
+    let _ = std::fs::write(path, body);
+}
+
+
+/// 绑定 IPv6 监听 socket，并强制 IPV6_V6ONLY。
+///
+/// Linux/Android 下 `[::]` 默认双栈，若同一端口已被 `0.0.0.0` 占用，
+/// 绑定会报 EADDRINUSE（os error 98）导致进程直接退出。
+/// Windows 默认 IPV6_V6ONLY=1 所以不会暴露这个问题——这是跨平台陷阱。
+/// NAT 过滤类型检测的证据位（RFC 4787 §5 的 EIF/ADF/APDF 判定）。
+///
+/// 判据：如果我们的 NAT **允许了一个我们从未向其发送过的源（IP:port）**的入站包，
+/// 说明过滤是按 IP 做的（ADF）或完全不滤（EIF）；
+/// 如果只允许我们发过包的那个精确 IP:port（APDF，俗称"端口受限"），
+/// 那么来自同一 IP 但不同端口的包会被丢弃。
+///
+/// 实现：把「对端公告的监听端口」与「实际收到包的源端口」对比 ——
+/// 打洞引擎会用临时端口发包，这些端口我们从未发过，
+/// 所以能收到它们就证明不是 APDF。
+static FILTER_EV: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// 对端公告的监听端口（0=未知）。用于过滤类型判定：收到源端口 ≠ 此值的包即为证据。
+/// 服务端从「中继转发来的数据」里学到的对端 peer_id。
+/// 家宽路由器拦入站 → 客户端无法主动摸到服务端监听口，P2P 只能服务端发起；
+/// 而客户端是动态 peer_id。它一旦通过中继发过数据，就记下来供打洞线程反向敲。
+static STABLE_PICK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static STABLE_PENDING_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const HYSTERESIS_N: u32 = 3;
+
+
+// ── 诊断计数器（大 payload 死锁排查）──
+static DIAG_SEND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_HUB_PUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_HUB_POP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static LEARNED_PEERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+    std::sync::OnceLock::new();
+
+/// 服务端入站 P2P 活跃对端注册表（addr → last_seen）
+/// P2P 处理线程在通道建立时插入，status 写入器读取（30s 内活跃视为在连）
+static P2P_INBOUND: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    std::sync::OnceLock::new();
+fn p2p_inbound() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    P2P_INBOUND.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+/// P2P 处理线程调用：记录/刷新一个入站对端
+pub fn note_p2p_inbound(addr: &std::net::SocketAddr) {
+    p2p_inbound().lock().unwrap().insert(addr.to_string(), std::time::Instant::now());
+}
+
+fn learned_peers() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
+    LEARNED_PEERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+static PEER_LISTEN_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+pub fn note_peer_listen_port(p: u16) {
+    PEER_LISTEN_PORT.store(p, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn peer_listen_port_known() -> u16 {
+    PEER_LISTEN_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn filter_evidence() -> &'static str {
+    match FILTER_EV.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => "ip-based(ADF/EIF)",
+        2 => "port-based(APDF)",
+        _ => "unknown",
+    }
+}
+
+fn note_filter_evidence_ip_based() {
+    FILTER_EV.store(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn bind_v6_only(port: u16) -> Option<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+    sock.set_only_v6(true).ok()?;
+    let addr: std::net::SocketAddr = format!("[::]:{}", port).parse().ok()?;
+    sock.bind(&addr.into()).ok()?;
+    let udp: UdpSocket = sock.into();
+    udp.set_nonblocking(true).ok();
+    Some(udp)
+}
+
+struct P2pChannel {
+    socket: Arc<UdpSocket>,
+    peer_addr: std::net::SocketAddr,
+    is_ipv6: bool,
+    /// 通道级双向验证位（黑盒回归修复核心）：REQUEST 敲门只证明「对端→我」，
+    /// 这样创建的通道为 false（verify ACK 到达才置 true）；REPLY 往返 / 打洞胜出 /
+    /// score>=3 证据创建的通道直接 true。apply_decision 只选 verified 通道承载业务，
+    /// 否则管道级 verified（可能来自另一个 socket 的证据）会把未验证通道顶上数据面。
+    /// Cell<bool>：允许通过 &self 修改（注册表 active_channel 返回 &P2pChannel）
+    verified: std::cell::Cell<bool>,
+    /// 可靠流（ARQ）。通道建立时创建，自己持有 socket+peer，ACK 从同一通道回。
+    stream: Arc<Mutex<crate::vnet::tunnel::TunnelStream>>,
+    #[allow(dead_code)] id: u64,
+    #[allow(dead_code)] verify_since: Option<Instant>,
+}
+
+impl P2pChannel {
+    fn new(
+        socket: Arc<UdpSocket>,
+        peer_addr: std::net::SocketAddr,
+        is_ipv6: bool,
+        crypto: Option<Arc<Mutex<crate::vnet::crypto::SessionCrypto>>>,
+        verified: bool,
+    ) -> Self {
+        let stream = crate::vnet::tunnel::TunnelStream::new(socket.clone(), peer_addr, crypto);
+        Self { socket, peer_addr, is_ipv6, verified: std::cell::Cell::new(verified), stream: Arc::new(Mutex::new(stream)), id: { static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1); N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }, verify_since: None }
+    }
+
+    /// 通道身份匹配：socket + peer 四元组
+    #[allow(dead_code)]
+    fn matches(&self, sock: &Arc<UdpSocket>, from: std::net::SocketAddr) -> bool {
+        Arc::ptr_eq(&self.socket, sock) && self.peer_addr == from
+    }
+}
+
+/// 通道注册表：多槽并存，每条候选路径独立验证、独立失败、独立回收
+/// 替代旧的单槽 Option<P2pChannel>（候选互相覆盖 = 状态空间维度缺失）
+#[allow(dead_code)]
+struct P2pRegistry {
+    channels: HashMap<u64, P2pChannel>,
+    active: Option<u64>,
+}
+
+#[allow(dead_code)]
+impl P2pRegistry {
+    fn new() -> Self { Self { channels: HashMap::new(), active: None } }
+    fn find(&self, sock: &Arc<UdpSocket>, from: std::net::SocketAddr) -> Option<&P2pChannel> {
+        self.channels.values().find(|c| c.matches(sock, from))
+    }
+    fn get(&self, id: u64) -> Option<&P2pChannel> { self.channels.get(&id) }
+    fn upsert(&mut self, ch: P2pChannel) -> u64 {
+        if let Some(existing) = self.channels.values().find(|c| c.matches(&ch.socket, ch.peer_addr)) {
+            return existing.id;
+        }
+        let id = ch.id;
+        self.channels.insert(id, ch);
+        id
+    }
+    fn remove(&mut self, id: u64) {
+        self.channels.remove(&id);
+        if self.active == Some(id) { self.active = None; }
+    }
+    fn active_channel(&self) -> Option<&P2pChannel> {
+        self.active.and_then(|id| self.channels.get(&id))
+    }
+    fn verified_candidates(&self) -> Vec<&P2pChannel> {
+        self.channels.values().filter(|c| c.verified.get()).collect()
+    }
+}
+/// 通道重建判据（黑盒回归修复）：
+/// - 对端 IP 变了 → 重建（真换端；真换端口由 watchdog 停滞清通道后重建兜底）
+/// - 同 IP、槽内通道**未验证**、新证据是**已验证**通道（REPLY 往返/打洞胜出）→ 顶替
+/// - 其余同 IP 情况（对端打洞引擎扫描端口的敲门/回包）→ 绝不重建
+///   （全地址比较会让通道每秒重建、ARQ 归零，对端在途流全判重复吞掉）
+fn chan_rebuild_needed(existing: &P2pChannel, from: std::net::SocketAddr, new_verified: bool) -> bool {
+    if existing.peer_addr.ip() != from.ip() {
+        return true;
+    }
+    new_verified && !existing.verified.get()
+}
+
+pub struct Connection {
+    /// 显式 P2P 监听端口覆盖（宿主分配；None 时读 VNET_P2P_PORT / 默认 9100）
+    p2p_port_override: Option<u16>,
+    pub my_peer_id: u32,
+    pub target_peer_id: u32,
+    relay: Arc<RelayClient>,
+    p2p: Arc<Mutex<P2pRegistry>>,
+    path: Arc<Mutex<DataPath>>,
+    running: Arc<AtomicBool>,
+    relay_packets: Arc<AtomicU64>,
+    p2p_packets: Arc<AtomicU64>,
+    /// P2P 对端地址（探测响应确认打通后设置）
+    p2p_peer: Arc<Mutex<Option<std::net::SocketAddr>>>,
+    /// 多连接下行数据分发中心
+    hub: Arc<Mutex<ConnHub>>,
+    /// 最近一次收到 P2P 探测回复的时刻（IPv4/IPv6 共用，供 watchdog 判定）
+    last_p2p_reply: Arc<Mutex<std::time::Instant>>,
+    /// 路径切换迟滞：连续收到多少次探测回复才允许切到 P2P（A9，防抖动）
+    switch_score: Arc<Mutex<u32>>,
+    /// 路径切换次数（G2 路径历史）
+    path_switches: Arc<Mutex<u32>>,
+    /// 最近一次路径切换时刻（冷却用，避免有损链路横跳）
+    last_switch_at: Arc<Mutex<std::time::Instant>>,
+    /// 累计 P2P 探测回复数（配合 probe_rounds 算丢包率）
+    p2p_replies: Arc<AtomicU64>,
+    /// 打洞引擎一旦建立通道就锁定，简单探测不得覆盖
+    /// （否则两边抢同一个 p2p 通道，服务端按 A socket 回包、客户端从 B socket 发，会丢一半）
+    /// 监听 socket 累计收包数（动态证据：一直为 0 说明入站被拦或对端未发）
+    listen_rx: Arc<AtomicU64>,
+    /// Rendezvous 固定监听 socket（客户端也监听，供对端直连）
+    listen_sock: Option<Arc<UdpSocket>>,
+    /// 探测可观测计数（per-Connection）：收到 REQUEST / REPLY / 验签失败
+    probe_req_rx: Arc<AtomicU64>,
+    probe_reply_rx: Arc<AtomicU64>,
+    probe_verify_fail: Arc<AtomicU64>,
+
+    /// 该监听 socket 的公网映射（STUN 学出，经中继公告）
+    listen_pub: Arc<Mutex<Option<std::net::SocketAddr>>>,
+    announced_v6: Arc<Mutex<Option<std::net::SocketAddr>>>,
+    /// IPv6 监听 socket（双栈；对端会往 [::]:port 发）
+    listen_sock_v6: Option<Arc<UdpSocket>>,
+    punch_locked: Arc<std::sync::atomic::AtomicBool>,
+    /// S：每条候选管道一个 PathPipe（Relay/P2pV4/P2pV6，固定下标见 pathpipe::index_of）。
+    /// ENV 各接收/探测线程持续更新 o_*（shadow），决策层读 s_selectable 做裁决。
+    pipes: Arc<Mutex<Vec<PathPipe>>>,
+    /// R：路径决策评价指标（用户可调旋钮，FFI 将来注入；见 PATH-STRATEGY.md）
+    policy: RPolicy,
+    threads_alive: Arc<AtomicU64>,
+    /// 本端网络能力画像（持续感知更新）
+    pub local_net_status: Arc<std::sync::Mutex<crate::vnet::netstatus::NetStatus>>,
+    /// relay 路径的 ARQ（中继模式下提供重传保障）
+    pub relay_arq: Arc<std::sync::Mutex<crate::vnet::relay_arq::RelayArq>>,
+    /// 对端网络能力画像（从 announce/probe 学到）
+    pub remote_net_status: Arc<std::sync::Mutex<crate::vnet::netstatus::NetStatus>>,
+}
+
+impl Connection {
+    pub fn new(relay_addr: &str, my_peer_id: u32, target_peer_id: u32) -> anyhow::Result<Self> {
+        Self::with_secret(relay_addr, my_peer_id, target_peer_id, None)
+    }
+
+    /// 带端到端加密构造（client 角色）。
+    /// `secret` 为 None 时明文传输，仅用于对比测试。
+    pub fn with_secret(
+        relay_addr: &str,
+        my_peer_id: u32,
+        target_peer_id: u32,
+        secret: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::with_secret_and_port(relay_addr, my_peer_id, target_peer_id, secret, None)
+    }
+
+    /// 与 with_secret 相同，但由宿主显式指定 P2P 监听端口：
+    /// 拿不到（被占）时自动回落随机口并公告**实际端口**——
+    /// 多实例宿主（myco）用它给每个实例分配不冲突的端口，避免抢 9100。
+    pub fn with_secret_and_port(
+        relay_addr: &str,
+        my_peer_id: u32,
+        target_peer_id: u32,
+        secret: Option<&str>,
+        preferred_p2p_port: Option<u16>,
+    ) -> anyhow::Result<Self> {
+        // 启动即自检入站可达性：被防火墙拦时 P2P 必然失败，必须主动报出来
+        crate::vnet::fwcheck::spawn_check();
+
+        let crypto = secret.map(|s| {
+            use crate::vnet::crypto::{Role, SessionCrypto};
+            SessionCrypto::new(&SessionCrypto::key_from_secret(s), Role::Client)
+        });
+        let encrypted = crypto.is_some();
+        let relay = Arc::new(RelayClient::with_crypto(relay_addr, my_peer_id, crypto, secret)?);
+        // 客户端注册退避重试（高铁/网络不稳定场景：首次注册可能因 CGN/切换失败）
+        {
+            let mut delay = Duration::from_secs(1);
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match relay.register() {
+                    Ok(()) => break,
+                    Err(e) => {
+                        if attempt >= 5 || delay >= Duration::from_secs(16) {
+                            return Err(e);
+                        }
+                        eprintln!("  [CLI] relay register attempt {} failed: {:#} — retry in {:?}", attempt, e, delay);
+                        thread::sleep(delay);
+                        delay *= 2;
+                    }
+                }
+            }
+        }
+        if encrypted {
+            println!("  [OK] End-to-end encryption: AES-256-GCM (PSK)");
+        } else {
+            println!("  [!!] WARNING: no --secret given, tunnel data is PLAINTEXT");
+        }
+
+        // 通告 STUN 发现的公网出口 IP（多出口 ISP 场景：可能与 relay 观察到的 IP 不同）
+        // 端口用 relay socket 的本地端口（NAT 端口保留时即公网端口）
+        // Rendezvous: 绑定固定监听端口，用「它自己」做 STUN 学出公网映射并公告。
+        // NAT 映射绑在 socket 上，必须用监听 socket 本身探测。
+        let p2p_port: u16 = preferred_p2p_port
+            .or_else(|| std::env::var("VNET_P2P_PORT").ok().and_then(|v| v.parse().ok()))
+            .unwrap_or(9100);
+        let listen_rx_cnt = Arc::new(AtomicU64::new(0));
+        let listen_sock = UdpSocket::bind(format!("0.0.0.0:{}", p2p_port))
+            .or_else(|_| UdpSocket::bind("0.0.0.0:0"))
+            .ok()
+            .map(Arc::new);
+        // IPv6 监听：PC→笔记本 的 IPv6 方向是通的（家宽拦入站只拦反方向），
+        // 但必须真有 IPv6 socket 在这个端口上听，否则对端发来的 v6 包全被内核丢弃。
+        // 注意：必须 IPV6_V6ONLY，否则与上面的 0.0.0.0:port 冲突（Linux/Android 上直接崩溃）
+        // 多实例：9100 被占时回退随机口（公告必须用实际端口，见下方 announce）
+        let listen_sock_v6: Option<Arc<UdpSocket>> = bind_v6_only(p2p_port)
+            .or_else(|| bind_v6_only(0))
+            .map(Arc::new);
+        // v6 公告（原在绑定前、且 get_my_ipv6 写死 :9100 —— 多实例下会公告错端口）
+        {
+            let actual_v6_port = listen_sock_v6.as_ref()
+                .and_then(|s| s.local_addr().ok()).map(|a| a.port());
+            let ip_str = std::env::var("VNET_ANNOUNCE_V6").ok().filter(|s| !s.is_empty())
+                .or_else(|| get_my_ipv6().map(|a| a.ip().to_string()))
+                .filter(|ip| !ip.is_empty() && ip != "::" && ip != "0:0:0:0:0:0:0:0");
+            if let (Some(port), Some(ip)) = (actual_v6_port, ip_str) {
+                // VNET_ANNOUNCE_V6 可能带端口（完整 [addr]:port）也可能是裸地址
+                let s = if ip.contains(']') {
+                    ip.clone()
+                } else {
+                    format!("[{}]:{}", ip, port)
+                };
+                let _ = relay.announce_ipv6(&s);
+                println!("  [OK] Announced IPv6: {}", s);
+            }
+        }
+        let mut listen_pub_val: Option<std::net::SocketAddr> = None;
+        if let Some(ref s) = listen_sock {
+            s.set_nonblocking(true).ok();
+            let lp = s.local_addr().map(|a| a.port()).unwrap_or(0);
+            for srv in ["stun.chat.bilibili.com:3478", "stun.hitv.com:3478", "stun.miwifi.com:3478"] {
+                if let Ok(pubaddr) = crate::vnet::stun::query_stun_on_socket(srv, s) {
+                    listen_pub_val = Some(pubaddr);
+                    let _ = relay.announce_ipv4(&pubaddr.to_string());
+                    println!("  [RDV] Listen {} -> public {}, announced", lp, pubaddr);
+                    break;
+                }
+            }
+            if listen_pub_val.is_none() {
+                println!("  [RDV] WARN: listen {} STUN failed", lp);
+            }
+        }
+
+        Ok(Self {
+            my_peer_id,
+            target_peer_id,
+            relay,
+            p2p: Arc::new(Mutex::new(P2pRegistry::new())),
+            path: Arc::new(Mutex::new(DataPath::Relay)),
+            running: Arc::new(AtomicBool::new(true)),
+            relay_packets: Arc::new(AtomicU64::new(0)),
+            p2p_packets: Arc::new(AtomicU64::new(0)),
+            p2p_peer: Arc::new(Mutex::new(None)),
+            hub: Arc::new(Mutex::new(ConnHub::new())),
+            listen_rx: listen_rx_cnt.clone(),
+            probe_req_rx: Arc::new(AtomicU64::new(0)),
+            probe_reply_rx: Arc::new(AtomicU64::new(0)),
+            probe_verify_fail: Arc::new(AtomicU64::new(0)),
+            listen_sock: listen_sock.clone(),
+            listen_pub: Arc::new(Mutex::new(listen_pub_val)),
+            announced_v6: Arc::new(Mutex::new(None)),
+            p2p_port_override: preferred_p2p_port,
+            listen_sock_v6: listen_sock_v6.clone(),
+            last_p2p_reply: Arc::new(Mutex::new(std::time::Instant::now())),
+            switch_score: Arc::new(Mutex::new(0)),
+            path_switches: Arc::new(Mutex::new(0)),
+            last_switch_at: Arc::new(Mutex::new(std::time::Instant::now())),
+            p2p_replies: Arc::new(AtomicU64::new(0)),
+            punch_locked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pipes: Arc::new(Mutex::new(crate::vnet::pathpipe::std_pipes())),
+            policy: RPolicy::default(),
+            threads_alive: Arc::new(AtomicU64::new(0)),
+            local_net_status: Arc::new(std::sync::Mutex::new(crate::vnet::netstatus::NetStatus::default())),
+            relay_arq: Arc::new(std::sync::Mutex::new(crate::vnet::relay_arq::RelayArq::new())),
+            remote_net_status: Arc::new(std::sync::Mutex::new(crate::vnet::netstatus::NetStatus::default())),
+        })
+    }
+
+    /// 常驻接收线程：唯一从 relay socket 收包的地方
+    /// 控制包（探测）就地处理，数据包入队
+    fn spawn_receiver(&self) {
+        let relay = self.relay.clone();
+        let rx_relay_arq = self.relay_arq.clone();
+        let path = self.path.clone();
+        let p2p = self.p2p.clone();
+        let p2p_peer = self.p2p_peer.clone();
+        let running = self.running.clone();
+        let queue = self.hub.clone();
+        let score_arc = self.switch_score.clone();
+        let switches_arc = self.path_switches.clone();
+        let last_switch_at_arc = self.last_switch_at.clone();
+        let p2p_replies_arc = self.p2p_replies.clone();
+        let punch_locked = self.punch_locked.clone();
+        let last_reply = self.last_p2p_reply.clone();
+        let score_wd = self.switch_score.clone();
+        let switches_wd = self.path_switches.clone();
+        let last_switch_wd = self.last_switch_at.clone();
+        let pipes_rx = self.pipes.clone();
+        let policy_rx = self.policy.clone();
+
+        thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                match relay.try_recv_kind() {
+                    crate::vnet::relay::RecvKind::RelayData(src, data) => {
+                        // relay ARQ：解帧 → 交付数据 + 回 ACK + 快速重传
+                        let (deliver, ack_frame, fast_retransmit) = {
+                            let mut raq = rx_relay_arq.lock().unwrap();
+                            raq.on_packet(&data)
+                        };
+                        {
+                            use std::sync::atomic::{AtomicU64, Ordering as OD};
+                            static DBG_RX: AtomicU64 = AtomicU64::new(0);
+                            let k = DBG_RX.fetch_add(1, OD::Relaxed);
+                            if k < 12 {
+                                println!("  [DBG-RX] RelayData#{} src={} wire={}B deliver={} ack={} fast={}",
+                                    k, src, data.len(), deliver.len(), ack_frame.is_some(), fast_retransmit.len());
+                            }
+                        }
+                        if let Some(ack) = ack_frame {
+                            let _ = relay.send_to_peer(src, &ack);
+                        }
+                        // 快速重传：立即发送缺失帧（不等 RTO 超时）
+                        for frame in fast_retransmit {
+                            let _ = relay.send_to_peer(src, &frame);
+                        }
+                        for d in deliver {
+                            queue.lock().unwrap().push(d);
+                        }
+                    }
+                    crate::vnet::relay::RecvKind::P2pData(from, data) => {
+                        // 记录 P2P 来源（回包用）
+                        *p2p_peer.lock().unwrap() = Some(from);
+                        // P2P 数据同样端到端加密；解不开直接丢弃
+                        if let Some(plain) = relay.unseal(&data) {
+                            queue.lock().unwrap().push(plain);
+                        }
+                    }
+                    crate::vnet::relay::RecvKind::ProbeReply(addr) => {
+                        // 每次收到回复都刷新 P2P 对端地址（服务端重启后端口会变）
+                        *p2p_peer.lock().unwrap() = Some(addr);
+                        *last_reply.lock().unwrap() = std::time::Instant::now();
+                        // 打洞引擎已建立通道时不得覆盖（否则两条路径抢同一通道）
+                        if !punch_locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            // 黑盒回归修复（通道抖动引擎）：与 R25-修2 同款纪律。
+                            // relay-socket 探测回包只算弱证据：通道以未验证身份入槽
+                            // （其 socket 承载的 ARQ 帧对端不按流处理，不直接承载业务），
+                            // 待 REPLY/打洞类的已验证通道同 IP 顶替。数据面在验证
+                            // 完成前保持中继路径。
+                            let need_a = match p2p.lock().unwrap().active_channel() {
+                                Some(ch) => chan_rebuild_needed(ch, addr, false),
+                                None => true,
+                            };
+                            if need_a {
+                                p2p.lock().unwrap().upsert(P2pChannel::new(
+                                    relay.shared_socket(),
+                                    addr,
+                                    false,
+                                    relay.crypto_arc(),
+                                    false,
+                                ));
+                            }
+                        }
+                        // A9 迟滞：连续 N 次探测回复才切换，避免路径抖动来回跳
+                        p2p_replies_arc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut score = score_arc.lock().unwrap();
+                        *score += 1;
+                        let ready = *score >= 3;
+                        drop(score);
+                        // O(shadow)：relay-socket 探测回包 → P2pV4 观察。
+                        // 探测包出 + 签名回包入 = 双向证据；score>=3 的迟滞沿用为
+                        // verified 的证据累积门槛。
+                        {
+                            let mut ps = pipes_rx.lock().unwrap();
+                            let p4 = &mut ps[index_of(PipeKind::P2pV4)];
+                            p4.o_reply_rx += 1;
+                            if ready {
+                                p4.mark_verified();
+                            }
+                            p4.update_derived(&policy_rx);
+                        }
+                        // 切换冷却：避免「切→丢→回→切」高频横跳（蜂窝链路实测 42 次）
+                        let cooled = last_switch_at_arc.lock().unwrap().elapsed()
+                            >= Duration::from_secs(30);
+                        let p = path.lock().unwrap();
+                        if !p.is_direct() && ready && cooled {
+                            drop(p);
+                            *last_switch_at_arc.lock().unwrap() = std::time::Instant::now();
+                            apply_decision(&pipes_rx, &policy_rx, &path, &p2p, &switches_arc);
+                            println!("  [P2P] Probe reply from {} (stable x3, cooldown ok) -> decision applied", addr);
+                        }
+                    }
+                    crate::vnet::relay::RecvKind::PeerProbe(addr) => {
+                        // 诊断：对端敲门包是否真的到达（限流打印）
+                        use std::sync::atomic::{AtomicU64, Ordering as O2};
+                        static CNT: AtomicU64 = AtomicU64::new(0);
+                        let n = CNT.fetch_add(1, O2::Relaxed);
+                        if n < 5 || n % 20 == 0 {
+                            println!("  [P2P-IN] peer probe from {} (#{})", addr, n + 1);
+                        }
+                    }
+                    crate::vnet::relay::RecvKind::Ignored => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+
+                // 保底 watchdog：P2P 模式下 8 秒没收到探测回复 → 回退中继
+                {
+                    let p = path.lock().unwrap();
+                    // 中继只做「连通性兜底」：只有 P2P 彻底失联 30 秒才回退，
+                    // 而不是「质量下降就回退」——后者在有损链路上会造成永不停歇的横跳。
+                    if p.is_direct() && last_reply.lock().unwrap().elapsed() > Duration::from_secs(30) {
+                        println!("  [P2P] No probe reply for 30s -> fallback to Relay");
+                        // O(shadow)：30s 无探测回包 → 当前直连管道记失败证据
+                        {
+                            let fam = if *p == DataPath::P2PIpv6 {
+                                PipeKind::P2pV6
+                            } else {
+                                PipeKind::P2pV4
+                            };
+                            let mut ps = pipes_rx.lock().unwrap();
+                            let pp = &mut ps[index_of(fam)];
+                            pp.mark_failed();
+                            pp.update_derived(&policy_rx);
+                        }
+                        drop(p);
+                        *score_wd.lock().unwrap() = 0;
+                        *last_switch_wd.lock().unwrap() = std::time::Instant::now();
+                        apply_decision(&pipes_rx, &policy_rx, &path, &p2p, &switches_wd);
+                    }
+                }
+            }
+        });
+    }
+
+    fn ctx(&self) -> ForwardCtx {
+        ForwardCtx {
+            running: self.running.clone(),
+            relay: self.relay.clone(),
+            relay_arq: self.relay_arq.clone(),
+            p2p: self.p2p.clone(),
+            path: self.path.clone(),
+            hub: self.hub.clone(),
+            p2p_peer: self.p2p_peer.clone(),
+            target_peer_id: self.target_peer_id,
+            pipes: self.pipes.clone(),
+            policy: self.policy.clone(),
+            switches: self.path_switches.clone(),
+        }
+    }
+
+    /// 停止（FFI/嵌入用）：所有工作线程在下一轮轮询退出
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
+
+    pub fn start_client(&self, local_port: u16) -> anyhow::Result<()> {
+        println!("  [OK] Relay connected as peer {}", self.my_peer_id);
+        let listen_sock_v6 = self.listen_sock_v6.clone();
+
+        self.threads_alive.fetch_add(1, Ordering::Relaxed);
+        let ka_relay = self.relay.clone();
+        let ka_relay_arq = self.relay_arq.clone();
+        let ka_target = self.target_peer_id;
+        let ka_run = self.running.clone();
+        // ── 感知+status 搬到 keepalive 线程（always-on，NO_P2P 也运行）──
+        let ka_ns = self.local_net_status.clone();
+        let ka_p2p = self.p2p.clone();
+        let ka_path = self.path.clone();
+        let ka_id = self.my_peer_id;
+        let ka_tgt = self.target_peer_id;
+        let ka_enc = self.relay.is_encrypted();
+        let ka_sw = self.path_switches.clone();
+        let ka_ta = self.threads_alive.clone();
+        let ka_prq = self.probe_req_rx.clone();
+        let ka_prp = self.probe_reply_rx.clone();
+        let ka_lrx = self.listen_rx.clone();
+        thread::spawn(move || {
+            let mut sense_at = std::time::Instant::now();
+            let mut stat_at = std::time::Instant::now();
+            let mut renew_at = std::time::Instant::now();
+            let mut first = true;
+            while ka_run.load(Ordering::Relaxed) {
+                // 1s sensing (STUN + interface + auto re-register on change)
+                if sense_at.elapsed() >= Duration::from_secs(1) {
+                    sense_at = std::time::Instant::now();
+                    let mut ns = ka_ns.lock().unwrap();
+                    let old_v6 = ns.ipv6;
+                    let new_v6: Option<std::net::SocketAddr> = get_my_ipv6();
+                    let (new_if, new_cost) = probe_default_if_status();
+                    let changed = new_v6 != old_v6 || new_if != ns.if_type || new_cost != ns.if_cost;
+                    if changed {
+                        ns.ipv6 = new_v6;
+                        ns.if_type = new_if;
+                        ns.if_cost = new_cost;
+                        ns.version += 1;
+                        ns.sensed_at = std::time::Instant::now();
+                        if first {
+                            println!("  [NETSTAT] initial v{}", ns.version);
+                            first = false;
+                        } else {
+                            println!("  [NETSTAT] v{} changed, re-registering", ns.version);
+                            // 网络切换后必须重新注册（relay 的 peer→地址映射需要更新）
+                            if let Err(e) = ka_relay.register() {
+                                eprintln!("  [NETSTAT] re-register failed: {}", e);
+                            }
+                            if let Ok(pub4) = crate::vnet::stun::query_stun("stun.chat.bilibili.com:3478", 0) {
+                                let _ = ka_relay.announce_ipv4(&pub4.to_string());
+                            }
+                            if let Some(v6) = ns.ipv6 {
+                                if !v6.ip().is_unspecified() {
+                                    let _ = ka_relay.announce_ipv6(&v6.to_string());
+                                }
+                            }
+                            let ns_str = ns.to_announce_extra();
+                            let _ = ka_relay.announce_netstatus(ns_str.trim());
+                            ka_p2p.lock().unwrap().active = None;
+                        }
+                    } else {
+                        ns.sensed_at = std::time::Instant::now();
+                    }
+                }
+                // 5s status write (always-on, even with NO_P2P)
+                if stat_at.elapsed() >= Duration::from_secs(5) {
+                    stat_at = std::time::Instant::now();
+                    let p = format!("{:?}", ka_path.lock().unwrap());
+                    let sw = ka_sw.lock().unwrap().to_string();
+                    let strat = {
+                        let ns = ka_ns.lock().unwrap();
+                        crate::vnet::netstatus::NetStatus::strategy(&ns, &ns).as_str().to_string()
+                    };
+                    let body = format!(
+                        "role=client\nmy_peer_id={}\ntarget_peer_id={}\npath={}\npath_switches={}\nstrategy={}\nprobe_req_rx={}\nprobe_reply_rx={}\nlisten_rx={}\nthreads_alive={}\nencrypted={}\nupdated_at={:?}\n",
+                        ka_id, ka_tgt, p, sw, strat,
+                        ka_prq.load(Ordering::Relaxed),
+                        ka_prp.load(Ordering::Relaxed),
+                        ka_lrx.load(Ordering::Relaxed),
+                        ka_ta.load(Ordering::Relaxed),
+                        ka_enc,
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs()
+                    );
+                    let _ = std::fs::write(status_file_path_for("client", ka_id), body);
+                }
+                {
+                        // relay ARQ：重传 + 流控 flush
+                        let (new_f, retrans_f) = ka_relay_arq.lock().unwrap().flush_and_tick();
+                        for frame in new_f { let _ = ka_relay.send_to_peer(ka_target, &frame); }
+                        for frame in retrans_f { let _ = ka_relay.send_to_peer(ka_target, &frame); }
+                    }
+                    ka_relay.keepalive();
+                    // relay 注册是周期续租：relay 重启后映射全丢时，下一周期自动重建。
+                    if renew_at.elapsed() >= Duration::from_secs(5) {
+                        renew_at = std::time::Instant::now();
+                        ka_relay.renew_registration();
+                    }
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        // 常驻接收线程（唯一 recv 方）：空闲时也处理探测回复，保证 P2P 能建立
+        self.threads_alive.fetch_add(1, Ordering::Relaxed);
+        self.spawn_receiver();
+
+        let probe_relay = self.relay.clone();
+        let my_id_for_status = self.my_peer_id;
+        let enc_for_status = self.relay.is_encrypted();
+        let last_rtt_for_status = Arc::new(Mutex::new(String::from("-")));
+                let listen_rx_for_status = self.listen_rx.clone();
+        let probe_req_for_status = self.probe_req_rx.clone();
+        let probe_reply_for_status = self.probe_reply_rx.clone();
+        let probe_fail_for_status = self.probe_verify_fail.clone();
+        let threads_alive_for_status = self.threads_alive.clone();
+        let net_status_for_status = self.local_net_status.clone();
+        let remote_ns_for_status = self.remote_net_status.clone();
+        let path_switches_for_status = self.path_switches.clone();
+        let local_ip_watch = Arc::new(Mutex::new(get_my_local_ipv4()));
+        let switch_score_net = self.switch_score.clone();
+        let path_switches_net = self.path_switches.clone();
+        let p2p = self.p2p.clone();
+        let p2p_peer = self.p2p_peer.clone();
+        let path = self.path.clone();
+        let running = self.running.clone();
+        let target_id = self.target_peer_id;
+
+        // DIAG: VNET_NO_P2P=1 完全禁用客户端 P2P 探测（隔离变量测试纯 relay）
+        let no_p2p = std::env::var("VNET_NO_P2P").unwrap_or_default() == "1";
+        let rx_queue_for_probe = self.hub.clone();
+        let last_reply_for_v6 = self.last_p2p_reply.clone();
+        let pipes_probe = self.pipes.clone();
+        let policy_probe = self.policy.clone();
+        if no_p2p {
+            println!("  [DIAG] VNET_NO_P2P=1 -> P2P probing disabled");
+        } else {
+        self.threads_alive.fetch_add(1, Ordering::Relaxed);
+        thread::spawn(move || {
+            let mut count = 0u64;
+            println!("  [PROBE-THREAD] started for peer {}", my_id_for_status);
+            // 多候选地址：relay 观察到的 + 对端 STUN 通告的 + 对端 IPv6
+            let mut v6_candidate: Option<std::net::SocketAddr> = None;
+            let mut candidates: Vec<std::net::SocketAddr> = Vec::new();
+            let mut last_report = std::time::Instant::now();
+            // 数据面停滞看门狗状态
+            let mut st_w_acked: u64 = 0;
+            let mut st_w_ack_at = std::time::Instant::now();
+            let mut last_probe_replies: u64 = 0;
+            let mut probe_stale_at = std::time::Instant::now();
+            let mut netstat_last_sense = std::time::Instant::now();
+            let netstat_local: Arc<std::sync::Mutex<crate::vnet::netstatus::NetStatus>> = net_status_for_status.clone();
+            // O(shadow)：ARQ (sent, acked) 快照滑窗（10s @1s/格），窗口 ACK 率的证据源
+            let mut st_w_hist: std::collections::VecDeque<(u64, u64)> =
+                std::collections::VecDeque::new();
+
+            // 独立 IPv6 socket —— 必须！IPv4 socket(0.0.0.0) 无法向 IPv6 地址发包
+            let v6_sock = listen_sock_v6.clone().or_else(|| {
+                UdpSocket::bind("[::]:0").ok().map(std::sync::Arc::new)
+            }).map(|s| {
+                s.set_nonblocking(true).ok();
+                s
+            });
+            if let Some(ref s) = v6_sock {
+                s.set_nonblocking(true).ok();
+                println!("  [P2P] IPv6 probe socket: {}",
+                    s.local_addr().map(|a| a.to_string()).unwrap_or_default());
+            }
+            let v6_for_p2p = v6_sock.clone();
+
+            // 独立 IPv6 接收线程：不能放在 1s 一轮的探测循环里，否则数据最多压 1 秒
+            if let Some(ref sock) = v6_sock {
+                let rx_sock = sock.clone();
+                let rx_path = path.clone();
+                let rx_peer = p2p_peer.clone();
+                let rx_p2p = p2p.clone();
+                let rx_run = running.clone();
+                let rx_q = rx_queue_for_probe.clone();
+                let rx_last = last_reply_for_v6.clone();
+                let rx_sec = probe_relay.clone();
+                let rx_pipes = pipes_probe.clone();
+                let rx_policy = policy_probe.clone();
+                let rx_switches = path_switches_net.clone();
+                thread::spawn(move || {
+                    let mut buf = [0u8; 65536];
+                    let mut rx_tick_at = std::time::Instant::now();
+                    while rx_run.load(Ordering::Relaxed) {
+                        match rx_sock.recv_from(&mut buf) {
+                            Ok((n, from)) => {
+                                if let Some((ptype, nonce, ts)) = crate::vnet::probe::parse_probe_full(&buf[..n]) {
+                                    if ptype == crate::vnet::probe::PROBE_TYPE_REQUEST {
+                                        let reply = rx_sec.sign_probe(&crate::vnet::probe::build_probe_reply(nonce, ts));
+                                        let _ = rx_sock.send_to(&reply, from);
+                                    } else {
+                                        let rtt = crate::vnet::probe::rtt_us_from(ts);
+                                        *rx_last.lock().unwrap() = std::time::Instant::now();
+                                        // O(shadow)：v6 探测回包 → P2pV6 观察（双向证据 + RTT 轨迹）
+                                        {
+                                            let mut ps = rx_pipes.lock().unwrap();
+                                            let p6 = &mut ps[index_of(PipeKind::P2pV6)];
+                                            p6.o_reply_rx += 1;
+                                            p6.push_rtt((rtt + 500) / 1000);
+                                            p6.mark_verified();
+                                            p6.update_derived(&rx_policy);
+                                        }
+                                        // ARQ tick：通道若落在本线程的 rx_sock 上，必须有人重传
+                                        if rx_tick_at.elapsed() >= Duration::from_millis(50) {
+                                            rx_tick_at = std::time::Instant::now();
+                                            if let Some(ch) = rx_p2p.lock().unwrap().active_channel() {
+                                                let mut st = ch.stream.lock().unwrap();
+                                                let (s, a, r) = st.stats();
+                                                let inf = st.inflight_count();
+                                                if inf > 0 {
+                                                    println!("  [TICK] sent={} acked={} retr={} inflight={}", s, a, r, inf);
+                                                }
+                                                st.tick();
+                                            }
+                                        }
+                                        *rx_peer.lock().unwrap() = Some(from);
+                                        {
+                                            // 与 RDV/打洞分支同理：通道已存在且对端未变时绝不重建。
+                                            // 这里每收到一个探测回复就会触发，无条件重建 = ARQ 序号
+                                            // 每秒归零，服务端把新包全判为重复丢弃——实测 3/20 成功。
+                                            let need_rx = match rx_p2p.lock().unwrap().active_channel() {
+                                                Some(ch) => chan_rebuild_needed(ch, from, true),
+                                                None => true,
+                                            };
+                                            if need_rx {
+                                                rx_p2p.lock().unwrap().upsert(P2pChannel::new(
+                                                    rx_sock.clone(), from, true, rx_sec.crypto_arc(), true));
+                                            }
+                                        }
+                                        if !rx_path.lock().unwrap().is_direct() {
+                                            println!("  [P2P] IPv6 direct -> {} (rtt={:.2}ms)", from, rtt as f64 / 1000.0);
+                                            apply_decision(&rx_pipes, &rx_policy, &rx_path, &rx_p2p, &rx_switches);
+                                        }
+                                    }
+                                } else if let Some(ch) = rx_p2p.lock().unwrap().active_channel() {
+                                    // 通道守卫：帧到达的 socket 必须与通道 socket 一致（防跨流污染）
+                                    if std::sync::Arc::ptr_eq(&ch.socket, &rx_sock) {
+                                        // ARQ：走可靠流按序交付（v6 通道同样适用）
+                                        {
+                                        use std::sync::atomic::Ordering as DO;
+                                        let rn = DIAG_RX.fetch_add(1, DO::Relaxed);
+                                        if n > 1300 || rn < 20 {
+                                            println!("  [DIAG] RX#{}: {}B t={}",
+                                                rn, n, std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+                                        }
+                                    }
+                                    let chunks = ch.stream.lock().unwrap().on_packet(&buf[..n]);
+                                        for d in chunks { rx_q.lock().unwrap().push(d); }
+                                    } else {
+                                        drop_ghost("v6-probe-rx");
+                                    }
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(_) => thread::sleep(Duration::from_millis(5)),
+                        }
+                    }
+                });
+            }
+
+            while running.load(Ordering::Relaxed) {
+                count += 1;
+
+                // ── G3 网络变化检测：出口 IP 变了就重新探测 ──
+                if count % 5 == 0 {
+                    let cur = get_my_local_ipv4();
+                    // O(shadow)：默认路由接口计费性 → Relay 管道 o_cost（简单版见 probe_default_if_cost）
+                    {
+                        let c = probe_default_if_cost();
+                        let mut ps = pipes_probe.lock().unwrap();
+                        ps[index_of(PipeKind::Relay)].o_cost = c;
+                    }
+                    let mut known = local_ip_watch.lock().unwrap();
+                    if *known != cur {
+                        let old = *known;
+                        *known = cur;
+                        // 首次记录不算变化
+                        if old.is_some() {
+                            println!("  [NET] Local egress changed {:?} -> {:?}, re-probing",
+                                old, cur);
+                            candidates.clear();
+                            // O(shadow)：出口变了 → 旧地址上的直连验证全部作废
+                            {
+                                let mut ps = pipes_probe.lock().unwrap();
+                                for k in [PipeKind::P2pV4, PipeKind::P2pV6] {
+                                    let pp = &mut ps[index_of(k)];
+                                    pp.mark_failed();
+                                    pp.update_derived(&policy_probe);
+                                }
+                            }
+                            *switch_score_net.lock().unwrap() = 0;
+                            // 网络变了，旧 P2P 地址大概率失效 -> 回中继等重新打通
+                            apply_decision(&pipes_probe, &policy_probe, &path, &p2p, &path_switches_net);
+                            p2p.lock().unwrap().active = None;
+                        }
+                    }
+                }
+
+                // 每 10 轮刷新候选列表
+                if candidates.is_empty() || count % 10 == 0 {
+                    if let Some((relay_addr, ipv6, public_v4)) = probe_relay.query_peer_info(target_id) {
+                    // 记录对端公告的**监听**端口，供过滤类型判定使用。
+                    // 注意：只能用 public_v4（announce 出去的监听映射），
+                    // 绝不能用 relay_addr —— 那是对端中继 socket 的端口，
+                    // 拿它当基准会把所有来自监听端口的包误判成"证据"（实测假阳性）。
+                    if let Some(a) = public_v4 {
+                        note_peer_listen_port(a.port());
+                    }
+                        let mut list = vec![relay_addr];
+                        // 对端 STUN 通告的出口 IP（可能不同于 relay 观察到的）
+                        if let Some(pv4) = public_v4 {
+                            if pv4 != relay_addr {
+                                list.push(pv4);
+                                if count <= 10 {
+                                    println!("  [P2P] Peer {} extra egress={}", target_id, pv4);
+                                }
+                            }
+                        }
+                        if count <= 10 {
+                            println!("  [P2P] Peer {} relay={} candidates={}", target_id, relay_addr, list.len());
+                            if let Some(ref v6) = ipv6 {
+                                println!("  [P2P] Peer {} IPv6={}", target_id, v6);
+                            }
+                        }
+                        candidates = list;
+                        // 记录对端 IPv6（单列，避免混入 IPv4 socket 发送路径）
+                        v6_candidate = ipv6.filter(|a| a.is_ipv6() && !a.ip().is_loopback());
+                    }
+                }
+
+                // ── IPv4 候选：走 relay socket（保持 NAT 映射一致）──
+                let pkt = probe_relay.sign_probe(&crate::vnet::probe::build_probe_packet(count));
+                for cand in &candidates {
+                    if cand.is_ipv4() {
+                        probe_relay.send_raw_to(&pkt, *cand);
+                    }
+                }
+
+                // ── IPv6 候选：只负责发探测（收包由上面的独立 v6 接收线程负责）──
+                if let (Some(ref sock), Some(target)) = (&v6_sock, v6_candidate) {
+                    let _ = sock.send_to(&pkt, target);
+                }
+
+                // 定期报告（控制台 30 秒一次，状态文件 1 秒一次）
+                if last_report.elapsed() >= Duration::from_secs(30) {
+                    let p = path.lock().unwrap().name().to_string();
+                    println!("  [STAT] Path={}, rounds={}, candidates={}, v6={}",
+                        p, count, candidates.len(), v6_candidate.is_some());
+                    last_report = std::time::Instant::now();
+                }
+                {
+                    let p = path.lock().unwrap().name().to_string();
+                    let peer = p2p_peer.lock().unwrap()
+                        .map(|a| a.to_string()).unwrap_or_else(|| "-".into());
+                    // ── 数据面停滞看门狗 ──
+                    // path=P2P 但 ARQ 无 ACK 进展超 3 秒（对端收不到我们的包）→
+                    // 记失败证据 + 决策降级（证据门取代旧的 60s 时间冷却）。没有它，
+                    // 死通道上的数据永不回退（实测：path=P2P、服务端零到达、上层一直超时）。
+                    {
+                        let direct_now = path.lock().unwrap().is_direct();
+                        if direct_now {
+                            let maybe = {
+                                let g = p2p.lock().unwrap();
+                                g.active_channel().map(|ch| (ch.is_ipv6, ch.stream.lock().unwrap().stats()))
+                            };
+                            if let Some((ch_v6, (sent, acked, retr))) = maybe {
+                                // O(shadow)：窗口 ACK 率（10s 滑窗增量比）→ 当前通道对应管道
+                                {
+                                    st_w_hist.push_back((sent, acked));
+                                    while st_w_hist.len() > 10 {
+                                        st_w_hist.pop_front();
+                                    }
+                                    if st_w_hist.len() >= 2 {
+                                        let (s0, a0) = *st_w_hist.front().unwrap();
+                                        if sent > s0 {
+                                            let ratio =
+                                                (acked - a0) as f32 / (sent - s0) as f32;
+                                            let fam = if ch_v6 { PipeKind::P2pV6 } else { PipeKind::P2pV4 };
+                                            let mut ps = pipes_probe.lock().unwrap();
+                                            let pp = &mut ps[index_of(fam)];
+                                            pp.o_ack_ratio = ratio.clamp(0.0, 1.0);
+                                            pp.update_derived(&policy_probe);
+                                        }
+                                    }
+                                }
+                                if acked > st_w_acked {
+                                    st_w_acked = acked;
+                                    st_w_ack_at = std::time::Instant::now();
+                                } else if sent > acked
+                                    && st_w_ack_at.elapsed() > Duration::from_secs(3)
+                                {
+                                    println!("  [WD] P2P stalled: sent={} acked={} retr={} -> downgrade by evidence",
+                                        sent, acked, retr);
+                                    // O(shadow)：ARQ 停滞 3s → 该管道记失败证据
+                                    {
+                                        let fam = if ch_v6 { PipeKind::P2pV6 } else { PipeKind::P2pV4 };
+                                        let mut ps = pipes_probe.lock().unwrap();
+                                        let pp = &mut ps[index_of(fam)];
+                                        pp.mark_failed();
+                                        pp.update_derived(&policy_probe);
+                                    }
+                                    // 停滞 3s = 通道已死，就地清（原语义；决策体不再代清）
+                                    p2p.lock().unwrap().active = None;
+                                    apply_decision(&pipes_probe, &policy_probe, &path, &p2p, &path_switches_net);
+                                }
+                            }
+                        }
+                        // ── RC2 fix: probe health watchdog (independent of data flow) ──
+                        // Dead P2P channel with no app data in flight: sent==acked so the
+                        // ARQ watchdog above never fires. Detect via probe reply stagnation.
+                        {
+                            let cur_replies = probe_req_for_status.load(std::sync::atomic::Ordering::Relaxed)
+                                + probe_reply_for_status.load(std::sync::atomic::Ordering::Relaxed);
+                            if cur_replies == last_probe_replies && cur_replies > 0 && count > 10 {
+                                if probe_stale_at.elapsed() > Duration::from_secs(15) {
+                                    let direct_now = path.lock().unwrap().is_direct();
+                                    if direct_now {
+                                        println!("  [WD] probe health: no reply growth {}s (replies={}) -> downgrade",
+                                            probe_stale_at.elapsed().as_secs(), cur_replies);
+                                        let fam = PipeKind::P2pV6; // v6 P2P is the dominant direct path
+                                        let mut ps = pipes_probe.lock().unwrap();
+                                        let pp = &mut ps[index_of(fam)];
+                                        pp.mark_failed();
+                                        pp.update_derived(&policy_probe);
+                                        drop(ps);
+                                        p2p.lock().unwrap().active = None;
+                                        apply_decision(&pipes_probe, &policy_probe, &path, &p2p, &path_switches_net);
+                                        probe_stale_at = std::time::Instant::now();
+                                    }
+                                }
+                            } else if cur_replies != last_probe_replies {
+                                last_probe_replies = cur_replies;
+                                probe_stale_at = std::time::Instant::now();
+                            }
+                        }
+                        // ── NetStatus continuous sensing (every 15s) ──
+                        if netstat_last_sense.elapsed() >= Duration::from_secs(1) {
+                            netstat_last_sense = std::time::Instant::now();
+                            let mut lns = netstat_local.lock().unwrap();
+                            let old_v6: Option<std::net::SocketAddr> = lns.ipv6;
+                            let new_v6: Option<std::net::SocketAddr> = get_my_ipv6();
+                            let changed = new_v6 != old_v6;
+                            let (new_if, new_cost) = probe_default_if_status();
+                            let if_changed = new_if != lns.if_type || new_cost != lns.if_cost;
+                            let changed = changed || if_changed;
+                            if changed {
+                                lns.version += 1;
+                                lns.ipv6 = new_v6;
+                                lns.if_type = new_if;
+                                lns.if_cost = new_cost;
+                                lns.sensed_at = std::time::Instant::now();
+                                lns.nat_source = crate::vnet::netstatus::Source::Measured;
+                                println!("  [NETSTAT] v{} changed: v6={:?} if={:?} cost={}",
+                                    lns.version, lns.ipv6, lns.if_type, lns.if_cost);
+                                // announce_extra takes &[SocketAddr]; NetStatus extra goes via v6 announce string
+                                // For now, just log the state change; announce integration is in relay.rs
+                                println!("  [NETSTAT] v{} changed: v6={:?} if={:?} cost={}",
+                                    lns.version, lns.ipv6, lns.if_type, lns.if_cost);
+                                // ── 网络变化 → 秒级响应：re-register + re-announce + 重建通道 ──
+                                // 1. STUN 探测新出口
+                                if let Ok(pub4) = crate::vnet::stun::query_stun("stun.chat.bilibili.com:3478", 0) {
+                                    let pub4_str = pub4.to_string();
+                                    let _ = probe_relay.announce_ipv4(&pub4_str);
+                                    println!("  [NETSTAT] re-announced v4={}", pub4_str);
+                                }
+                                // 2. v6 re-announce
+                                if let Some(v6) = lns.ipv6 {
+                                    if !v6.ip().is_unspecified() {
+                                        let v6_str = v6.to_string();
+                                        let _ = probe_relay.announce_ipv6(&v6_str);
+                                        println!("  [NETSTAT] re-announced v6={}", v6_str);
+                                    }
+                                }
+                                // 3. 通道重建（清旧通道让下轮 probe 重建）
+                                p2p.lock().unwrap().active = None;
+                                println!("  [NETSTAT] channel cleared for rebuild");
+                                let ns_str = lns.to_announce_extra();
+                                let _ = probe_relay.announce_netstatus(ns_str.trim());
+                            } else {
+                                lns.sensed_at = std::time::Instant::now();
+                            }
+                        }
+
+                        // ── RC2b: data-delivery watchdog (probe alive but data dead) ──
+                        // Scenario: small probe packets flow (56B) but ARQ data frames don't
+                        // (fragmentation, CGN QoS on larger packets, corrupted stream state).
+                        // Evidence: sent > 0 but delivered/ACKed frozen for 5s while probes grow.
+                        {
+                            let (sent_now, acked_now, _) = {
+                                let g = p2p.lock().unwrap();
+                                match g.active_channel() {
+                                    Some(ch) => {
+                                        let st = ch.stream.lock().unwrap();
+                                        let s = st.stats();
+                                        drop(st); drop(g);
+                                        s
+                                    }
+                                    None => (0, 0, 0),
+                                }
+                            };
+                            if sent_now > acked_now && acked_now == st_w_acked {
+                                if st_w_ack_at.elapsed() > Duration::from_secs(5) {
+                                    println!("  [WD] data delivery frozen: sent={} acked={} (probes alive) -> rebuild channel",
+                                        sent_now, acked_now);
+                                    // Full channel teardown: ARQ stream state is suspect
+                                    p2p.lock().unwrap().active = None;
+                                    // Mark pipe failed to force relay via evidence gate
+                                    {
+                                        let fam = PipeKind::P2pV6;
+                                        let mut ps = pipes_probe.lock().unwrap();
+                                        let pp = &mut ps[index_of(fam)];
+                                        pp.mark_failed();
+                                        pp.update_derived(&policy_probe);
+                                    }
+                                    apply_decision(&pipes_probe, &policy_probe, &path, &p2p, &path_switches_net);
+                                    // Reset tracking so we don't immediately re-trigger
+                                    st_w_acked = 0;
+                                    st_w_ack_at = std::time::Instant::now();
+                                }
+                            } else if acked_now > st_w_acked {
+                                st_w_acked = acked_now;
+                                st_w_ack_at = std::time::Instant::now();
+                            }
+                        }
+                    }
+                    let (pipe_v4_str, pipe_v6_str, relay_cost_str) = {
+                        let ps = pipes_probe.lock().unwrap();
+                        let f = |p: &PathPipe| {
+                            format!(
+                                "v={} req={} rep={} fr={} ack={:.2} rtt={:?}",
+                                p.o_verified_bidi,
+                                p.o_req_rx,
+                                p.o_reply_rx,
+                                p.o_failure_run,
+                                p.o_ack_ratio,
+                                p.rtt_evidence_ms()
+                            )
+                        };
+                        (
+                            f(&ps[index_of(PipeKind::P2pV4)]),
+                            f(&ps[index_of(PipeKind::P2pV6)]),
+                            ps[index_of(PipeKind::Relay)].o_cost.to_string(),
+                        )
+                    };
+                    write_status_at(&status_file_path_for("client", my_id_for_status), &[
+                        ("role", "client".into()),
+                        ("my_peer_id", my_id_for_status.to_string()),
+                        ("target_peer_id", target_id.to_string()),
+                        ("path", p),
+                        ("p2p_peer", peer),
+                        ("probe_rounds", count.to_string()),
+                        ("candidates", candidates.len().to_string()),
+                        ("path_switches", path_switches_for_status.lock().unwrap().to_string()),
+                        ("ipv6_candidate", v6_candidate.is_some().to_string()),
+                        ("encrypted", enc_for_status.to_string()),
+                        ("last_rtt_ms", last_rtt_for_status.lock().unwrap().clone()),
+                        ("inbound_fw", crate::vnet::fwcheck::current().as_str().to_string()),
+                        ("filtering", filter_evidence().to_string()),
+                        ("listen_rx", listen_rx_for_status.load(std::sync::atomic::Ordering::Relaxed).to_string()),
+                        ("probe_req_rx", probe_req_for_status.load(std::sync::atomic::Ordering::Relaxed).to_string()),
+                        ("probe_reply_rx", probe_reply_for_status.load(std::sync::atomic::Ordering::Relaxed).to_string()),
+                        ("probe_verify_fail", probe_fail_for_status.load(std::sync::atomic::Ordering::Relaxed).to_string()),
+                        ("pipe_v4", pipe_v4_str),
+                        ("pipe_v6", pipe_v6_str),
+                        ("relay_cost", relay_cost_str),
+                        ("strategy", {
+                    let ns = net_status_for_status.clone();
+                    let rs = remote_ns_for_status.clone();
+                    let l = ns.lock().unwrap().clone();
+                    let r = rs.lock().unwrap().clone();
+                    crate::vnet::netstatus::NetStatus::strategy(&l, &r).as_str().to_string()
+                }),
+                ("threads_alive", threads_alive_for_status.load(std::sync::atomic::Ordering::Relaxed).to_string()),
+("updated_at", format!("{:?}",
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_secs())),
+                    ]);
+                }
+
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+        }
+
+        // ── Rendezvous IPv6 监听 socket 接收线程 ──
+        // PC→笔记本 的 IPv6 方向通（家宽只拦入站反方向），对端会往 [我方v6]:port 发。
+        if let Some(ref ls6) = self.listen_sock_v6 {
+            let ls6 = ls6.clone();
+            let r_relay = self.relay.clone();
+            let r_path = self.path.clone();
+            let r_p2p = self.p2p.clone();
+            let r_peer = self.p2p_peer.clone();
+            let r_hub = self.hub.clone();
+            let r_run = self.running.clone();
+            let r_last = self.last_p2p_reply.clone();
+            let r_target = self.target_peer_id;
+            let r6_v6_pub = self.announced_v6.clone();
+            let r6_probe_req = self.probe_req_rx.clone();
+            let r6_probe_reply = self.probe_reply_rx.clone();
+            let r6_pipes = self.pipes.clone();
+            let r6_policy = self.policy.clone();
+            let r6_switches = self.path_switches.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let mut ka = std::time::Instant::now();
+                let mut kn: u64 = 0;
+                let mut rx_tick_at = std::time::Instant::now();
+                let r_p2p_tick6 = r_p2p.clone();
+                let mut tick6_at = std::time::Instant::now();
+                let mut r6_verify_since: Option<std::time::Instant> = None;
+                while r_run.load(Ordering::Relaxed) {
+                    match ls6.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            {
+                                use std::sync::atomic::{AtomicU64, Ordering as O2};
+                                static R6: AtomicU64 = AtomicU64::new(0);
+                                let k = R6.fetch_add(1, O2::Relaxed);
+                                if k < 8 || k % 30 == 0 {
+                                    println!("  [RDV6-IN] len={} from={}", n, from);
+                                }
+                            }
+                            if let Some(body) = r_relay.verify_probe(&buf[..n]) {
+                                if let Some((ptype, nonce_p, ts)) =
+                                    crate::vnet::probe::parse_probe_full(body)
+                                {
+                                    if ptype == crate::vnet::probe::PROBE_TYPE_REQUEST {
+                                        // 过滤类型证据（同上，用公告端口）
+                                        r6_probe_req.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        // O(shadow)：v6 敲门包计数 → P2pV6 观察
+                                        {
+                                            let mut ps = r6_pipes.lock().unwrap();
+                                            let p6 = &mut ps[index_of(PipeKind::P2pV6)];
+                                            p6.o_req_rx += 1;
+                                            p6.update_derived(&r6_policy);
+                                        }
+                                        let kp6 = peer_listen_port_known();
+                                        if kp6 != 0 && from.port() != kp6 {
+                                            note_filter_evidence_ip_based();
+                                        }
+                                        let reply = r_relay.sign_probe(
+                                            &crate::vnet::probe::build_probe_reply(nonce_p, ts));
+                                        let _ = ls6.send_to(&reply, from);
+                                        // 对端能到达我们的监听口 = 这个四元组就是可用通道。
+                                        // 家宽拦入站时「对端→我」往往先通（我方发过去的探测被拦），只等 REPLY 会永远差半步；
+                                        // 收到合法签名（上方 verify_probe 已验）的 REQUEST 即建通道，回包走同一四元组。
+                                        // 同 IP 不重建：对端打洞引擎从几十个扫描端口敲门，
+                                        // 全地址比较会让通道每秒重建（ARQ 归零 + verify 字节
+                                        // 在对端触发 upstream connect 风暴）。同 IP 的扫描敲门只回包。
+                                        // REQUEST 敲门只证明「对端→我」：通道以未验证身份入槽，
+                                        // verify ACK 到达（tick6 块 Pass）才置 verified 并承载业务。
+                                        let need_req6 = match r_p2p.lock().unwrap().active_channel() {
+                                            Some(ch) => chan_rebuild_needed(ch, from, false),
+                                            None => true,
+                                        };
+                                        if need_req6 {
+                                            let mut ch = P2pChannel::new(
+                                                ls6.clone(), from, true, r_relay.crypto_arc(), false);
+                                            ch.verify_since = Some(std::time::Instant::now());
+                                            println!("  [EXP1] RDV6 verify sent: from={:?} to_peer={:?} via_sock={:?}",
+                                                from, from, ls6.local_addr().map(|a|a.to_string()));
+                                            let _ = ch.stream.lock().unwrap().send(b"\x00");
+                                            r_p2p.lock().unwrap().upsert(ch);
+                                            r6_verify_since = Some(std::time::Instant::now());
+                                            println!("  [RDV6] channel created (verifying) from {}", from);
+                                        }
+                                        *r_last.lock().unwrap() = std::time::Instant::now();
+                                        *r_peer.lock().unwrap() = Some(from);
+                                        // path 切换延后到 verify 决议（tick6 块）
+                                    } else {
+                                        r6_probe_reply
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        // O(shadow)：v6 探测回包 → P2pV6 观察（双向证据 + RTT 轨迹）
+                                        {
+                                            let rtt_ms = crate::vnet::probe::rtt_us_from(ts) / 1000;
+                                            let mut ps = r6_pipes.lock().unwrap();
+                                            let p6 = &mut ps[index_of(PipeKind::P2pV6)];
+                                            p6.o_reply_rx += 1;
+                                            p6.push_rtt(rtt_ms);
+                                            p6.mark_verified();
+                                            p6.update_derived(&r6_policy);
+                                        }
+                                        *r_last.lock().unwrap() = std::time::Instant::now();
+                                        *r_peer.lock().unwrap() = Some(from);
+                                        let need_new6 = match r_p2p.lock().unwrap().active_channel() {
+                                            Some(ch) => chan_rebuild_needed(ch, from, true),
+                                            None => true,
+                                        };
+                                        if need_new6 {
+                                            r_p2p.lock().unwrap().upsert(P2pChannel::new(
+                                                ls6.clone(),
+                                                from,
+                                                true,
+                                                r_relay.crypto_arc(),
+                                                true,
+                                            ));
+                                        }
+                                        // IPv6 优先：无 NAT、通常少一跳（实测 EasyTier 走 udp6 是 46.7ms，
+                                        // 我们走 IPv4 是 72ms）。只升不降，避免和 v4 互相抢占。
+                                        apply_decision(&r6_pipes, &r6_policy, &r_path, &r_p2p, &r6_switches);
+                                    }
+                                }
+                            } else if let Some(ch) = r_p2p.lock().unwrap().active_channel() {
+                                // 通道守卫：帧到达的 socket 必须与通道 socket 一致（防跨流污染）
+                                if std::sync::Arc::ptr_eq(&ch.socket, &ls6) {
+                                    // P2P 数据走可靠流：解密 → 去重排序 → 按序交付
+                                    let chunks = ch.stream.lock().unwrap().on_packet(&buf[..n]);
+                                    for d in chunks {
+                                        r_hub.lock().unwrap().push(d);
+                                    }
+                                } else {
+                                    drop_ghost("rdv6");
+                                }
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(5)),
+                    }
+                    // ARQ 重传检查（通道可能落在本线程的 ls6 上，必须有人 tick）
+                    if tick6_at.elapsed() >= Duration::from_millis(50) {
+                        tick6_at = std::time::Instant::now();
+                        // verify_channel 决议：ACK 到 → 置通道 verified；2s 无 ACK → 丢通道。
+                        // 黑盒回归修复：决议不再依赖 path 是否 direct——path 可已被其它
+                        // socket 的证据翻成 direct，而槽内通道仍是本验证对象；按验证窗口判。
+                        // 槽内通道若已被更强证据顶替成 verified，直接视为通过（清时钟）。
+                        enum VRes { None, Pass, Fail }
+                        let vres = {
+                            let mut g = r_p2p_tick6.lock().unwrap();
+                            let mut v = VRes::None;
+                            // 遍历所有未验证通道（不只 active——RDV6 通道刚创建时 active 可能是 None）
+                            let unverified: Vec<u64> = g.channels.values()
+                                .filter(|c| !c.verified.get() && c.verify_since.is_some())
+                                .map(|c| c.id)
+                                .collect();
+                            for cid in unverified {
+                                // 先提取需要的数据（不可变借用）
+                                let (verified_flag, peer_addr, acked) = {
+                                    if let Some(ch) = g.channels.get(&cid) {
+                                        let mut st = ch.stream.lock().unwrap();
+                                        st.tick();
+                                        let (_, acked, _) = st.stats();
+                                        (ch.verified.get(), ch.peer_addr, acked)
+                                    } else { continue; }
+                                };
+                                // 释放不可变借用后再修改
+                                if let Some(t) = g.channels.get(&cid).and_then(|c| c.verify_since) {
+                                    if acked > 0 {
+                                        println!("  [EXP2] verify PASS via acked={}: ch.peer={:?}", acked, peer_addr);
+                                        if let Some(ch) = g.channels.get(&cid) {
+                                            ch.verified.set(true);
+                                        }
+                                        g.active = Some(cid);
+                                        v = VRes::Pass;
+                                    } else if t.elapsed() > Duration::from_secs(2) {
+                                        println!("  [EXP2] verify FAIL: ch.peer={:?} acked={}", peer_addr, acked);
+                                        v = VRes::Fail;
+                                    }
+                                }
+                            }
+                            v
+                        };
+                        match vres {
+                            VRes::Pass => {
+                                r6_verify_since = None;
+                                // 通道级验证位：verify ACK 到达，通道方可承载业务
+                                {
+                                    let mut g = r_p2p_tick6.lock().unwrap();
+                                    if let Some(ch) = g.active_channel() {
+                                        ch.verified.set(true);
+                                    }
+                                }
+                                // O(shadow)：verify 决议 Pass → P2pV6 双向验证过 + 清失败游程
+                                {
+                                    let mut ps = r6_pipes.lock().unwrap();
+                                    let p6 = &mut ps[index_of(PipeKind::P2pV6)];
+                                    p6.mark_verified();
+                                    p6.update_derived(&r6_policy);
+                                }
+                                apply_decision(&r6_pipes, &r6_policy, &r_path, &r_p2p, &r6_switches);
+                            }
+                            VRes::Fail => {
+                                r6_verify_since = None;
+                                // O(shadow)：verify 决议 Fail → P2pV6 失败游程 +1 + 失去验证
+                                {
+                                    let mut ps = r6_pipes.lock().unwrap();
+                                    let p6 = &mut ps[index_of(PipeKind::P2pV6)];
+                                    p6.mark_failed();
+                                    p6.update_derived(&r6_policy);
+                                }
+                                r_p2p_tick6.lock().unwrap().active = None;
+                                println!("  [RDV6] verify failed (no ACK in 2s), channel dropped");
+                            }
+                            VRes::None => {}
+                        }
+                    }
+
+                    // IPv6 出站保活：建立/维持 [::]:port 的映射与过滤放行
+                    if ka.elapsed() >= Duration::from_secs(5) {
+                        ka = std::time::Instant::now();
+                        kn += 1;
+                        let pkt = r_relay.sign_probe(&crate::vnet::probe::build_probe_packet(kn));
+                        if let Some((_r, ipv6, _a)) = r_relay.query_peer_info(r_target) {
+                            if let Some(v6) = ipv6 {
+                                if v6.is_ipv6() {
+                                    // 源地址对齐：多 v6 地址（隐私扩展临时地址）时，OS 对
+                                    // 该对端实际使用的源地址可能与公告的不同。家宽状态防火墙
+                                    // 按五元组放行，源地址不一致 → 对端回的包进不来/我们的包
+                                    // 被对端路由器丢弃（实测症状：path=P2P 但数据零到达）。
+                                    // 这里用临时 socket connect 求出真实源地址，变了就重公告。
+                                    // UDP connect 锁定（DSH 建议）：connected socket 的源地址
+                                    // 由 OS 在 connect 时固定，send/recv 全走同一路径；公告与之对齐。
+                                    if ls6.peer_addr().map(|p| p != v6).unwrap_or(true) {
+                                        let _ = ls6.connect(v6);
+                                        println!("  [RDV6] ls6 connected -> {}", v6);
+                                    }
+                                    if let Ok(la) = ls6.local_addr() {
+                                        let ip = get_my_ipv6().map(|a| a.ip()); if ip.is_none() { continue; } let want = std::net::SocketAddr::new(ip.unwrap(), la.port());
+                                        let cur = *r6_v6_pub.lock().unwrap();
+                                        if cur != Some(want) {
+                                            let s = want.to_string();
+                                            let _ = r_relay.announce_ipv6(&s);
+                                            *r6_v6_pub.lock().unwrap() = Some(want);
+                                            println!("  [RDV6] IPv6 announce locked -> {}", s);
+                                        }
+                                    }
+                                    let _ = ls6.send_to(&pkt, v6);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // ── Rendezvous 监听 socket 接收线程 ──
+        // 对端会主动连到我们公告的公网映射地址，落到这个 socket 上。
+        // 必须有人读它，否则对端的敲门包被内核丢掉。
+        if let Some(ref ls) = self.listen_sock {
+            let ls = ls.clone();
+            let r_lrx = self.listen_rx.clone();
+            let r_probe_req = self.probe_req_rx.clone();
+            let r4_pipes = self.pipes.clone();
+            let r4_policy = self.policy.clone();
+            let r4_switches = self.path_switches.clone();
+            let r_probe_reply = self.probe_reply_rx.clone();
+            let r_listen_pub = self.listen_pub.clone();
+            let r_p2p_tick = self.p2p.clone();
+            let mut tick_at = std::time::Instant::now();
+            let r_p2p_tick6 = self.p2p.clone();
+            let mut tick6_at = std::time::Instant::now();
+            let r_ka_target: Arc<Mutex<Option<std::net::SocketAddr>>> =
+                Arc::new(Mutex::new(None));
+            let r_ka_target_inner = r_ka_target.clone();
+            // 本连接 v6 监听的实际端口（自愈公告用；多实例回退后不再是 9100）
+            let r_v6_lport: u16 = self.listen_sock_v6.as_ref()
+                .and_then(|s| s.local_addr().ok())
+                .map(|a| a.port()).unwrap_or(9100);
+            let r_target_peer = self.target_peer_id;
+            let r_relay = self.relay.clone();
+            let r_path = self.path.clone();
+            let r_p2p = self.p2p.clone();
+            let r_peer = self.p2p_peer.clone();
+            let r_hub = self.hub.clone();
+            let r_run = self.running.clone();
+            let r_last = self.last_p2p_reply.clone();
+            let r_v6_pub = self.announced_v6.clone();
+        thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                let mut ka_start = std::time::Instant::now();
+                let mut ka_nonce: u64 = 0;
+                // 非阻塞 STUN 状态机：绝不能另起线程读同一个 socket（会抢数据包）。
+                // 在本循环里发请求、在本循环里收响应，两不干扰。
+                let mut stun_next = std::time::Instant::now() + Duration::from_secs(30);
+                let mut stun_pending: Option<([u8; 12], std::time::Instant, std::net::SocketAddr)> = None;
+                while r_run.load(Ordering::Relaxed) {
+                    // 到期：发起一次映射探测
+                    if stun_pending.is_none() && std::time::Instant::now() >= stun_next {
+                        stun_next = std::time::Instant::now() + Duration::from_secs(30);
+                        for srv in ["stun.chat.bilibili.com:3478", "stun.hitv.com:3478"] {
+                            if let Some(saddr) = crate::vnet::stun::resolve_stun_server(srv) {
+                                let (tid, pkt) = crate::vnet::stun::make_binding_request();
+                                let _ = ls.send_to(&pkt, saddr);
+                                stun_pending = Some((tid, std::time::Instant::now() + Duration::from_secs(3), saddr));
+                                break;
+                            }
+                        }
+                    }
+                    match ls.recv_from(&mut buf) {
+                        Ok((n, from)) => {
+                            r_lrx.fetch_add(1, Ordering::Relaxed);
+                            // 过滤类型证据：能收到「不是对端监听端口」发来的包，
+                            // 说明 NAT 允许了我们没发过包的源端口 → ADF/EIF，不是 APDF。
+                            // 用公告端口而非通道端口：证据往往在通道建立前就到达了。
+                            let kp = peer_listen_port_known();
+                            if kp != 0 && from.port() != kp {
+                                note_filter_evidence_ip_based();
+                            }
+                            // 先看是不是我们那笔 STUN 查询的响应（同 socket，不额外抢包）
+                            let mut consumed_by_stun = false;
+                            if let Some((tid, _dl, saddr)) = stun_pending {
+                                if from == saddr {
+                                    if let Some((pubaddr, rtid)) =
+                                        crate::vnet::stun::parse_binding_response_pub(&buf[..n])
+                                    {
+                                        if rtid == tid {
+                                            let cur = *r_listen_pub.lock().unwrap();
+                                            if cur != Some(pubaddr) {
+                                                println!("  [RDV] listen mapping changed {:?} -> {}, re-announcing",
+                                                    cur, pubaddr);
+                                                let _ = r_relay.announce_ipv4(&pubaddr.to_string());
+                                                *r_listen_pub.lock().unwrap() = Some(pubaddr);
+                                            }
+                                            stun_pending = None;
+                                            consumed_by_stun = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if consumed_by_stun {
+                                continue;
+                            }
+                            // DIAG: 打印监听 socket 收到的任何包的源地址（判断对端实际出口 IP）
+                            {
+                                use std::sync::atomic::{AtomicU64, Ordering as O2};
+                                static RX: AtomicU64 = AtomicU64::new(0);
+                                let k = RX.fetch_add(1, O2::Relaxed);
+                                if k < 8 || k % 30 == 0 {
+                                    println!("  [RDV-IN] len={} from={}", n, from);
+                                }
+                            }
+                            if let Some(body) = r_relay.verify_probe(&buf[..n]) {
+                                if let Some((ptype, nonce_p, ts)) =
+                                    crate::vnet::probe::parse_probe_full(body)
+                                {
+                                    if ptype == crate::vnet::probe::PROBE_TYPE_REQUEST {
+                                        r_probe_req
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        // O(shadow)：v4 敲门包 → P2pV4 观察。
+                                        // 与 v6 不同，这里把合法签名 REQUEST 记为双向验证：
+                                        // v4 汇合打的是「我们自己用同一 socket 保活出的公告映射」，
+                                        // 对端刚从该四元组发出 → 回程路径存在；黑盒场景由
+                                        // watchdog 停滞证据兜底（3s 内降级）。
+                                        {
+                                            let mut ps = r4_pipes.lock().unwrap();
+                                            let p4 = &mut ps[index_of(PipeKind::P2pV4)];
+                                            p4.o_req_rx += 1;
+                                            p4.mark_verified();
+                                            p4.update_derived(&r4_policy);
+                                        }
+                                        let reply = r_relay.sign_probe(
+                                            &crate::vnet::probe::build_probe_reply(nonce_p, ts));
+                                        let _ = ls.send_to(&reply, from);
+                                        // 同 v6：收到合法签名的 REQUEST 即建通道（v4 路径），不再只等 REPLY。
+                                        // PATH-STRATEGY：v6 > v4，v6 通道不被 v4 敲门降级替换
+                                        // （实测 v4/v6 敲门都到达时通道来回翻，每翻一次 ARQ 归零）
+                                        let need_req4 = match r_p2p.lock().unwrap().active_channel() {
+                                            Some(ch) => chan_rebuild_needed(ch, from, true)
+                                                && !(ch.peer_addr.is_ipv6() && from.is_ipv4()),
+                                            None => true,
+                                        };
+                                        if need_req4 {
+                                            r_p2p.lock().unwrap().upsert(P2pChannel::new(
+                                                ls.clone(), from, false, r_relay.crypto_arc(), true));
+                                        }
+                                        *r_last.lock().unwrap() = std::time::Instant::now();
+                                        *r_peer.lock().unwrap() = Some(from);
+                                        apply_decision(&r4_pipes, &r4_policy, &r_path, &r_p2p, &r4_switches);
+                                    } else {
+                                        // 对端回了我方的探测 -> P2P 打通，复用监听 socket
+                                        *r_last.lock().unwrap() = std::time::Instant::now();
+                                        *r_peer.lock().unwrap() = Some(from);
+                                        // 关键：不要每次收到回复都重建通道！
+                                        // 重建会新建 TunnelStream、ARQ 序号归零，
+                                        // 对端接收窗口已推进，新包会被全部判为重复而丢弃（实测 4/20）。
+                                        r_probe_reply.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        // O(shadow)：v4 探测回包 → P2pV4 观察（双向证据 + RTT 轨迹）
+                                        {
+                                            let rtt_ms = crate::vnet::probe::rtt_us_from(ts) / 1000;
+                                            let mut ps = r4_pipes.lock().unwrap();
+                                            let p4 = &mut ps[index_of(PipeKind::P2pV4)];
+                                            p4.o_reply_rx += 1;
+                                            p4.push_rtt(rtt_ms);
+                                            p4.mark_verified();
+                                            p4.update_derived(&r4_policy);
+                                        }
+                                        let need_new = match r_p2p.lock().unwrap().active_channel() {
+                                            Some(ch) => chan_rebuild_needed(ch, from, true),
+                                            None => true,
+                                        };
+                                        if need_new {
+                                            r_p2p.lock().unwrap().upsert(P2pChannel::new(
+                                                ls.clone(),
+                                                from,
+                                                false,
+                                                r_relay.crypto_arc(),
+                                                true,
+                                            ));
+                                        }
+                                        {
+                                            use std::sync::atomic::{AtomicU64, Ordering as O2};
+                                            static RC: AtomicU64 = AtomicU64::new(0);
+                                            let k = RC.fetch_add(1, O2::Relaxed);
+                                            if k < 5 || k % 30 == 0 {
+                                                let us = crate::vnet::probe::rtt_us_from(ts);
+                                                println!("  [RDV-RTT] {:.1}ms from {} (#{})", us as f64 / 1000.0, from, k + 1);
+                                            }
+                                        }
+                                        apply_decision(&r4_pipes, &r4_policy, &r_path, &r_p2p, &r4_switches);
+                                    }
+                                }
+                            } else if let Some(ch) = r_p2p.lock().unwrap().active_channel() {
+                                // 通道守卫：帧到达的 socket 必须与通道 socket 一致（防跨流污染）
+                                if std::sync::Arc::ptr_eq(&ch.socket, &ls) {
+                                    // ARQ：走可靠流按序交付
+                                    let chunks = ch.stream.lock().unwrap().on_packet(&buf[..n]);
+                                    for d in chunks { r_hub.lock().unwrap().push(d); }
+                                } else {
+                                    drop_ghost("rdv4");
+                                }
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(5)),
+                    }
+
+                    // ARQ 重传检查（每 50ms 一次）
+                    if tick_at.elapsed() >= Duration::from_millis(50) {
+                        tick_at = std::time::Instant::now();
+                        if let Some(ch) = r_p2p_tick.lock().unwrap().active_channel() {
+                            ch.stream.lock().unwrap().tick();
+                        }
+                    }
+
+                    if let Some((_, dl, _)) = stun_pending {
+                        if std::time::Instant::now() > dl { stun_pending = None; }
+                    }
+
+                    // Rendezvous 的关键：监听 socket 必须持续出站，否则 NAT 里没有它的映射，
+                    // 对端连过来会被直接丢弃（这就是"公告了地址却连不上"的原因）。
+                    if ka_start.elapsed() >= Duration::from_secs(10) {
+                        ka_start = std::time::Instant::now();
+                        ka_nonce += 1;
+                        // 注意：映射自愈的 STUN 查询不能放在接收循环里——
+                        // query_stun_on_socket 最长阻塞 3 秒，会把接收循环卡住，
+                        // 导致排队积压（实测把 65ms 的应用层延迟测成 128ms，并造成压测超时）。
+                        // 自愈已改为独立线程。
+                        let pkt = r_relay.sign_probe(
+                            &crate::vnet::probe::build_probe_packet(ka_nonce));
+                        // 从对端公告里刷新保活目标（relay 观察到的 IPv4 + 对端监听映射）
+                        if let Some((relay_addr, _v6, announced_v4)) =
+                            r_relay.query_peer_info(r_target_peer)
+                        {
+                            if relay_addr.ip().is_ipv4() {
+                                *r_ka_target_inner.lock().unwrap() = Some(relay_addr);
+                            }
+                            if let Some(a) = announced_v4 {
+                                if a.ip().is_ipv4() {
+                                    *r_ka_target_inner.lock().unwrap() = Some(a);
+                                }
+                            }
+                        }
+                        // IPv6 公告自愈：切网后启动时 get_my_ipv6 可能返回 None（地址未就绪），
+                        // 而公告只在启动做一次 → 服务端永远拿不到 v6、无从敲门（实测根因）。
+                        // 每 3 个保活轮（约 30s）重探，空→有 或 变化 时重公告。
+                        if ka_nonce % 3 == 0 {
+                            let cur_sa: Option<std::net::SocketAddr> = get_my_ipv6()
+                                .map(|a| a.ip())
+                                .map(|ip| format!("[{}]:{}", ip, r_v6_lport))
+                                .and_then(|x| x.parse().ok());
+                            let last = *r_v6_pub.lock().unwrap();
+                            let need = match (&last, &cur_sa) {
+                                (None, Some(_)) => true,
+                                (Some(a), Some(b)) => a != b,
+                                _ => false,
+                            };
+                            if need {
+                                if let Some(sa) = cur_sa {
+                                    if !sa.ip().is_unspecified() {
+                                        let s = sa.to_string();
+                                        println!("  [RDV] IPv6 announce {:?} -> {}, re-announcing", last, s);
+                                        let _ = r_relay.announce_ipv6(&s);
+                                    }
+                                    *r_v6_pub.lock().unwrap() = Some(sa);
+                                }
+                            }
+                        }
+                        // 必须按地址族过滤：v4 监听 socket 发往 IPv6 地址会返回
+                        // os error 97 (Address family not supported)，而 r_peer 可能是
+                        // 通过 v6 通道学到的地址（实测手机 WiFi 场景每轮都刷这个错）。
+                        let targets: Vec<std::net::SocketAddr> = {
+                            let mut v = Vec::new();
+                            if let Some(a) = *r_peer.lock().unwrap() {
+                                if a.is_ipv4() { v.push(a); }
+                            }
+                            if let Some(a) = *r_ka_target_inner.lock().unwrap() {
+                                if a.is_ipv4() && !v.contains(&a) { v.push(a); }
+                            }
+                            v
+                        };
+                        for t in targets {
+                            match ls.send_to(&pkt, t) {
+                                Ok(n) => {
+                                    use std::sync::atomic::{AtomicU64, Ordering as O2};
+                                    static TX: AtomicU64 = AtomicU64::new(0);
+                                    let k = TX.fetch_add(1, O2::Relaxed);
+                                    if k < 5 || k % 20 == 0 {
+                                        println!("  [RDV-TX] {} bytes -> {} (from :{})", n, t,
+                                            ls.local_addr().map(|a| a.port()).unwrap_or(0));
+                                    }
+                                }
+                                Err(e) => println!("  [RDV-TX] ERR -> {}: {}", t, e),
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // ── 打洞引擎（PLAN 第四节：20 socket 池 + 双向端口扫描）──
+        // 简单探测打不通时（对称 NAT / 端口随机），由 PunchEngine 做端口扫描。
+        // 打通后必须复用「胜出的那个 socket」收发数据——NAT 映射绑在 socket 上。
+        {
+            let pr_relay = self.relay.clone();
+            let pr_path = self.path.clone();
+            let pr_p2p = self.p2p.clone();
+            let pr_peer = self.p2p_peer.clone();
+            let pr_hub = self.hub.clone();
+            let pr_run = self.running.clone();
+            let pr_lock = self.punch_locked.clone();
+            let pr_pipes = self.pipes.clone();
+            let pr_policy = self.policy.clone();
+            let pr_switches = self.path_switches.clone();
+            let pr_target = self.target_peer_id;
+            thread::spawn(move || {
+                // VNET_NO_P2P=1 必须同时禁用打洞引擎，否则「强制走中继」压测会被 P2P 污染
+                if std::env::var("VNET_NO_P2P").unwrap_or_default() == "1" {
+                    println!("  [DIAG] VNET_NO_P2P=1 -> punch engine disabled");
+                    return;
+                }
+                let mut engine: Option<crate::vnet::punch::PunchEngine> = None;
+                let mut last_engine_cands: Option<(std::net::SocketAddr, Option<std::net::SocketAddr>, Option<std::net::SocketAddr>)> = None;
+                let mut nonce = 0u64;
+                let mut pump_sock: Option<std::sync::Arc<UdpSocket>> = None;
+                let mut last_probe = std::time::Instant::now();
+                    let mut pump_tick_at = std::time::Instant::now();
+                let mut punch_reported = false;
+
+                while pr_run.load(Ordering::Relaxed) {
+                    // 已打通 -> 只做数据泵 + 保活
+                    if let Some(ref sock) = pump_sock {
+                        let mut buf = [0u8; 65536];
+                        loop {
+                            match sock.recv_from(&mut buf) {
+                                Ok((n, from)) => {
+                                    if let Some((ptype, nonce_p, ts)) =
+                                        crate::vnet::probe::parse_probe_full(&buf[..n])
+                                    {
+                                        if ptype == crate::vnet::probe::PROBE_TYPE_REQUEST {
+                                            let reply = pr_relay.sign_probe(
+                                                &crate::vnet::probe::build_probe_reply(nonce_p, ts));
+                                            let _ = sock.send_to(&reply, from);
+                                        }
+                                    } else if let Some(ch) = pr_p2p.lock().unwrap().active_channel() {
+                                        {
+                                            use std::sync::atomic::{AtomicU64, Ordering as O3};
+                                            static DBG: AtomicU64 = AtomicU64::new(0);
+                                            let dk = DBG.fetch_add(1, O3::Relaxed);
+                                            if dk < 10 {
+                                                println!("  [DBG-FIX] pump rx {}B from {} ptr_eq={}",
+                                                    n, from, std::sync::Arc::ptr_eq(&ch.socket, sock));
+                                            }
+                                        }
+                                        // 通道守卫：帧到达的 socket 必须与通道 socket 一致（防跨流污染）
+                                        if std::sync::Arc::ptr_eq(&ch.socket, sock) {
+                                            // P2P 数据走可靠流：解密 → 去重排序 → 按序交付
+                                            let chunks = ch.stream.lock().unwrap().on_packet(&buf[..n]);
+                                            for d in chunks {
+                                                pr_hub.lock().unwrap().push(d);
+                                            }
+                                        } else {
+                                            drop_ghost("punch");
+                                        }
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        // ARQ tick：通道若落在打洞胜出 socket 上，必须有人重传
+                        if pump_tick_at.elapsed() >= Duration::from_millis(50) {
+                            pump_tick_at = std::time::Instant::now();
+                            if let Some(ch) = pr_p2p.lock().unwrap().active_channel() {
+                                ch.stream.lock().unwrap().tick();
+                            }
+                        }
+                        // 保持 NAT 映射：每 15 秒一个探测
+                        if last_probe.elapsed() >= Duration::from_secs(15) {
+                            nonce += 1;
+                            if let Some(peer) = *pr_peer.lock().unwrap() {
+                                let pkt = pr_relay.sign_probe(
+                                    &crate::vnet::probe::build_probe_packet(nonce));
+                                let _ = sock.send_to(&pkt, peer);
+                            }
+                            last_probe = std::time::Instant::now();
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+
+                    // 简单探测已打通就不需要端口扫描
+                    if pr_path.lock().unwrap().is_direct() {
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+
+                    // 懒创建引擎（需要先拿到对端地址）
+                    // 候选变化时重建引擎：否则引擎拿着创建瞬间的陈旧候选，对端重新公告后仍打旧端口
+                    let cur_cands = pr_relay.query_peer_info(pr_target);
+                    let changed = match (&cur_cands, &last_engine_cands) {
+                        (Some((r1, v1, p1)), Some((r0, v0, p0))) => r1 != r0 || v1 != v0 || p1 != p0,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if changed { engine = None; last_engine_cands = cur_cands.clone(); }
+                    if engine.is_none() {
+                        if let Some((relay_addr, ipv6, public_v4)) = cur_cands.clone()
+                        {
+                            let stun_port = public_v4.map(|a| a.port())
+                                .or(Some(relay_addr.port()));
+                            match crate::vnet::punch::PunchEngine::new(
+                                ipv6.filter(|a| a.is_ipv6()),
+                                public_v4.or(Some(relay_addr)),
+                                stun_port,
+                                20,
+                                pr_relay.probe_auth_clone(),
+                            ) {
+                                Ok(e) => {
+                                    println!("  [PUNCH] Engine ready: 20 sockets, peer v4={:?} v6={:?}",
+                                        public_v4.or(Some(relay_addr)), ipv6);
+                                    engine = Some(e);
+                                }
+                                Err(e) => {
+                                    println!("  [PUNCH] Engine init failed: {}", e);
+                                    thread::sleep(Duration::from_secs(5));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            thread::sleep(Duration::from_secs(2));
+                            continue;
+                        }
+                    }
+
+                    if let Some(ref mut e) = engine {
+                        nonce += 1;
+                        if e.punch_round(nonce) {
+                            if let Some(res) = e.get_result() {
+                                // 简单探测已经打通时，打洞引擎只保留为备份，不接管数据面。
+                                // 两条路径同时抢一个 P2P 通道会导致服务端按 A socket 回包、
+                                // 客户端从 B socket 发出，实测丢一半。
+                                let simple_ok = pr_path.lock().unwrap().is_direct();
+                                if simple_ok {
+                                    if !punch_reported {
+                                        println!("  [PUNCH] {} also reachable ({}), keeping simple path",
+                                            res.method.name(), res.peer_addr);
+                                        punch_reported = true;
+                                    }
+                                    thread::sleep(Duration::from_secs(2));
+                                    continue;
+                                }
+                                if let Some(sock) = e.winning_socket() {
+                                    println!("  [PUNCH] Success via {} -> {}, reusing socket for data",
+                                        res.method.name(), res.peer_addr);
+                                    *pr_peer.lock().unwrap() = Some(res.peer_addr);
+                                    pr_lock.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    // 与 RDV 分支同理：通道已存在且对端未变时绝不重建。
+                                    // 打洞引擎每轮都会「成功」，无条件重建会让 ARQ 序号归零，
+                                    // 对端把新包全判为重复丢弃 —— 症状是「前几次能通、之后全失败」。
+                                    let need_pr = match pr_p2p.lock().unwrap().active_channel() {
+                                        Some(ch) => ch.peer_addr != res.peer_addr || !ch.verified.get(),
+                                        None => true,
+                                    };
+                                    if need_pr {
+                                        pr_p2p.lock().unwrap().upsert(P2pChannel::new(
+                                            sock.clone(), res.peer_addr, res.is_ipv6, pr_relay.crypto_arc(), true));
+                                    }
+                                    // O(shadow)：打洞胜出 = 探测往返成立 → 对应族管道双向验证
+                                    {
+                                        let fam = if res.is_ipv6 { PipeKind::P2pV6 } else { PipeKind::P2pV4 };
+                                        let mut ps = pr_pipes.lock().unwrap();
+                                        let pp = &mut ps[index_of(fam)];
+                                        pp.o_reply_rx += 1;
+                                        pp.mark_verified();
+                                        pp.update_derived(&pr_policy);
+                                    }
+                                    apply_decision(&pr_pipes, &pr_policy, &pr_path, &pr_p2p, &pr_switches);
+                                    pump_sock = Some(sock);
+                                }
+                            }
+                        }
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+            });
+        }
+
+        let proxy_addr = format!("127.0.0.1:{}", local_port);
+        let listener = TcpListener::bind(&proxy_addr)?;
+        self.run_accept(listener, &proxy_addr)
+    }
+
+    /// 启动客户端并立即返回（accept 循环跑在独立线程）——
+    /// 嵌入方（async/管理面线程）用这个，避免调用线程被 accept 吃掉。
+    /// 返回 Ok 前已完成端口绑定校验（绑定失败立刻报错，不在线程里静默失败）。
+    ///
+    /// 注意：必须跑**完整版 start_client** —— 它才起探测/打洞/保活/状态线程。
+    /// （2026-11-05 修复：此前这里只 spawn accept 循环，宿主用它必然退化成纯中继。）
+    pub fn start_client_detached(self: &std::sync::Arc<Self>, local_port: u16) -> anyhow::Result<()> {
+        {
+            // 同步预检端口可绑（失败立刻报错；成功即释放，真实绑定在 start_client 内）
+            let probe = TcpListener::bind(("127.0.0.1", local_port))?;
+            drop(probe);
+        }
+        let me = self.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = me.start_client(local_port) {
+                eprintln!("  [!!] start_client (detached) exited for peer {}: {:#}", me.my_peer_id, e);
+            } else {
+                println!("  [DETACHED] start_client OK for peer {} (threads alive)", me.my_peer_id);
+            }
+        });
+        Ok(())
+    }
+
+    /// accept 主循环：**可中断**（看 running 标志），退出时 listener 被 drop → 端口释放。
+    /// 2026-11-05 修复：原 `for stream in listener.incoming()` 永不返回且不看 running，
+    /// 导致 (a) 嵌入方调用线程被永久占用 (b) stop 后端口不释放、无法原地重建。
+    fn run_accept(&self, listener: TcpListener, proxy_addr: &str) -> anyhow::Result<()> {
+        listener.set_nonblocking(true)?;
+        println!("  [OK] Local proxy on {}", proxy_addr);
+
+        while self.running.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((client, peer)) => {
+                    println!("  [>>] Connection from {} (spawned)", peer);
+                    // 每条连接独立线程：一条卡住不影响后续 accept
+                    let ctx = self.ctx();
+                    thread::spawn(move || ctx.forward(client));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    eprintln!("  [!!] Accept: {}", e);
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        // listener 在此 drop → 端口立即释放，可原地重建
+        drop(listener);
+        println!("  [OK] Local proxy on {} closed (port released)", proxy_addr);
+        Ok(())
+    }
+
+}
+
+/// 单条连接转发所需的上下文（全是 Arc 句柄，可安全 move 进独立线程）。
+/// accept 循环必须为每条连接 spawn 一个线程，绝不在这里阻塞，
+/// 否则一条不发 EOF 的悬挂连接就会冻结整条隧道的 accept。
+#[derive(Clone)]
+struct ForwardCtx {
+    running: Arc<AtomicBool>,
+    relay: Arc<RelayClient>,
+    relay_arq: Arc<std::sync::Mutex<crate::vnet::relay_arq::RelayArq>>,
+    p2p: Arc<Mutex<P2pRegistry>>,
+    path: Arc<Mutex<DataPath>>,
+    hub: Arc<Mutex<ConnHub>>,
+    p2p_peer: Arc<Mutex<Option<std::net::SocketAddr>>>,
+    target_peer_id: u32,
+    pipes: Arc<Mutex<Vec<PathPipe>>>,
+    policy: RPolicy,
+    switches: Arc<Mutex<u32>>,
+}
+
+impl ForwardCtx {
+    fn forward(&self, client: TcpStream) {
+        // 注册本连接的下行队列
+        let conn_id = self.hub.lock().unwrap().register();
+        let hub_up = self.hub.clone();
+        let hub_down = self.hub.clone();
+        let running = self.running.clone();
+        let relay = self.relay.clone();
+        let p2p = self.p2p.clone();
+        let path = self.path.clone();
+        let target_id = self.target_peer_id;
+
+        // Connection-active flag: when either thread exits, the other should too
+        let conn_active = Arc::new(AtomicBool::new(true));
+        // 本端是否只是半关闭（SHUT_WR）。只有半关闭才需要 drain，否则立即释放 accept 循环
+        let half_closed = Arc::new(AtomicBool::new(false));
+
+        let up_client = client.try_clone().unwrap();
+        let up_relay = relay.clone();
+        let up_relay_arq: Arc<std::sync::Mutex<crate::vnet::relay_arq::RelayArq>> = self.relay_arq.clone();
+        let up_p2p = p2p.clone();
+        let up_path = path.clone();
+        let up_target = target_id;
+        let up_running = running.clone();
+        let up_active = conn_active.clone();
+        let up_peer = self.p2p_peer.clone();
+        let up_half = half_closed.clone();
+        let up_pipes = self.pipes.clone();
+        let up_policy = self.policy.clone();
+        let up_switches = self.switches.clone();
+
+        let up = thread::spawn(move || {
+            let mut stream = up_client;
+            // accept 即注册 owner：server-first 数据在上行首包之前就可能到达，
+            // 不能等应用先写数据才 claim，否则 greeting 会卡在 ConnHub 队列里。
+            hub_up.lock().unwrap().claim(conn_id);
+            // server-first 协议必须在任何应用 DATA 前建立 upstream：
+            // 发送幂等 SESSION_START（仅 relay 路径），server 收到后立即连接目标端口。
+            if !up_path.lock().unwrap().is_direct() {
+                let _ = up_relay.send_to_peer(up_target, &crate::vnet::transport::build_session_start());
+            }
+            let mut buf = [0u8; 16384]; // 256KB：一次读大 payload，避免多次 send
+            stream.set_read_timeout(Some(Duration::from_millis(50))).ok();
+            while up_running.load(Ordering::Relaxed) && up_active.load(Ordering::Relaxed) {
+                match stream.read(&mut buf) {
+                    Ok(0) => { up_half.store(true, Ordering::Relaxed); break; }
+                    Ok(n) => {
+                        hub_up.lock().unwrap().claim(conn_id);
+                        let current = *up_path.lock().unwrap();
+                        if current.is_direct() {
+                            // ── 流控：等 inflight < 64 再发（锁不持有，receiver 可清 ACK）──
+                            loop {
+                                let cnt = {
+                                    let g = up_p2p.lock().unwrap();
+                                    match g.active_channel() {
+                                        Some(ch) => ch.stream.lock().unwrap().inflight_count(),
+                                        None => 0,
+                                    }
+                                };
+                                if cnt < 64 { break; }
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            // P2P：优先用已建立的 P2P 通道（IPv4/IPv6 各自 socket）
+                            let guard = up_p2p.lock().unwrap();
+                            if let Some(ch) = guard.active_channel() {
+                                // ARQ：编号 + 加密 + 记 inflight，超时自动重传
+                                {
+                                    use std::sync::atomic::Ordering as DO;
+                                    let sn = DIAG_SEND.fetch_add(1, DO::Relaxed);
+                                    if n > 32768 || sn < 20 {
+                                        let infl = ch.stream.lock().unwrap().inflight_count();
+                                        println!("  [DIAG] SEND#{}: {}B inflight={} t={}",
+                                            sn, n, infl, std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+                                    }
+                                }
+                                if ch.stream.lock().unwrap().send(&buf[..n]).is_err() {
+                                    let ch_v6 = ch.is_ipv6;
+                                    drop(guard);
+                                    // O(shadow)：通道发送失败 → 对应族管道记失败证据
+                                    {
+                                        let fam = if ch_v6 { PipeKind::P2pV6 } else { PipeKind::P2pV4 };
+                                        let mut ps = up_pipes.lock().unwrap();
+                                        let pp = &mut ps[index_of(fam)];
+                                        pp.mark_failed();
+                                        pp.update_derived(&up_policy);
+                                    }
+                                    // 发送失败 -> 证据已记（mark_failed），决策体降级标签；
+                                    // 死通道就地清（原语义；决策体不再代清），本包走中继
+                                    apply_decision(&up_pipes, &up_policy, &up_path, &up_p2p, &up_switches);
+                                    up_p2p.lock().unwrap().active = None;
+                                    // P2P 失败 fallback → relay（也走 ARQ）
+                                    {
+                                        let mut raq = up_relay_arq.lock().unwrap();
+                                        raq.send(&buf[..n]);
+                                        let (nf, rf) = raq.flush_and_tick();
+                                        drop(raq);
+                                        for frame in nf { let _ = up_relay.send_to_peer(up_target, &frame); }
+                                        for frame in rf { let _ = up_relay.send_to_peer(up_target, &frame); }
+                                    }
+                                }
+                            } else {
+                                drop(guard);
+                                // 无 P2P 通道 → relay（走 ARQ）
+                                {
+                                    let mut raq = up_relay_arq.lock().unwrap();
+                                    raq.send(&buf[..n]);
+                                    let (nf, rf) = raq.flush_and_tick();
+                                    drop(raq);
+                                    for frame in nf { let _ = up_relay.send_to_peer(up_target, &frame); }
+                                    for frame in rf { let _ = up_relay.send_to_peer(up_target, &frame); }
+                                }
+                            }
+                        } else {
+                            // 主 relay 路径（!is_direct）→ ARQ
+                            {
+                                let mut raq = up_relay_arq.lock().unwrap();
+                                raq.send(&buf[..n]);
+                                let (new_f, retrans_f) = raq.flush_and_tick();
+                                drop(raq);
+                                for frame in new_f { let _ = up_relay.send_to_peer(up_target, &frame); }
+                                for frame in retrans_f { let _ = up_relay.send_to_peer(up_target, &frame); }
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+            }
+            // 注意：不在这里清 conn_active —— 由 forward() 在 drain 完成后清，
+            // 否则 down 线程会立即退出，在途响应来不及写出。
+        });
+
+        let down_client = client.try_clone().unwrap();
+        let down_active = conn_active.clone();       // moved into thread
+        let down_active_obs = conn_active.clone();   // observer for drain loop
+        let down_running = running;
+        let down_queue = self.hub.clone();
+        // 记录 down 线程最后一次成功写入的时刻（drain 判据）
+        let last_write = Arc::new(Mutex::new(std::time::Instant::now()));
+        let last_write_obs = last_write.clone();
+
+        let down = thread::spawn(move || {
+            let mut stream = down_client;
+            while down_running.load(Ordering::Relaxed) && down_active.load(Ordering::Relaxed) {
+                let mut got = false;
+                // 从常驻接收线程投递的队列取数据
+                loop {
+                    let item = {
+                    let r = down_queue.lock().unwrap().pop(conn_id);
+                    if let Some(ref d) = r {
+                        use std::sync::atomic::Ordering as DO;
+                        let pn = DIAG_HUB_POP.fetch_add(1, DO::Relaxed);
+                        if d.len() > 1100 || pn < 20 {
+                            println!("  [DIAG] HUB_POP#{}: {}B conn={}",
+                                pn, d.len(), conn_id);
+                        }
+                    }
+                    r
+                };
+                    match item {
+                        Some(data) => {
+                            if data.is_empty() { continue; }
+                            if stream.write_all(&data).is_err() {
+                                down_active.store(false, Ordering::Relaxed);
+                                return;
+                            }
+                            *last_write.lock().unwrap() = std::time::Instant::now();
+                            got = true;
+                        }
+                        None => break,
+                    }
+                }
+                if !got { thread::sleep(Duration::from_millis(1)); }
+            }
+            down_active.store(false, Ordering::Relaxed);
+        });
+
+        let _ = up.join();
+        // 半关闭语义：本端可能只是 SHUT_WR（如 nc/curl 发完请求就关写端），
+        // 仍须把在途响应排空再关连接。
+        // 关键：只有「半关闭」才 drain；对端完全关闭时立即释放，否则会阻塞下一次 accept。
+        // drain 上限只需覆盖一个正常往返（60ms 足够），
+        // 用 400ms 会让「发请求→收响应→关闭」的客户端在关闭时白等，串行压测下延迟飙到 157ms。
+        let up_closed_at = std::time::Instant::now();
+        let queue_for_drain = self.hub.clone();
+        if half_closed.load(Ordering::Relaxed) {
+            loop {
+                let pending = queue_for_drain.lock().unwrap().pending(conn_id) > 0;
+                let wrote = *last_write_obs.lock().unwrap() > up_closed_at;
+                let elapsed = up_closed_at.elapsed();
+                if !down_active_obs.load(Ordering::Relaxed) { break; }
+                if !pending && wrote { break; }                        // 响应已交付
+                if !pending && elapsed > Duration::from_millis(60) { break; }
+                if elapsed > Duration::from_millis(250) { break; }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        conn_active.store(false, Ordering::Relaxed);
+        let _ = down.join();
+        hub_down.lock().unwrap().unregister(conn_id);
+        println!("  [<<] Connection closed");
+    }
+}
+
+/// Server mode
+pub fn start_server(relay_addr: &str, peer_id: u32, target_port: u16) -> anyhow::Result<std::sync::Arc<AtomicBool>> {
+    start_server_with_secret(relay_addr, peer_id, target_port, None)
+}
+
+pub fn start_server_with_secret(
+    relay_addr: &str,
+    peer_id: u32,
+    target_port: u16,
+    secret: Option<&str>,
+) -> anyhow::Result<std::sync::Arc<AtomicBool>> {
+    start_server_full(relay_addr, peer_id, target_port, secret, None)
+}
+
+/// 宿主可显式指定 P2P 监听端口（多实例时避免抢 9100；被占自动回落随机口并公告真实端口）
+pub fn start_server_full(
+    relay_addr: &str,
+    peer_id: u32,
+    target_port: u16,
+    secret: Option<&str>,
+    preferred_p2p_port: Option<u16>,
+) -> anyhow::Result<std::sync::Arc<AtomicBool>> {
+    crate::vnet::fwcheck::spawn_check();
+
+    let crypto = secret.map(|s| {
+        use crate::vnet::crypto::{Role, SessionCrypto};
+        SessionCrypto::new(&SessionCrypto::key_from_secret(s), Role::Server)
+    });
+    let encrypted = crypto.is_some();
+    let relay = Arc::new(RelayClient::with_crypto(relay_addr, peer_id, crypto, secret)?);
+    {
+            let mut retry_delay = Duration::from_secs(1);
+            loop {
+                match relay.register() {
+                    Ok(()) => break,
+                    Err(e) => {
+                        eprintln!("  [SRV] relay register failed: {:#} — retry in {:?}", e, retry_delay);
+                        if retry_delay >= Duration::from_secs(30) {
+                            return Err(e);
+                        }
+                        thread::sleep(retry_delay);
+                        retry_delay *= 2;
+                    }
+                }
+            }
+        }
+    if encrypted {
+        println!("  [OK] End-to-end encryption: AES-256-GCM (PSK)");
+    } else {
+        println!("  [!!] WARNING: no --secret given, tunnel data is PLAINTEXT");
+    }
+    println!("  [OK] Server peer {} registered, target=127.0.0.1:{}", peer_id, target_port);
+
+
+    // 通告 STUN 发现的公网出口 IP（多出口 ISP 场景必需）
+    // Rendezvous：服务端先绑监听 socket，用「它自己」STUN 学出公网映射并公告，
+    // 而不是用 relay socket 的出口（那个端口对监听端口无效，对端连不上）。
+    let p2p_port: u16 = preferred_p2p_port
+        .or_else(|| std::env::var("VNET_P2P_PORT").ok().and_then(|v| v.parse().ok()))
+        .unwrap_or(9100);
+    let p2p_v4 = UdpSocket::bind(format!("0.0.0.0:{}", p2p_port))
+        .or_else(|_| UdpSocket::bind("0.0.0.0:0"))?;
+    p2p_v4.set_nonblocking(true)?;
+    {
+        let mut announced_ok = false;
+        for srv in ["stun.chat.bilibili.com:3478", "stun.hitv.com:3478", "stun.miwifi.com:3478"] {
+            if let Ok(pubaddr) = crate::vnet::stun::query_stun_on_socket(srv, &p2p_v4) {
+                let _ = relay.announce_ipv4(&pubaddr.to_string());
+                println!("  [RDV] Server listen {} -> public {}, announced",
+                    p2p_v4.local_addr().map(|a| a.port()).unwrap_or(0), pubaddr);
+                announced_ok = true;
+                break;
+            }
+        }
+        if !announced_ok { println!("  [RDV] WARN: server listen STUN failed"); }
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+
+    let ka = relay.clone();
+    let ka_run = running.clone();
+    thread::spawn(move || {
+        while ka_run.load(Ordering::Relaxed) {
+            ka.keepalive();
+            // 与 client 相同：周期续租，relay 服务重启后自动恢复映射。
+            ka.renew_registration();
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
+
+    let p2p_v4 = Arc::new(p2p_v4);
+    let p2p_v4_sec = relay.clone();
+    let p2p_v4_run = running.clone();
+    let p2p_v4_port = target_port;
+    let p2p_v4_rx = p2p_v4.clone();
+    thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        let p2p_v4_tx = p2p_v4_rx.clone();
+        // 多对端（与 v6 处理线程同构）：每个对端独立的 ARQ 流 + 独立的上游 TCP。
+        struct PeerConn4 {
+            stream: crate::vnet::tunnel::TunnelStream,
+            tcp: Option<TcpStream>,
+            last_activity: std::time::Instant,
+        }
+        let mut peers: std::collections::HashMap<std::net::SocketAddr, PeerConn4> =
+            std::collections::HashMap::new();
+        while p2p_v4_run.load(Ordering::Relaxed) {
+            if let Ok((len, remote)) = p2p_v4_rx.recv_from(&mut buf) {
+                // 先验签再解析（明文探测包带 HMAC 尾）
+                let is_probe = if let Some(body_p) = p2p_v4_sec.verify_probe(&buf[..len]) {
+                    if let Some((ptype, nonce_p, ts)) = crate::vnet::probe::parse_probe_full(body_p) {
+                        if ptype == crate::vnet::probe::PROBE_TYPE_REQUEST {
+                            let reply = p2p_v4_sec.sign_probe(
+                                &crate::vnet::probe::build_probe_reply(nonce_p, ts));
+                            let _ = p2p_v4_rx.send_to(&reply, remote);
+                        }
+                        true
+                    } else { false }
+                } else { false };
+                if is_probe {
+                    // 探测包，已处理
+                } else if len > 0 {
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering as O3};
+                        static DBG: AtomicU64 = AtomicU64::new(0);
+                        let dk = DBG.fetch_add(1, O3::Relaxed);
+                        if dk < 10 {
+                            println!("  [DBG-FIX] srv v4 rx {}B from {}", len, remote);
+                        }
+                    }
+                    let entry = peers.entry(remote).or_insert_with(|| PeerConn4 {
+                        stream: crate::vnet::tunnel::TunnelStream::new(
+                            p2p_v4_tx.clone(), remote, p2p_v4_sec.crypto_arc()),
+                        tcp: None,
+                        last_activity: std::time::Instant::now(),
+                    });
+                    {
+                        use std::sync::atomic::Ordering as DO;
+                        let rn = DIAG_RX.fetch_add(1, DO::Relaxed);
+                        if len > 1300 || rn < 30 {
+                            let (s, a, r) = entry.stream.stats();
+                            println!("  [DIAG-SRV] RX#{}: {}B sent={} acked={} retr={} t={}",
+                                rn, len, s, a, r,
+                                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+                        }
+                    }
+                    let delivered = entry.stream.on_packet(&buf[..len]);
+                    for plain in delivered {
+                        let is_new_session = plain.len() >= 6
+                            && plain[0] == 0x03 && plain[1] == 0x00
+                            && plain[2] == 0x00 && plain[3] == 0x13
+                            && plain[4] == 0x0E && plain[5] == 0xE0;
+                        if is_new_session && entry.tcp.is_some() {
+                            println!("  [P2P-DATA] New session from {}, recreating TCP", remote);
+                            entry.tcp = None;
+                        }
+                        if entry.tcp.is_some()
+                            && entry.last_activity.elapsed() > Duration::from_secs(10)
+                        {
+                            entry.tcp = None;
+                        }
+                        if entry.tcp.is_none() {
+                            let t = format!("127.0.0.1:{}", p2p_v4_port);
+                            if let Ok(tcp) = TcpStream::connect(&t) {
+                                tcp.set_nonblocking(true).ok();
+                                println!("  [P2P-DATA] Connected {} (peer {})", t, remote);
+                                note_p2p_inbound(&remote);
+                                entry.tcp = Some(tcp);
+                            }
+                        }
+                        if let Some(ref mut tcp) = entry.tcp {
+                            use std::sync::atomic::Ordering as DO;
+                            let hn = DIAG_HUB_POP.fetch_add(1, DO::Relaxed);
+                            if plain.len() > 1100 || hn < 30 {
+                                println!("  [DIAG-SRV] HUB_POP#{}: {}B → tcp",
+                                    hn, plain.len());
+                            }
+                            let _ = tcp.write_all(&plain);
+                        }
+                        entry.last_activity = std::time::Instant::now();
+                    }
+                }
+            }
+            for pc in peers.values_mut() {
+                pc.stream.tick();
+                if let Some(ref mut tcp) = pc.tcp {
+                    let mut rb = [0u8; 65536];
+                    match tcp.read(&mut rb) {
+                        Ok(0) => { pc.tcp = None; }
+                        Ok(n) => {
+                            let _ = pc.stream.send(&rb[..n]);
+                            pc.last_activity = std::time::Instant::now();
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(_) => { pc.tcp = None; }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let p2p_v6_sec = relay.clone();
+    // 多实例：9100 被占时回退随机口；公告用实际端口（get_my_ipv6 写死 9100 不能直接用）
+    let p2p_v6 = Arc::new(bind_v6_only(p2p_port)
+        .or_else(|| bind_v6_only(0))
+        .ok_or_else(|| anyhow::anyhow!("bind [::]:{} (v6) failed", p2p_port))?);
+    {
+        let port = p2p_v6.local_addr().map(|a| a.port()).unwrap_or(9100);
+        let ip_str = std::env::var("VNET_ANNOUNCE_V6").ok().filter(|s| !s.is_empty())
+            .or_else(|| get_my_ipv6().map(|a| a.ip().to_string()))
+            .filter(|ip| !ip.is_empty() && ip != "::" && ip != "0:0:0:0:0:0:0:0");
+        if let Some(ip) = ip_str {
+            let s = if ip.contains(']') { ip.clone() } else { format!("[{}]:{}", ip, port) };
+            let _ = relay.announce_ipv6(&s);
+            println!("  [OK] Announced IPv6: {}", s);
+        }
+    }
+    // 打洞线程也必须从 :9100 发 v6 探测（见打洞线程内注释），提前克隆
+    let punch_v6_listen = p2p_v6.clone();
+    p2p_v6.set_nonblocking(true)?;
+    let p2p_v6_run = running.clone();
+    let p2p_v6_port = target_port;
+    thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        let p2p_v6_tx = p2p_v6.clone();
+        // 多对端：每个对端独立的 ARQ 流 + 独立的上游 TCP。
+        // 产品形态就是多设备（手机+笔记本）同时连一台 PC——原来的单对端假设
+        // 会把后来的对端塞进先来者的流（序号错乱、回包发错人，实测 0/50）。
+        struct PeerConn {
+            stream: crate::vnet::tunnel::TunnelStream,
+            tcp: Option<TcpStream>,
+            last_activity: std::time::Instant,
+        }
+        let mut peers: std::collections::HashMap<std::net::SocketAddr, PeerConn> =
+            std::collections::HashMap::new();
+        while p2p_v6_run.load(Ordering::Relaxed) {
+            if let Ok((len, remote)) = p2p_v6.recv_from(&mut buf) {
+                let is_probe = if let Some((ptype, nonce, ts)) =
+                    crate::vnet::probe::parse_probe_full(&buf[..len])
+                {
+                    if ptype == crate::vnet::probe::PROBE_TYPE_REQUEST {
+                        let reply = p2p_v6_sec.sign_probe(
+                            &crate::vnet::probe::build_probe_reply(nonce, ts));
+                        let _ = p2p_v6.send_to(&reply, remote);
+                    }
+                    true
+                } else { false };
+                if is_probe {
+                    // 探测包，已处理
+                } else if len > 0 {
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering as O3};
+                        static DBG: AtomicU64 = AtomicU64::new(0);
+                        let dk = DBG.fetch_add(1, O3::Relaxed);
+                        if dk < 10 {
+                            println!("  [DBG-FIX] srv v6 rx {}B from {}", len, remote);
+                        }
+                    }
+                    let entry = peers.entry(remote).or_insert_with(|| PeerConn {
+                        stream: crate::vnet::tunnel::TunnelStream::new(
+                            p2p_v6_tx.clone(), remote, p2p_v6_sec.crypto_arc()),
+                        tcp: None,
+                        last_activity: std::time::Instant::now(),
+                    });
+                    {
+                        use std::sync::atomic::Ordering as DO;
+                        let rn = DIAG_RX.fetch_add(1, DO::Relaxed);
+                        let (exp_next, ooo, dup) = entry.stream.receiver_stats();
+                        println!("  [DIAG-V6] RX#{}: {}B exp_next={} ooo={} dup={} t={}",
+                            rn, len, exp_next, ooo, dup,
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
+                    }
+                    let delivered = entry.stream.on_packet(&buf[..len]);
+                    for plain in delivered {
+                        // 会话边界判定必须用解密后的明文（用密文永远匹配不上）
+                        let is_new_session = plain.len() >= 6
+                            && plain[0] == 0x03 && plain[1] == 0x00
+                            && plain[2] == 0x00 && plain[3] == 0x13
+                            && plain[4] == 0x0E && plain[5] == 0xE0;
+                        if is_new_session && entry.tcp.is_some() {
+                            println!("  [P2P-DATA-v6] New session from {}, recreating TCP", remote);
+                            entry.tcp = None;
+                        }
+                        if entry.tcp.is_some()
+                            && entry.last_activity.elapsed() > Duration::from_secs(10)
+                        {
+                            entry.tcp = None;
+                        }
+                        if entry.tcp.is_none() {
+                            let t = format!("127.0.0.1:{}", p2p_v6_port);
+                            if let Ok(tcp) = TcpStream::connect(&t) {
+                                tcp.set_nonblocking(true).ok();
+                                println!("  [P2P-DATA-v6] Connected {} (peer {})", t, remote);
+                                note_p2p_inbound(&remote);
+                                entry.tcp = Some(tcp);
+                            }
+                        }
+                        if let Some(ref mut tcp) = entry.tcp {
+                            let _ = tcp.write_all(&plain);
+                        }
+                        entry.last_activity = std::time::Instant::now();
+                    }
+                }
+            }
+            // 每个对端独立：ARQ 重传 + 上游读 + 回发（发给各自的流，不会串）
+            for pc in peers.values_mut() {
+                pc.stream.tick();
+                if let Some(ref mut tcp) = pc.tcp {
+                    let mut rb = [0u8; 16384]; // 16KB: ~15帧/轮，避免60帧突发
+                    match tcp.read(&mut rb) {
+                        Ok(0) => { pc.tcp = None; }
+                        Ok(n) => {
+                            let hex_preview: Vec<String> = rb[..n.min(16)].iter()
+                                .map(|b| format!("{:02x}", b)).collect();
+                            println!("  [EXP-TX] read {}B from sink hdr=[{}]", n, hex_preview.join(" "));
+                            let _ = pc.stream.send(&rb[..n]);
+                            pc.last_activity = std::time::Instant::now();
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(_) => { pc.tcp = None; }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let punch_relay = relay.clone();
+    let punch_run = running.clone();
+    let peer_id_for_punch = peer_id;
+    let punch_v4_listen = p2p_v4.clone();
+    // DIAG: VNET_NO_P2P=1 禁用服务端打洞
+    if std::env::var("VNET_NO_P2P").unwrap_or_default() != "1" {
+    thread::spawn(move || {
+        let mut count = 0u64;
+        let mut cands: Vec<std::net::SocketAddr> = Vec::new();
+        let mut v6_cands: Vec<std::net::SocketAddr> = Vec::new();
+        let mut v6_sock: Option<Arc<UdpSocket>> = None;
+        let my_id_for_punch = peer_id_for_punch;
+        while punch_run.load(Ordering::Relaxed) {
+            count += 1;
+            // 每 5 轮刷新候选：relay 观察到的 IPv4 + 客户端公告的监听映射 + 客户端 IPv6
+            if count % 5 == 0 || cands.is_empty() {
+                // 多对端：收集**所有**在线 peer 的候选，不能在第一个查到时就 break——
+                // 产品形态是多设备同时连一台 PC，只打第一个会让其余设备永远等不到敲门
+                // （实测手机+笔记本并发时笔记本恒走中继的根因）。
+                let mut list: Vec<std::net::SocketAddr> = Vec::new();
+                let mut v6s: Vec<std::net::SocketAddr> = Vec::new();
+                // 配置列表（VNET_PUNCH_PEERS，缺省旧数组）∪ 从数据学到的对端
+                let mut targets: Vec<u32> = std::env::var("VNET_PUNCH_PEERS")
+                    .ok()
+                    .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+                    .unwrap_or_else(|| vec![200u32, 300, 400, 100, 301]);
+                for lp in learned_peers().lock().unwrap().iter() {
+                    if !targets.contains(lp) { targets.push(*lp); }
+                }
+                for target in targets {
+                    if target == my_id_for_punch { continue; }
+                    if let Some((relay_addr, ipv6, announced_v4)) =
+                        punch_relay.query_peer_info(target)
+                    {
+                        if relay_addr.ip().is_ipv4() { list.push(relay_addr); }
+                        if let Some(a) = announced_v4 {
+                            if a.ip().is_ipv4() && !list.contains(&a) { list.push(a); }
+                        }
+                        if let Some(a) = ipv6 {
+                            if a.is_ipv6() && !v6s.contains(&a) { v6s.push(a); }
+                        }
+                    }
+                }
+                if count <= 10 && (!list.is_empty() || !v6s.is_empty()) {
+                    println!("  [P2P] all-peer cands={:?} v6={:?}", list, v6s);
+                }
+                cands = list;
+                v6_cands = v6s;
+                // 开一个独立 IPv6 socket 用于主动敲门（IPv4 socket 发不出 IPv6 包）
+
+            }
+            let pkt = punch_relay.sign_probe(&crate::vnet::probe::build_probe_packet(count));
+            for t in &cands {
+                punch_relay.send_raw_to(&pkt, *t);
+                // 关键：还要从「监听 socket」发一次，才能建立它的 NAT 映射，
+                // 否则客户端连 公告地址 会被路由器丢弃（映射不存在）。
+                match punch_v4_listen.send_to(&pkt, *t) {
+                    Ok(n) => {
+                        use std::sync::atomic::{AtomicU64, Ordering as O2};
+                        static STX: AtomicU64 = AtomicU64::new(0);
+                        let k = STX.fetch_add(1, O2::Relaxed);
+                        if k < 5 || k % 20 == 0 {
+                            println!("  [SRV-TX] {} bytes -> {}", n, t);
+                        }
+                    }
+                    Err(e) => println!("  [SRV-TX] ERR -> {}: {}", t, e),
+                }
+            }
+            // v6 探测必须从 :9100 监听 socket 发，而不是临时端口：
+            // 客户端会向「包的源端口」回包——:9100 有现成处理线程能接住回包并承载后续数据；
+            // 用临时端口发 = 回包永远没人读（热点场景 3 分钟打不通的根因之一）。
+            for t in &v6_cands {
+                let _ = punch_v6_listen.send_to(&pkt, *t);
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+    }
+
+    let mut last_status = std::time::Instant::now();
+    let mut clients_seen: u32 = 0;
+    let mut active_tcp: Option<TcpStream> = None;
+    let mut peer_id_conn: u32 = 0;
+    // P2P 直连对端地址（收到 P2pData 时记录，回复走它）
+    let mut p2p_reply_addr: Option<std::net::SocketAddr> = None;
+    let mut last_relay_activity = std::time::Instant::now();
+    // relay 路径 ARQ（服务端→客户端方向的重传保障）
+    let mut srv_relay_arq = crate::vnet::relay_arq::RelayArq::new();
+    while running.load(Ordering::Relaxed) {
+        // 统一分类接收：中继数据 / P2P 数据 / 探测
+        // 控制包（探测）不跳过 TCP 读，继续走下面的读取逻辑
+        let (data, from_relay, src_peer) = match relay.try_recv_kind() {
+            crate::vnet::relay::RecvKind::RelayData(src_peer, d) => {
+                p2p_reply_addr = None;
+                if src_peer != 0 {
+                    learned_peers().lock().unwrap().insert(src_peer);
+                }
+                // SESSION_START：先建立 upstream，支持 server-first greeting；不进入应用字节流。
+                if d.len() == crate::vnet::transport::HEADER_SIZE && d[0] == crate::vnet::transport::TYPE_SESSION_START {
+                    active_tcp = None;
+                    peer_id_conn = src_peer;
+                    let t = format!("127.0.0.1:{}", target_port);
+                    match TcpStream::connect(&t) {
+                        Ok(tcp) => {
+                            tcp.set_nonblocking(true).ok();
+                            println!("  [OK] Connected to local service {} (session-start)", t);
+                            active_tcp = Some(tcp);
+                            last_relay_activity = std::time::Instant::now();
+                        }
+                        Err(e) => { eprintln!("  [!!] Session-start connect to {}: {}", t, e); }
+                    }
+                    (Vec::new(), true, src_peer)
+                } else {
+                // relay ARQ：解帧 → 交付数据 + 回 ACK + 快速重传
+                let (deliver, ack_frame, fast_retransmit) = srv_relay_arq.on_packet(&d);
+                if let Some(ref ack) = ack_frame {
+                    let _ = relay.send_to_peer(src_peer, ack);
+                }
+                for frame in fast_retransmit {
+                    let _ = relay.send_to_peer(src_peer, &frame);
+                }
+                let combined: Vec<u8> = deliver.concat();
+                (combined, true, src_peer)
+                }
+            }
+            crate::vnet::relay::RecvKind::P2pData(from, d) => {
+                p2p_reply_addr = Some(from);
+                // P2P 直连数据是密文，必须先解密再交给本地服务
+                match relay.unseal(&d) {
+                    Some(plain) => (plain, false, 0),
+                    None => (Vec::new(), false, 0),
+                }
+            }
+            crate::vnet::relay::RecvKind::PeerProbe(_) | crate::vnet::relay::RecvKind::ProbeReply(_) => {
+                (Vec::new(), false, 0) // 控制包：无数据，但不跳过 TCP 读
+            }
+            crate::vnet::relay::RecvKind::Ignored => {
+                (Vec::new(), false, 0)
+            }
+        };
+
+        if !data.is_empty() {
+            // Detect X.224 Connection Request (new session)
+            let is_new_session = data.len() >= 6
+                && data[0] == 0x03 && data[1] == 0x00
+                && data[2] == 0x00 && data[3] == 0x13
+                && data[4] == 0x0E && data[5] == 0xE0;
+            if is_new_session && active_tcp.is_some() {
+                active_tcp = None;
+            }
+            if active_tcp.is_some() && last_relay_activity.elapsed() > Duration::from_secs(2) {
+                active_tcp = None;
+            }
+
+            if active_tcp.is_none() {
+                let t = format!("127.0.0.1:{}", target_port);
+                match TcpStream::connect(&t) {
+                    Ok(tcp) => {
+                        tcp.set_nonblocking(true).ok();
+                        println!("  [OK] Connected to local service {} (from {})",
+                            t, if from_relay { "relay" } else { "P2P" });
+                        active_tcp = Some(tcp);
+                        if from_relay { peer_id_conn = src_peer; }
+                    }
+                    Err(e) => { eprintln!("  [!!] Connect to {}: {}", t, e); }
+                }
+            }
+            if let Some(ref mut tcp) = active_tcp {
+                let _ = tcp.write_all(&data);
+                last_relay_activity = std::time::Instant::now();
+            }
+        }
+
+        if let Some(ref mut tcp) = active_tcp {
+            // UDP 载荷上限 65507B（65535 IP - 20 IP头 - 8 UDP头）
+            // relay.send_to_peer 额外开销 ~17B → 安全上限 ~65490B
+            // 读缓冲 16384B（16KB）确保每个 relay 包远低于 UDP 限制
+            // 之前 65536B 会在 echo 响应 ≥64KB 时产生超限 UDP 包 → OS 静默丢弃
+            let mut buf = [0u8; 16384];
+            match tcp.read(&mut buf) {
+                Ok(0) => { active_tcp = None; }
+                Ok(n) => {
+                    // P2P 优先：有 P2P 来源就直发，否则走中继
+                    if let Some(addr) = p2p_reply_addr {
+                        println!("  [RELAY-TX] via P2P to {} ({}B)", addr, n);
+                        let sealed = relay.seal(&buf[..n]);
+                        let _ = relay.send_raw_to(&sealed, addr);
+                    } else {
+                        println!("  [RELAY-TX] via relay to peer {} ({}B)", peer_id_conn, n);
+                        {
+                        srv_relay_arq.send(&buf[..n]);
+                        let (new_f, retrans_f) = srv_relay_arq.flush_and_tick();
+                        println!("  [DBG-SRV-TX] payload={}B new={} retrans={} sizes={:?}",
+                            n, new_f.len(), retrans_f.len(),
+                            new_f.iter().map(|f| f.len()).collect::<Vec<_>>());
+                        for frame in new_f { let _ = relay.send_to_peer(peer_id_conn, &frame); }
+                        for frame in retrans_f { let _ = relay.send_to_peer(peer_id_conn, &frame); }
+                    }
+                    }
+                    last_relay_activity = std::time::Instant::now();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => { active_tcp = None; }
+            }
+        }
+        // 空闲时也不能睡太久：中继 socket 同时承载 P2P 探测包，
+        // 睡 10ms 会让探测回复最多延迟 10ms，直接抬高测得 RTT。
+        // 服务端也上报状态（之前只有 client 写，server 机器上 `vnet status` 读到的是残留文件）
+        if last_status.elapsed() >= Duration::from_secs(5) {
+            let body = vec![
+                ("role", "server".to_string()),
+                ("my_peer_id", peer_id.to_string()),
+                ("target_port", target_port.to_string()),
+                ("clients_seen", clients_seen.to_string()),
+                ("inbound_p2p", {
+                    let m = p2p_inbound().lock().unwrap();
+                    m.iter()
+                        .filter(|(_, t)| t.elapsed() < Duration::from_secs(30))
+                        .map(|(a, _)| a.clone())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }),
+                ("encrypted", relay.is_encrypted().to_string()),
+                ("updated_at", format!("{:?}",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default().as_secs())),
+            ];
+            let mut text = String::new();
+            for (k, v) in &body { text.push_str(&format!("{}={}\n", k, v)); }
+            let _ = std::fs::write(status_file_path_for("server", peer_id), text);
+            last_status = std::time::Instant::now();
+        }
+
+        // relay ARQ：重传 + 流控 flush
+        {
+            let (new_f, retrans_f) = srv_relay_arq.flush_and_tick();
+            for frame in new_f { let _ = relay.send_to_peer(peer_id_conn, &frame); }
+            for frame in retrans_f { let _ = relay.send_to_peer(peer_id_conn, &frame); }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    Ok(running)
+}
+
+/// 通过 STUN 发现本机公网出口 IPv4（多出口 ISP 场景：可能与 relay 观察到的 IP 不同）
+fn discover_public_ipv4() -> Option<std::net::IpAddr> {
+    for server in ["stun.cloudflare.com:3478", "stun.l.google.com:19302"] {
+        if let Ok(addr) = crate::vnet::stun::query_stun(server, 0) {
+            if addr.is_ipv4() {
+                return Some(addr.ip());
+            }
+        }
+    }
+    None
+}
+
+/// 探测本机当前使用的出口 IPv4（不发包，只让内核选路）。
+/// 用于网络变化检测：切 WiFi / 换网 / 拔网线都会让它变化。
+fn probe_default_if_status() -> (crate::vnet::netstatus::IfType, u8) {
+    let cost = probe_default_if_cost();
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+            for line in content.lines().skip(1) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == "00000000" {
+                    let ifname = parts[0];
+                    let iftype = if ifname.starts_with("rmnet") || ifname.starts_with("ccmni") || ifname.starts_with("wwan") {
+                        crate::vnet::netstatus::IfType::Cellular
+                    } else if ifname.starts_with("wlan") || ifname.starts_with("wifi") {
+                        crate::vnet::netstatus::IfType::Wifi
+                    } else if ifname.starts_with("eth") || ifname.starts_with("usb") {
+                        crate::vnet::netstatus::IfType::Ethernet
+                    } else {
+                        crate::vnet::netstatus::IfType::Unknown
+                    };
+                    return (iftype, cost);
+                }
+            }
+        }
+        (crate::vnet::netstatus::IfType::Unknown, cost)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (crate::vnet::netstatus::IfType::Unknown, cost)
+    }
+}
+
+fn get_my_local_ipv4() -> Option<std::net::IpAddr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:53").ok()?;
+    let local = sock.local_addr().ok()?;
+    match local.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => {
+            Some(std::net::IpAddr::V4(v4))
+        }
+        _ => None,
+    }
+}
+
+/// O(o_cost)：当前默认路由接口的计费性（0=免费 WiFi/有线 1=蜂窝计费）。
+/// 简单版（M2）：unix 读 /proc/net/route 的默认路由接口名做启发式——
+/// rmnet*/ccmni*/wwan*（蜂窝）→1，其余（wlan/eth/p2p 热点等）→0。
+/// TODO(Windows)：无 GBK 编码风险的廉价接口名查询通道；桌面场景几乎恒为
+/// WiFi/有线，暂恒 0（拿不准按免费，误判代价低）。
+fn probe_default_if_cost() -> u8 {
+    #[cfg(unix)]
+    if let Ok(text) = std::fs::read_to_string("/proc/net/route") {
+        for line in text.lines().skip(1) {
+            let mut f = line.split('\t');
+            let iface = f.next().unwrap_or("");
+            let dest = f.next().unwrap_or("");
+            // Destination 00000000 == 默认路由
+            if dest == "00000000" {
+                let n = iface.to_ascii_lowercase();
+                if n.starts_with("rmnet")
+                    || n.starts_with("ccmni")
+                    || n.starts_with("wwan")
+                {
+                    return 1;
+                }
+                return 0;
+            }
+        }
+    }
+    0
+}
+
+fn get_my_ipv6() -> Option<std::net::SocketAddr> {
+    if let Ok(sock) = UdpSocket::bind("[::]:0") {
+        if sock.connect("[2001:4860:4860::8888]:53").is_ok() {
+            if let Ok(local) = sock.local_addr() {
+                match local.ip() {
+                    std::net::IpAddr::V6(v6) if !v6.is_loopback()
+                        && !v6.is_unicast_link_local()
+                        && !v6.is_unspecified() => {
+                        return Some(std::net::SocketAddr::new(std::net::IpAddr::V6(v6), 9100));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hub_filters_arq_ack_header() {
+        let mut hub = ConnHub::new();
+        let id = hub.register();
+        hub.claim(id);
+        // ARQ ACK 帧头（type=2, 全零）应被过滤
+        hub.push(vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(hub.pending(id), 0, "ACK header must be filtered");
+        // 正常数据不应被过滤
+        hub.push(vec![0x03, 0x00, 0x00, 0x13, 0x0E]); // TPKT 头
+        assert_eq!(hub.pending(id), 1, "normal data passes through");
+    }
+}
+
+// myco 侧观测辅助（P0 `myco vnet peers|raw status`）——由 scripts/vnet-sync-deploy.ps1
+// 在同步 vendored vnet 源码后**追加到 connection.rs 末尾**。
+//
+// 为什么要单独存一份：每次从 myco-vnet-migrate 同步 connection.rs 都会整文件覆盖，
+// 这些函数不是上游 vnet crate 的一部分，必须由部署脚本重新贴回来；否则 `myco vnet
+// peers` 会编译失败。
+
+/// 纯函数：解析状态文件的 `k=v` 行（空行/无等号行跳过，键值两端空白去掉）。
+pub fn parse_status_kv(body: &str) -> Vec<(String, String)> {
+    body.lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(k, _)| !k.is_empty())
+        .collect()
+}
+
+/// 按路径读状态文件为 KV 表（不存在/读失败 → None）。
+pub fn read_status_path(path: &std::path::Path) -> Option<Vec<(String, String)>> {
+    let body = std::fs::read_to_string(path).ok()?;
+    Some(parse_status_kv(&body))
+}
+
+/// 读某 (role, peer_id) 实例的状态 KV 表（`myco vnet peers` 数据源）。
+pub fn read_status_file(role: &str, peer_id: u32) -> Option<Vec<(String, String)>> {
+    read_status_path(&status_file_path_for(role, peer_id))
+}
+
+/// 全部状态文件快照：(路径, KV 表)，按路径排序（输出可复现）。
+pub fn list_status_snapshots() -> Vec<(std::path::PathBuf, Vec<(String, String)>)> {
+    let mut v: Vec<_> = list_status_files()
+        .into_iter()
+        .filter_map(|p| read_status_path(&p).map(|kv| (p, kv)))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// 入站 P2P 对端快照：(addr, 最近活跃距今毫秒)，按新鲜度升序。
+pub fn p2p_inbound_snapshot() -> Vec<(String, u64)> {
+    let m = p2p_inbound().lock().unwrap();
+    let mut v: Vec<(String, u64)> = m
+        .iter()
+        .map(|(a, t)| (a.clone(), t.elapsed().as_millis() as u64))
+        .collect();
+    v.sort_by_key(|x| x.1);
+    v
+}

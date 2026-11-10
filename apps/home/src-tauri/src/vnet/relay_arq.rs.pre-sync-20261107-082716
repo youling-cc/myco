@@ -1,0 +1,267 @@
+//! RelayArq v2 —— relay 路径的 ARQ 层（带流控）
+//!
+//! 改进（vs v1）：
+//! 1. 流控窗口：inflight 最多 32 帧，窗口满时新数据进 pending 缓冲
+//! 2. 重传 pacing：每次 tick 最多重传 8 帧（防止重传风暴）
+//! 3. pending 缓冲：send() 只缓冲数据，flush_and_tick() 按窗口发送
+//! 4. ACK 去重：只有累积位置前进时才发 ACK
+
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+use crate::vnet::transport;
+
+const CHUNK_SIZE: usize = 1000;
+const WINDOW_SIZE: usize = 32;       // 流控窗口：最多 32 帧在途
+const MAX_RETRANS_PER_TICK: usize = 8; // 每次 tick 最多重传 8 帧
+const RTO_BASE_MS: u64 = 200;
+const MAX_RETRIES: u32 = 8;
+
+pub struct RelayArq {
+    // 流控
+    pending: VecDeque<Vec<u8>>,
+
+    // 发送端
+    next_seq: u32,
+    inflight: HashMap<u32, (Vec<u8>, Instant, u32)>,
+
+    // 接收端
+    next_expected: u32,
+    out_of_order: HashMap<u32, Vec<u8>>,
+
+    // ACK 去重
+    last_ack_sent: Option<u32>,
+
+    // 统计
+    pub sent: u64,
+    pub acked: u64,
+    pub retransmitted: u64,
+    pub dropped: u64, // 超过 MAX_RETRIES 被丢弃的帧
+}
+
+impl RelayArq {
+    pub fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            next_seq: 0,
+            inflight: HashMap::new(),
+            next_expected: 0,
+            out_of_order: HashMap::new(),
+            last_ack_sent: None,
+            sent: 0,
+            acked: 0,
+            retransmitted: 0,
+            dropped: u64::MAX, // will be set to 0
+        }
+    }
+
+    /// 缓冲待发数据（不直接发帧——由 flush_and_tick 按窗口发）
+    pub fn send(&mut self, payload: &[u8]) {
+        for chunk in payload.chunks(CHUNK_SIZE) {
+            self.pending.push_back(chunk.to_vec());
+        }
+    }
+
+    /// 流控 + 重传：返回 (新帧列表, 重传帧列表)
+    /// 调用方负责通过 relay 发送
+    pub fn flush_and_tick(&mut self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut new_frames = Vec::new();
+        let mut retransmissions = Vec::new();
+        let now = Instant::now();
+
+        // 1. 重传超时帧（pacing：最多 MAX_RETRANS_PER_TICK 帧）
+        let mut retrans_count = 0;
+        let mut dead = Vec::new();
+        for (seq, (frame, sent_at, retries)) in self.inflight.iter_mut() {
+            if retrans_count >= MAX_RETRANS_PER_TICK { break; }
+            let rto = Duration::from_millis(RTO_BASE_MS * (1 << (*retries).min(7)));
+            if now.duration_since(*sent_at) > rto {
+                retransmissions.push(frame.clone());
+                *sent_at = now;
+                *retries += 1;
+                self.retransmitted += 1;
+                retrans_count += 1;
+                if *retries > MAX_RETRIES {
+                    dead.push(*seq);
+                }
+            }
+        }
+        for seq in dead {
+            self.inflight.remove(&seq);
+        }
+
+        // 2. 从 pending 发新帧（窗口 permitting）
+        while let Some(chunk) = self.pending.pop_front() {
+            if self.inflight.len() >= WINDOW_SIZE {
+                self.pending.push_front(chunk); // 窗口满，放回去
+                break;
+            }
+            let seq = self.next_seq;
+            self.next_seq = self.next_seq.wrapping_add(1);
+            let frame = build_data_frame_inner(seq, &chunk);
+            new_frames.push(frame.clone());
+            self.inflight.insert(seq, (frame, Instant::now(), 0));
+            self.sent += 1;
+        }
+
+        (new_frames, retransmissions)
+    }
+
+    /// 处理收到的 relay 数据
+    /// 返回 (要交付的数据块, 要回发的 ACK 帧)
+    pub fn on_packet(&mut self, data: &[u8]) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+        if let Some((ptype, seq, ack, payload)) = transport::parse_packet(data) {
+            match ptype {
+                transport::TYPE_DATA => {
+                    let (deliver, ack_seq) = self.handle_data(seq, &payload);
+                    // ACK 去重：只有累积位置前进时才发
+                    if Some(ack_seq) != self.last_ack_sent && ack_seq != u32::MAX {
+                        self.last_ack_sent = Some(ack_seq);
+                        let ack_frame = transport::build_ack(ack_seq);
+                        (deliver, Some(ack_frame))
+                    } else {
+                        (deliver, None)
+                    }
+                }
+                transport::TYPE_ACK => {
+                    self.handle_ack(ack);
+                    (Vec::new(), None)
+                }
+                _ => (Vec::new(), None),
+            }
+        } else {
+            (Vec::new(), None)
+        }
+    }
+
+    pub fn pending_count(&self) -> usize { self.pending.len() }
+    pub fn inflight_count(&self) -> usize { self.inflight.len() }
+
+    fn handle_data(&mut self, seq: u32, data: &[u8]) -> (Vec<Vec<u8>>, u32) {
+        let mut ordered = Vec::new();
+
+        // 流重置检测
+        const RESET_WINDOW: u32 = 64;
+        if seq.wrapping_add(RESET_WINDOW) < self.next_expected
+            || (seq > self.next_expected.wrapping_add(RESET_WINDOW)
+                && self.out_of_order.is_empty())
+        {
+            self.next_expected = seq;
+            self.out_of_order.clear();
+        }
+
+        if seq == self.next_expected {
+            ordered.push(data.to_vec());
+            self.next_expected = self.next_expected.wrapping_add(1);
+            while let Some(buf) = self.out_of_order.remove(&self.next_expected) {
+                ordered.push(buf);
+                self.next_expected = self.next_expected.wrapping_add(1);
+            }
+        } else if seq > self.next_expected {
+            self.out_of_order.insert(seq, data.to_vec());
+        }
+
+        let ack = if self.next_expected == 0 {
+            u32::MAX
+        } else {
+            self.next_expected.wrapping_sub(1)
+        };
+        (ordered, ack)
+    }
+
+    fn handle_ack(&mut self, ack: u32) {
+        if ack == u32::MAX { return; }
+        let before = self.inflight.len();
+        self.inflight.retain(|seq, _| *seq > ack);
+        let removed = before - self.inflight.len();
+        if removed > 0 {
+            self.acked += removed as u64;
+        }
+    }
+}
+
+fn build_data_frame_inner(seq: u32, data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(transport::HEADER_SIZE + data.len());
+    frame.push(transport::TYPE_DATA);
+    frame.extend_from_slice(&seq.to_be_bytes());
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    frame.extend_from_slice(data);
+    frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flow_control_window() {
+        let mut raq = RelayArq::new();
+        // 发送 100KB = 100 chunks，但窗口只有 32
+        raq.send(&vec![0u8; 100_000]);
+        let (frames, _) = raq.flush_and_tick();
+        assert_eq!(frames.len(), 32); // 窗口限制
+        assert_eq!(raq.pending_count(), 68); // 68 还在 pending
+    }
+
+    #[test]
+    fn test_window_opens_after_ack() {
+        let mut sender = RelayArq::new();
+        let mut receiver = RelayArq::new();
+
+        sender.send(&vec![0u8; 50_000]); // 50 chunks
+        let (frames, _) = sender.flush_and_tick();
+        assert_eq!(frames.len(), 32); // 窗口满
+
+        // 接收端处理前 32 帧
+        for frame in &frames {
+            let (_, ack) = receiver.on_packet(frame);
+            if let Some(a) = ack {
+                sender.on_packet(&a); // 处理 ACK
+            }
+        }
+
+        // 窗口打开后，再 flush 应该发出更多
+        let (more, _) = sender.flush_and_tick();
+        assert_eq!(more.len(), 18); // 剩余 18 chunks
+        assert_eq!(sender.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_retransmit_pacing() {
+        let mut raq = RelayArq::new();
+        raq.send(&vec![0u8; 100_000]);
+        let _ = raq.flush_and_tick(); // 发 32 帧
+
+        // 等待超时（200ms）
+        std::thread::sleep(Duration::from_millis(250));
+
+        // tick 应该只重传 MAX_RETRANS_PER_TICK 帧
+        let (_, retrans) = raq.flush_and_tick();
+        assert_eq!(retrans.len(), MAX_RETRANS_PER_TICK); // 最多 8 帧
+    }
+
+    #[test]
+    fn test_roundtrip_with_flow_control() {
+        let mut sender = RelayArq::new();
+        let mut receiver = RelayArq::new();
+
+        let data = b"hello flow control world";
+        sender.send(data);
+
+        // Flush
+        let (frames, _) = sender.flush_and_tick();
+        assert!(!frames.is_empty());
+
+        // Receive
+        let mut all_delivered = Vec::new();
+        for frame in &frames {
+            let (deliver, ack) = receiver.on_packet(frame);
+            all_delivered.extend(deliver);
+            if let Some(a) = ack {
+                sender.on_packet(&a);
+            }
+        }
+        assert_eq!(all_delivered.concat(), data);
+        assert_eq!(sender.inflight_count(), 0);
+    }
+}

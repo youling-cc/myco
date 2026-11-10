@@ -1,0 +1,27 @@
+[package]
+name = "myco-aop-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "myco_aop_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "myco-aop-core"
+path = "src/main.rs"
+
+[dependencies]
+myco-terminal-proto = { path = "../terminal-proto" }
+myco-transport = { path = "../transport" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

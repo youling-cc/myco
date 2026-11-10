@@ -1,0 +1,70 @@
+[
+  {
+    "sessionId": "aop-s1-contract",
+    "slug": "term-model",
+    "layer": "P",
+    "attempt": 1,
+    "executorKind": "agent",
+    "kind": "tool",
+    "o": "屏幕锚:fineState=idle",
+    "s": "harness=claude_code,等待输入",
+    "a": "write_input(\"git status\")",
+    "r": "",
+    "at": "2026-08-14T10:00:00+00:00",
+    "from": "did:myco:agent:canvas-001"
+  },
+  {
+    "sessionId": "aop-s1-contract",
+    "slug": "cast-frame",
+    "layer": "C",
+    "attempt": 2,
+    "executorKind": "agent",
+    "kind": "eval",
+    "o": "交付物:tile 更新位图",
+    "s": "检测准确率 fixture 对拍中",
+    "a": "R 核验: tile-diff",
+    "r": "score=0.92 feedback=静止区 tile 漏检 2 块",
+    "at": "2026-08-14T10:01:00+00:00",
+    "from": "did:myco:agent:canvas-001"
+  },
+  {
+    "sessionId": "aop-s1-contract",
+    "slug": "human-review",
+    "layer": "R",
+    "attempt": 1,
+    "executorKind": "human",
+    "kind": "human",
+    "o": "人工任务卡:审阅架构图 ⑦ 阵型",
+    "s": "humanPending,等待交付",
+    "a": "HumanSubmission: note=已核对六层泳道 + artifacts=[design/04-agent/myco-agents-architecture.html]",
+    "r": "score=1 feedback=交付达标",
+    "at": "2026-08-14T10:02:00+00:00",
+    "from": "did:myco:agent:canvas-001"
+  },
+  {
+    "sessionId": "aop-s1-legacy",
+    "slug": "task",
+    "layer": "-",
+    "attempt": 0,
+    "executorKind": "agent",
+    "kind": "note",
+    "o": "会话恢复",
+    "s": "read_all 回放旧 traces.jsonl(无 from 字段)",
+    "a": "sse 重连补帧",
+    "r": "",
+    "at": "2026-08-13T09:00:00+00:00"
+  },
+  {
+    "sessionId": "aop-s1-contract",
+    "slug": "delegate",
+    "layer": "A",
+    "attempt": 1,
+    "executorKind": "remote",
+    "kind": "tool",
+    "o": "discovery 匹配到远程 DID agent",
+    "s": "S0 seam 未实装,回退本地 Agent",
+    "a": "invoke: did:myco:agent:a-cast-tx",
+    "r": "",
+    "at": "2026-08-14T10:03:00+00:00"
+  }
+]

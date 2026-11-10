@@ -1,0 +1,117 @@
+/* ─────────────────────────────────────────────────────────────
+ * 菌光 tokens · 单一事实源（myco 家族三端共用：home/aop/phone）
+ * 视觉语言定稿 2026-09-05（docs/myco-strategy/ued demo v3）：
+ *   夜 = 深夜森林发光的菌丝；晨 = 清晨菌伞内侧的暖白。
+ *   规则：辉光是红灯特权；同屏动效≤2；装饰可玩、功能必冷；
+ *         不对称圆角（左上 12 其余 8）；emoji 零容忍（UI chrome）。
+ * 用法：各端 import '@myco/ui-kit/biolum.css' 后在自己的 :root 里
+ *   把旧变量名 alias 到这里的语义变量（值不落本端，防漂移）。
+ * 主题机制：document.documentElement.dataset.theme = 'light'|'dark'（默认 dark）。
+ * ───────────────────────────────────────────────────────────── */
+
+:root {
+  /* ── 源色（不直接消费，经语义层引用）──
+     2026-09-10 UED 改版：暗色从森林绿黑对齐 PC 工作区深蓝灰（#161b22） */
+  --biolum-night-bg0: #0d1117;   /* 深蓝灰黑 · 页面底（对齐 PC 工作区暗色） */
+  --biolum-night-bg1: #161b22;   /* 窗体面 */
+  --biolum-night-bg2: #1c2333;   /* 抬升面（标题栏/横条） */
+  --biolum-night-card: #161b22;
+  --biolum-night-bd: #2d333b;  --biolum-night-bd2: #2d333b;  --biolum-night-bd3: #3d444d;
+  --biolum-night-tx: #e6edf3;  --biolum-night-tx2: #9aa4b2;
+  --biolum-night-mu: #6e7681;  --biolum-night-mu2: #54595f;
+  --biolum-night-hover: #1c2333;  --biolum-night-shadow: rgba(0, 0, 0, .45);
+
+  /* ── 晨间色板（2026-09-10 UED 改版：米黄→浅蓝灰对齐 PC 工作区）──
+     设计定稿：「跟 PC 更一致，自由有趣的风格」——PC 是 #6b7bff 蓝紫 +
+     #f4f6fc 浅蓝灰；手机端米黄换浅蓝灰，菌光紫保留（自由有趣的气质）。 */
+  --biolum-morning-bg0: #f4f6fc; /* 浅蓝灰 · 页面底（对齐 PC 工作区） */
+  --biolum-morning-bg1: #FFFFFF;
+  --biolum-morning-bg2: #e7ecf7;
+  --biolum-morning-card: #fafbff;
+  --biolum-morning-bd: #e2e5ee;  --biolum-morning-bd2: #e8eaf2;  --biolum-morning-bd3: #c5c9d4;
+  --biolum-morning-tx: #1c1f2a;  --biolum-morning-tx2: #565b6b;
+  --biolum-morning-mu: #9aa0b0;  --biolum-morning-mu2: #b0b5c4;
+  --biolum-morning-hover: #e7ecf7;  --biolum-morning-shadow: rgba(140, 149, 159, .25);
+
+  /* 强调双紫：填充/文字一律用 acc（晨紫，两主题通用，白字对比度 ≥4.5）；
+     acc2 是暗底上的发光紫，只做描边/辉光/暗底小字强调，不做实心填充 */
+  --biolum-night-acc: #7C5CE0;   --biolum-night-acc2: #A78BFA;
+  --biolum-morning-acc: #7C5CE0; --biolum-morning-acc2: #9d7bf5;
+  --biolum-night-acc-ink: #FFFFFF;   /* acc 实心上的文字 */
+  --biolum-morning-acc-ink: #FFFFFF;
+  --biolum-night-teal: #5EEAD4;  --biolum-morning-teal: #2FBFA8; /* 菌光青(次强调) */
+
+  /* ── 灯五色（跨端语义：红异常/黄配速/绿在线完成/蓝探索/黑静默）── */
+  --biolum-night-lamp-red: #FF6B6B;   --biolum-morning-lamp-red: #E5484D;
+  --biolum-night-lamp-yellow: #FFD166; --biolum-morning-lamp-yellow: #D9930D;
+  --biolum-night-lamp-green: #4ADE80;  --biolum-morning-lamp-green: #2E9E5B;
+  --biolum-night-lamp-blue: #5FB3FF;   --biolum-morning-lamp-blue: #2F7DE1;
+  --biolum-night-lamp-idle: #39424E;   --biolum-morning-lamp-idle: #1F272E;
+  --biolum-night-lamp-idle-ring: #4A5763; --biolum-morning-lamp-idle-ring: #1F272E; /* 黑灯靠描边存在 */
+  --biolum-night-red-glow: 0 0 6px rgba(255, 107, 107, .5);
+  --biolum-morning-red-glow: none; /* 辉光是红灯的特权，且仅夜 */
+
+  /* ── 语义层（消费这层；默认=菌光夜）── */
+  --bg0: var(--biolum-night-bg0);
+  --bg1: var(--biolum-night-bg1);
+  --bg2: var(--biolum-night-bg2);
+  --card: var(--biolum-night-card);
+  --bd: var(--biolum-night-bd);  --bd2: var(--biolum-night-bd2);  --bd3: var(--biolum-night-bd3);
+  --tx: var(--biolum-night-tx);  --tx2: var(--biolum-night-tx2);
+  --mu: var(--biolum-night-mu);  --mu2: var(--biolum-night-mu2);
+  --hover: var(--biolum-night-hover);  --shadow: var(--biolum-night-shadow);
+  --acc: var(--biolum-night-acc);  --acc-ink: var(--biolum-night-acc-ink);
+  --acc2: var(--biolum-night-acc2);
+  --teal: var(--biolum-night-teal);
+  --spore: var(--biolum-night-acc2); /* 每枚孢子图标里那一粒紫 */
+  --lamp-red: var(--biolum-night-lamp-red);      --red-glow: var(--biolum-night-red-glow);
+  --lamp-yellow: var(--biolum-night-lamp-yellow);
+  --lamp-green: var(--biolum-night-lamp-green);
+  --lamp-explore: var(--biolum-night-lamp-blue); /* 灯蓝=探索,与旧 accent 蓝语义分离 */
+  --lamp-idle: var(--biolum-night-lamp-idle);    --lamp-idle-ring: var(--biolum-night-lamp-idle-ring);
+  /* 派生软色一律 color-mix(跟随变量,不留字面量) */
+  --acc-soft: color-mix(in srgb, var(--acc) 12%, transparent);
+  --red-soft: color-mix(in srgb, var(--lamp-red) 14%, transparent);
+  --green-soft: color-mix(in srgb, var(--lamp-green) 14%, transparent);
+  --yellow-soft: color-mix(in srgb, var(--lamp-yellow) 14%, transparent);
+}
+
+/* 晨间语义层：light 之外，粉/绿/蓝三个彩题也垫晨色（批三 2026-09-29——此前
+ * data-theme=pink 时语义层仍落夜黑，聊天区 --chrome-bg 深黑与 demo 粉底拼接；
+ * 彩题各自的染色（底/按钮/链接）由消费端 css 负责，token 层只保"晨间底座"）。 */
+:root[data-theme='light'],
+:root[data-theme='pink'],
+:root[data-theme='green'],
+:root[data-theme='blue'] {
+  --bg0: var(--biolum-morning-bg0);
+  --bg1: var(--biolum-morning-bg1);
+  --bg2: var(--biolum-morning-bg2);
+  --card: var(--biolum-morning-card);
+  --bd: var(--biolum-morning-bd);  --bd2: var(--biolum-morning-bd2);  --bd3: var(--biolum-morning-bd3);
+  --tx: var(--biolum-morning-tx);  --tx2: var(--biolum-morning-tx2);
+  --mu: var(--biolum-morning-mu);  --mu2: var(--biolum-morning-mu2);
+  --hover: var(--biolum-morning-hover);  --shadow: var(--biolum-morning-shadow);
+  --acc: var(--biolum-morning-acc);  --acc-ink: var(--biolum-morning-acc-ink);
+  --acc2: var(--biolum-morning-acc2);
+  --teal: var(--biolum-morning-teal);
+  --spore: var(--biolum-morning-acc);
+  --lamp-red: var(--biolum-morning-lamp-red);      --red-glow: var(--biolum-morning-red-glow);
+  --lamp-yellow: var(--biolum-morning-lamp-yellow);
+  --lamp-green: var(--biolum-morning-lamp-green);
+  --lamp-explore: var(--biolum-morning-lamp-blue);
+  --lamp-idle: var(--biolum-morning-lamp-idle);    --lamp-idle-ring: var(--biolum-morning-lamp-idle-ring);
+}
+
+/* 红灯呼吸（辉光是红灯的特权；晨态关闭；reduced-motion 降级） */
+@keyframes biolum-breathe {
+  0%, 100% { box-shadow: var(--red-glow); opacity: 1; }
+  50% { box-shadow: 0 0 2px color-mix(in srgb, var(--lamp-red) 20%, transparent); opacity: .72; }
+}
+.lamp-red-live { animation: biolum-breathe 2.4s ease-in-out infinite; }
+:root[data-theme='light'] .lamp-red-live,
+:root[data-theme='pink'] .lamp-red-live,
+:root[data-theme='green'] .lamp-red-live,
+:root[data-theme='blue'] .lamp-red-live { animation: none; }
+@media (prefers-reduced-motion: reduce) {
+  .lamp-red-live { animation: none; }
+}

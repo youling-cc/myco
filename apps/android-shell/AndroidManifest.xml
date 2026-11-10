@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.myco.phone" android:versionCode="210" android:versionName="0.3.199">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 2026-10-25 閸ョ偛缍婃穱顔碱槻閿?.3.172 閺堝鈧?.3.173 閸欐垹澧楁稉顫啊娑撱倖娼?WiFi 閺夊啴妾洪妴?         KeepAliveService 閻?WIFI_MODE_FULL_HIGH_PERF WifiLock 娓氭繆绂嗙€瑰啩婊戦敍?         娑撱垹銇戦崥搴＄磽鐢瓕顫﹂棃娆撶帛閸氱偞甯€閿涘苯顦婚柈?RDP 閸撳秴褰?閻斿嫬鐫嗛弮?WiFi 鐏忓嫰顣舵导鎴犳耿閿?         闂呇囦壕 JS 濞夐潧浠犻幗?閳?閻㈠娼版鎴濈潌閻╂潙鍩岄弬顓炵磻閵嗗倹顒滅敮鍛婃綀闂勬劧绱濋弮鐘虹箥鐞涘本妞傚鍦崶閵?-->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 2026-10-20 B 閺傝顢嶉敍鍫滅箽濞茶宸遍崠鏍电礆閿涙瓍ARTIAL_WAKE_LOCK + 閻㈠灚鐫滄导妯哄閻ц棄鎮曢崡鏇炵穿鐎?-->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 2026-10-20 B1閿涙larmManager 閸涖劍婀￠崬銈夊晪閿涘湒oze allow-while-idle閿?2+ 閺堫亝宸块弶鍐╂閼奉亜濮╅柅鈧崠?setAndAllowWhileIdle閿?-->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- APK 閼奉亝娲块弬?myco 閸欐垵绔烽柅姘朵壕閻╃顥?娑撳秶绮￠崯鍡楃暗) -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 閸欐牗娅欐い?ScanCamActivity(Camera2)闂団偓鐟?CAMERA,鏉╂劘顢戦弮鍓佹暤鐠囨灚鈧?     *  婢圭増妲戦崥搴ｉ兇缂佺喓娴夐張?ACTION_IMAGE_CAPTURE 闂団偓閺夊啴妾哄鍙夊房娴?閺傚洦銆傜悰灞艰礋)閳ユ柡鈧柨褰囬弲顖炪€夋稉?     *  閸烆垯绔撮幏宥囧弾鐠侯垰绶?娑撳秴鍟€鐠ф壆閮寸紒鐔烘祲閺?閺冪姴鍟跨粣浣碘偓?-->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- 妤癸箑鍘犳搴礄2026-10-16閿涘绱癢ebView getUserMedia({audio}) 閻劊鈧揪ermChrome 閻?         onPermissionRequest 瀹告彃顕?RESOURCE_AUDIO_CAPTURE 閺€鎹愵攽閿涘奔绲炬潻娑氣柤鏉╂ê绻€妞ょ粯瀵旈張?         RECORD_AUDIO 鏉╂劘顢戦弮鑸垫綀闂勬劧绱欐稉?CAMERA 閸氬瞼鎮婇敍姘矌 manifest 婢圭増妲戞稉宥咁檮閿?         MainActivity 妫ｆ牕鎯庣悰銉ㄧ箥鐞涘本妞傞悽瀹狀嚞閿涘鈧?-->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- Android 14+:targetSdk 鏉╁洣缍嗘导姘愁潶缁崵绮哄?娑撶儤妫悧?Android 閹垫捇鈧?鐠€锕€鎲?閻劍鍩涚€圭偞绁撮幎銉╂) -->
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+    <application
+        android:label="Myco" android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <service android:name=".KeepAliveService" android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="persistent_encrypted_device_tunnel" />
+        </service>
+        <service android:name=".TunnelProcessService" android:exported="false"
+            android:process=":tunnel"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="rdp_data_plane_tunnel" />
+        </service>
+        <!-- 2026-10-20 B1閿涙艾鍠曠紒鎾虫暅闁辨帗甯撮弨璺烘珤閿涘牐鍤滈幋鎴犵敾閹?9min 娑撯偓濡楋綇绱辨稉宥勭贩鐠?WebView閿?-->
+        <receiver android:name=".FreezeWakeReceiver" android:exported="false" />
+        <activity android:name=".MainActivity" android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- 2026-10-28 濞ｉ亶鎽奸幒銉ф瑜版洩绱橠L-Auth閿涘绱板ù蹇氼潔閸?閳?myco://auth?ticket=<t>&callback=<url>
+                 閳?myco 瀵湱鈥樼拋?閳?缁涙儳鎮?閳?閸ョ偠鐨熷ù蹇氼潔閸ｃ劎娅ヨぐ鏇樷偓鍌氼槻閻?QR 閻ц缍嶉柧鎹愮熅閵?-->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="myco" android:host="auth" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".ScanCamActivity" android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" />
+        <!-- 閸掑棔闊╂禒璇插妞ょ數娈戦悪顒傜彌 WebView閿?026-10-09閵嗗瞼鍋ｉ崡鈥虫皑鏉╂稏鈧稄绱氶敍?             韫囧懘銆忔稉搴濆瘜 WebView 楠炶泛鐡ㄩ垾鏂衡偓鏃堟瘈闁挸顓归幋椋庮伂鐠烘垵婀稉鑽ゆ櫕闂堛垽鍋呮稉?WebView 闁插矉绱?             娑撹崵鏅棃顫閺冿箑顕遍懜顏勬皑閹?JS 娑撳﹣绗呴弬鍥风礄鏉╃偛鎮撻幍鈧張澶愭瘈闁捁绻涢幒銉礆闁库偓濮ｄ降鈧?             exported=false閿涙艾褰ч悽杈ㄦ拱鎼存梻鏁?openShareWeb 濡椼儲濯虹挧鏋偓?-->
+        <!-- stateAlwaysHidden閿涙碍婀版い?*缁愭褰涙＃鏍偧閹峰灝鍩岄悞锔惧仯**閺冩湹绗夊纭呯翻閸忋儲纭堕敍鍫熺槷婵″倷绮犲顔讳繆
+             鐢妇娼冮柨顔炬磸閸掑洩绻冮弶銉礆閳ユ柡鈧梻鐛ラ崣锝囬獓瀵偓閸忓啿褰х粻陇绻栨稉鈧稉瀣剁礉妞ら潧鍞撮崚鍥︾窗鐠囨繀姘︾紒?ShareFocusGuard閵?             adjustResize閿涙岸鏁惄妯鸿剨閸戠儤妞傞崢瀣級妞ょ敻娼版妯哄閿涘苯绨抽柈銊ㄧ箾閹恒儲瀵氱粈鍝勬珤娑撳秳绱扮悮顐︽暛閻╂娲婃担蹇嬧偓?-->
+        <activity android:name=".ShareWebActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:windowSoftInputMode="stateAlwaysHidden|adjustResize"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+        <!-- 2026-10-25 閻喐婧€ RED 娣囶喖顦查敍姝砮lease 0.3.173 濠曞繐锛愰弰搴㈡拱 Activity閿?             openInAppBrowser 閻╁瓨甯?ActivityNotFoundException 閳?DSH 閸椔ゎ潶鏉╊偄娲栭拃?             缁崵绮哄ù蹇氼潔閸?閳?myco 鏉╂稓鈻奸崥搴″酱閸愯崵绮?閳?vnet 鏉烆剙褰?relay 閸忋劍鏌囬妴?-->
+        <activity android:name=".InAppBrowserActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:windowSoftInputMode="stateAlwaysHidden|adjustResize"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+    </application>
+</manifest>

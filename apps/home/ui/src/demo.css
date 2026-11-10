@@ -1,0 +1,371 @@
+/* ═══ myco 主界面 demo 皮肤（第37轮整建制移植；第100轮主题系统化：文字/卡片全变量化）═══
+   来源：demo html <style> 原样提取（类名/配色/字号 1:1），仅：
+   ① 去掉 demo 舞台说明区
+   ② .shell/.scr 适配产品窗口
+   ③ 底部 tab 内联样式固化为 .tabbar/.tabbtn
+   ④ 主题五色系统化（第100轮）：--tx/--tx2/--txm/--card-bg/--card-bd/--accent 语义变量
+      五主题各一套完整值；组件消费变量层。硬编码装饰色（渐变按钮/功能语义色）保留。 */
+
+#root:has(main.demo-scr) { background: #f8fafc; }
+[data-theme="dark"] #root:has(main.demo-scr) { background: #12161f; }
+.demo-shell, .demo-topbar, .demo-scr, .cardd, .btnd, .acct-row, .devline, .tabbar, .methodd, .chipd, .tabbtn { box-sizing: border-box; }
+.demo-shell { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #eef1f6; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+/* color 由下方变量规则提供（.demo-shell{color:var(--tx)}——旧字面量 #1a2233 已删，防同特异度后者胜钉死全主题） */
+
+/* 窄条顶部条 */
+.demo-topbar { display: flex; align-items: center; gap: 7px; padding: 9px 12px 7px; border-bottom: 1px solid #e6ebf3; background: #fff; flex-shrink: 0; }
+.demo-topbar .logo { width: 9px; height: 9px; border-radius: 3px; background: linear-gradient(135deg,#6b7bff,#4ec9a5); }
+.demo-topbar .nm { font-size: 12.5px; font-weight: 700; letter-spacing: .5px; }
+/* 2026-10-11 类名冲突修复：本类原叫 .st——与 index.html 内联的 agent/fleet 面板
+   `.st{border-radius:50%}` 撞名，导致账号名元素同时吃到 border-radius:50% + 本规则
+   的 overflow:hidden ⇒ 208×21 椭圆裁切框把文字首端（首字母 C）上下切掉。
+   改名 .acct-name 脱离冲突（全应用仅此一处用 .st）。 */
+.demo-topbar .acct-name { font-size: 13px; font-weight: 600; color: #1a2233; white-space: nowrap; flex: 0 1 220px; min-width: 0; overflow: hidden; text-overflow: ellipsis; line-height: 1.4; padding: 2px 3px; min-height: 21px; display: flex; align-items: center; cursor: default; }
+/* 2026-10-11 菌丝圆点外层容器（圆点挪出 .acct-name 后，其 flex 约束由它继承）：
+   flex:0 1 220px + min-width:0 与原元素一致（顶栏空间分配不变）；overflow:visible
+   是关键——圆点光晕不被裁（.acct-name 的 overflow:hidden 只管文字 ellipsis）。 */
+.st-wrap { display: inline-flex; align-items: center; gap: 5px; flex: 0 1 220px; min-width: 0; overflow: visible; cursor: pointer; }
+/* wrap 里的账号名：占满 wrap 剩余空间（覆盖原 flex:0 1 220px，避免双重 basis 冲突） */
+.demo-topbar .st-wrap .acct-name { flex: 1 1 auto; }
+.demo-topbar .ico { background: none; border: none; color: #6b7bff; font-size: 13px; cursor: pointer; padding: 2px 3px; line-height: 1; }
+
+/* 屏幕滚动区（demo .scr） */
+.demo-scr { flex: 1; overflow-y: auto; padding: 14px 13px 18px; display: flex; flex-direction: column; gap: 9px; }
+
+/* 通用 UI（demo 原样） */
+.h1d { font-size: 17px; font-weight: 800; margin-top: 2px; }
+.h2d { font-size: 14px; font-weight: 700; }
+.subd { font-size: 12px; color: #5b6a83; line-height: 1.65; }
+.tinyd { font-size: 11px; color: #8a97ab; line-height: 1.55; }
+.cardd { background: #fff; border: 1px solid #e4eaf2; border-radius: 12px; padding: 11px 12px; }
+.btnd { border: none; border-radius: 10px; padding: 11px; font-size: 13.5px; font-weight: 600; cursor: pointer; background: linear-gradient(135deg,#6b7bff,#4d8dff); color: #fff; width: 100%; }
+/* 2026-10-06 hover 对比度修：变暗而非变亮——白字渐变钮变亮会更看不清（粉/绿题实测 <3:1），
+   ghost 浅底深字变暗同样提升对比；五主题均安全。 */
+.btnd:hover { filter: brightness(.95); }
+.btnd.ghost { background: #fff; color: #3b475e; border: 1px solid #d7dfeb; font-weight: 500; }
+.btnd.danger { background: #dc2626; }
+.btnd.small { padding: 7px 12px; font-size: 12px; width: auto; border-radius: 8px; }
+.linkish { background: none; border: none; color: #6b7bff; font-size: 12.5px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; padding: 4px; }
+.textlink { text-align: center; margin-top: 2px; }
+.acct-row { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid #e4eaf2; border-radius: 10px; background: #fff; cursor: pointer; }
+.acct-row .av { width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 15px; background: #eef2ff; flex-shrink: 0; }
+.acct-row .nm { font-size: 13px; font-weight: 600; }
+.acct-row .did { font-size: 11px; color: #8a97ab; font-family: ui-monospace, monospace; }
+.acct-row .cur { margin-left: auto; font-size: 11px; color: #16a34a; font-weight: 600; flex-shrink: 0; }
+.acct-row .sw { margin-left: auto; font-size: 11px; color: #6b7bff; flex-shrink: 0; }
+.dividerd { height: 1px; background: #e6ebf3; margin: 3px 0; }
+.qrd { width: 172px; height: 172px; border-radius: 12px; background: repeating-conic-gradient(#1a2233 0% 25%, #fff 0% 50%) 0 0/22px 22px; margin: 6px auto; border: 6px solid #fff; box-shadow: 0 2px 10px rgba(20,30,60,.12); position: relative; }
+.centerd { text-align: center; }
+.spinnerd { display: inline-block; width: 14px; height: 14px; border: 2px solid #c7d2fe; border-top-color: #6b7bff; border-radius: 50%; animation: demospin 1s linear infinite; vertical-align: -2px; }
+@keyframes demospin { to { transform: rotate(360deg) } }
+.chipd { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; border-radius: 999px; padding: 3px 10px; background: #eef2ff; color: #4338ca; }
+.chipd.green { background: #dcfce7; color: #15803d; }
+.chipd.gray { background: #eef1f6; color: #475569; }
+/* 2026-10-06 凭据徽章「成员」色（既有黄色 chip 风格，同 IdentityPanel 未备份徽章） */
+.chipd.amber { background: #fef3c7; color: #92400e; }
+.methodd { display: flex; align-items: center; gap: 9px; padding: 10px 11px; border: 1.5px solid #e4eaf2; border-radius: 12px; background: #fff; cursor: pointer; }
+.methodd.on { border-color: #6b7bff; background: #f5f7ff; }
+.methodd .ic { width: 32px; height: 32px; border-radius: 9px; background: #eef2ff; display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
+.methodd .t { font-size: 13px; font-weight: 600; }
+.methodd .d { font-size: 11px; color: #8a97ab; }
+.methodd .na { margin-left: auto; font-size: 10px; background: #fee2e2; color: #b91c1c; border-radius: 999px; padding: 2px 7px; flex-shrink: 0; }
+.methodd .rec { margin-left: auto; font-size: 10px; background: #dcfce7; color: #15803d; border-radius: 999px; padding: 2px 7px; flex-shrink: 0; }
+.backrowd { display: flex; align-items: center; gap: 8px; position: relative; min-height: 22px; }
+/* 2026-10-10 导航栏定稿（设计定稿"标题居中"）：返回留左上、页面标题绝对居中——
+   消除「‹ 返回 设置」被连读成动作短语的歧义（iOS/微信小程序同款布局）。 */
+.backrowd .nav-title { position: absolute; left: 50%; transform: translateX(-50%); margin: 0 !important; text-align: center; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60%; }
+.backrowd .bk { background: none; border: none; color: #6b7bff; font-size: 13px; cursor: pointer; padding: 2px 4px; border-radius: 6px; }
+/* 2026-10-06：透明紫字按钮 hover 补浅底（防 .sec button:hover 误伤修复后无任何反馈） */
+.backrowd .bk:hover { background: var(--hover, #f2f4fa); }
+
+/* ── 菌丝发光圆点（2026-10-10 用户要求：顶栏昵称前的小点美化） ──
+   2026-10-11 三轮收敛（用户实测）：
+   ① 尺寸减半 14px→7px（原尺寸太大；且光晕外扩 6px 会盖到紧邻首字的左下角——
+      这就是"字母 C 下面像被挡住"的真凶：不是被裁，是半透明紫光晕压上去了）
+   ② 光晕同步减半（半径/透明度都收），离首字留出干净间距
+   ③ 垂直对齐加 top:1px 微调：容器 align-items:center 是几何居中，而文字视觉重心
+      在 x-height（偏下），故小圆点看起来偏高；下移 1px 让圆心对准文字中腰。
+   克制原则：7px、小半径光晕、不动画——只做质感，不喧宾夺主。 */
+.myco-dot {
+  display: inline-block;          /* 2026-10-11 加固：防 flex 上下文里被当文本行盒拉伸 */
+  width: 7px; height: 7px; border-radius: 50%;
+  flex: none; aspect-ratio: 1/1; min-width: 7px; min-height: 7px;
+  box-sizing: border-box;
+  position: relative; top: 1px;   /* 视觉重心下移 1px，与文字中腰对齐 */
+  background:
+    radial-gradient(circle at 30% 28%, rgba(255,255,255,.95) 0%, rgba(255,255,255,.42) 18%, transparent 38%),
+    radial-gradient(circle at 60% 66%, #93a5ff 0%, #6b7bff 45%, #4f46e5 100%);
+  box-shadow:
+    0 0 3px rgba(107,123,255,.45),
+    0 0 1px rgba(139,157,255,.70),
+    inset 0 .5px 1px rgba(255,255,255,.55),
+    inset 0 -.5px 1.5px rgba(79,70,229,.35);
+}
+/* hover 微反馈：光晕略增强（呼应点击功能，幅度克制） */
+.st-wrap:hover .myco-dot { box-shadow:
+    0 0 4px rgba(107,123,255,.60),
+    0 0 1.5px rgba(139,157,255,.85),
+    inset 0 .5px 1px rgba(255,255,255,.55),
+    inset 0 -.5px 1.5px rgba(79,70,229,.35);
+}
+/* 暗色主题下光晕减一档（避免深色底上刺眼） */
+[data-theme="dark"] .myco-dot { box-shadow:
+    0 0 2.5px rgba(107,123,255,.32),
+    0 0 .8px rgba(139,157,255,.50),
+    inset 0 .5px 1px rgba(255,255,255,.35),
+    inset 0 -.5px 1.5px rgba(79,70,229,.45);
+}
+.devline { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid #e4eaf2; border-radius: 10px; background: #fff; font-size: 12px; }
+.devline .dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
+.devline .x { margin-left: auto; color: #dc2626; font-size: 11px; cursor: pointer; flex-shrink: 0; }
+.devline .endchip { margin-left: auto; font-size: 10px; border-radius: 999px; padding: 3px 9px; flex-shrink: 0; background: #eef1f6; color: #475569; font-weight: 600; }
+.devline .endchip.go { background: #dcfce7; color: #15803d; }
+.devline .endchip.yl { background: #eef2ff; color: #4338ca; }
+
+/* ─── 智能体 Tab 设备操作层（2026-10-13 P0）───
+   在线态三档：在线绿 / 离线灰 / 已除名红——左侧 3px 色条 + 状态点；
+   在线状态点加轻微呼吸（1.8s，不做花哨动效；尊重 prefers-reduced-motion）。 */
+.devline.dev-online { border-left: 3px solid #22c55e; }
+.devline.dev-offline { border-left: 3px solid #cbd5e1; }
+.devline.dev-revoked { border-left: 3px solid #ef4444; }
+.devline .dot.pulse { animation: devpulse 1.8s ease-in-out infinite; }
+@keyframes devpulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
+@media (prefers-reduced-motion: reduce) { .devline .dot.pulse { animation: none; } }
+/* 展开区（DID + 操作按钮行） */
+.devopen { padding: 4px 6px 2px 13px; }
+/* 委任状（授权）剩余徽标：浅底 + 文字色由 delegationLevelColor 内联给出 */
+.delegchip { flex-shrink: 0; font-size: 9.5px; font-weight: 600; border-radius: 999px; padding: 1px 7px; }
+/* 除名＝破坏性但需二次确认：先描边红（区别于「确认除名」的实心红） */
+.btnd.danger-ghost { background: #fff; color: #dc2626; border: 1px solid #fca5a5; font-weight: 500; }
+.btnd.danger-ghost:hover { background: #fef2f2; }
+[data-theme="dark"] .btnd.danger-ghost { background: #1a2130; color: #ff8a80; border-color: #7f1d1d; }
+[data-theme="dark"] .devline.dev-offline { border-left-color: #3b465c; }
+
+/* 账号卡（home 首卡） */
+.acct-cardd { cursor: pointer; }
+.acct-cardd .av { width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 700; background: #eef2ff; color: #4338ca; flex-shrink: 0; }
+.acct-cardd .nm { font-size: 13px; font-weight: 600; }
+.acct-cardd .didt { font-size: 11px; color: #8a97ab; font-family: ui-monospace, monospace; }
+.acct-cardd .sw { margin-left: auto; font-size: 12px; color: #6b7bff; flex-shrink: 0; }
+
+/* 底部 tab */
+.tabbar { display: flex; gap: 6px; border-top: 1px solid #e6ebf3; padding: 8px 13px calc(8px + env(safe-area-inset-bottom, 0px)); background: #fff; flex-shrink: 0; }
+.tabbar .tabbtn { border: none; border-radius: 10px; padding: 8px; font-size: 13.5px; font-weight: 600; cursor: pointer; background: linear-gradient(135deg,#6b7bff,#4d8dff); color: #fff; flex: 1; }
+.tabbar .tabbtn.ghost { background: #fff; color: #3b475e; border: 1px solid #d7dfeb; font-weight: 500; }
+
+/* ─── 暗色最小映射（亮色为准，暗色保可读） ─── */
+[data-theme="dark"] .demo-shell { background: #151a24; color: #e5eaf3; }
+[data-theme="dark"] .demo-topbar { background: #1a2130; border-bottom-color: #2a3345; }
+[data-theme="dark"] .demo-topbar .acct-name { color: #e5eaf3; }
+[data-theme="dark"] .demo-scr { }
+[data-theme="dark"] .cardd, [data-theme="dark"] .acct-row, [data-theme="dark"] .devline { background: #1a2130; border-color: #2a3345; }
+[data-theme="dark"] .subd { color: #9aa7bd; }
+[data-theme="dark"] .tinyd { color: #7a8699; }
+[data-theme="dark"] .btnd.ghost { background: #1a2130; color: #c7d2e4; border-color: #2f3a4f; }
+[data-theme="dark"] .dividerd { background: #2a3345; }
+[data-theme="dark"] .tabbar { background: #1a2130; border-top-color: #2a3345; }
+[data-theme="dark"] .tabbar .tabbtn.ghost { background: #1a2130; color: #c7d2e4; border-color: #2f3a4f; }
+[data-theme="dark"] .methodd { background: #1a2130; border-color: #2a3345; }
+[data-theme="dark"] .methodd.on { background: #1e2637; border-color: #6b7bff; }
+[data-theme="dark"] .chipd.gray, [data-theme="dark"] .devline .endchip { background: #232c3d; color: #c7d2e4; }
+
+/* ─── 第38轮：顶栏头像菜单（K3 方案：头像入口+锚定下拉，承载切换账号/检查更新/设置） ─── */
+.demo-topbar .avatar { position: relative; width: 24px; height: 24px; border-radius: 50%; background: linear-gradient(135deg,#6b7bff,#4ec9a5); color: #fff; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; border: none; padding: 0; cursor: pointer; flex-shrink: 0; }
+.demo-topbar .avatar:hover { outline: 2px solid #eef1f6; outline-offset: 1px; }
+.demo-topbar .avatar .reddot { position: absolute; top: -2px; right: -2px; width: 6px; height: 6px; border-radius: 50%; background: #ff5a5a; border: 1.5px solid #fff; }
+.menu-mask { position: fixed; inset: 0; z-index: 90; }
+.menu-panel { position: fixed; top: 74px; right: 8px; width: 200px; background: #fff; border: 1px solid #eef1f6; border-radius: 12px; box-shadow: 0 8px 24px rgba(30,40,80,.12); z-index: 91; overflow: hidden; animation: menuin .12s ease-out; transform-origin: top right; }
+@keyframes menuin { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
+.menu-head { display: flex; align-items: center; gap: 10px; padding: 12px; }
+.menu-head .av { width: 32px; height: 32px; border-radius: 50%; background: linear-gradient(135deg,#6b7bff,#4ec9a5); color: #fff; font-size: 15px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.menu-head .nm { font-size: 13px; font-weight: 600; color: #1a2333; }
+.menu-head .sub { font-size: 11px; color: #8a94a6; margin-top: 2px; }
+.menu-row { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 12px; font-size: 13px; color: #1a2333; cursor: pointer; border: none; background: none; width: 100%; text-align: left; }
+.menu-row:hover { background: #f8fafc; }
+.menu-row .em { font-size: 15px; flex-shrink: 0; }
+.menu-row .stx { margin-left: auto; font-size: 11px; color: #8a94a6; }
+.menu-row .stx.go { color: #6b7bff; text-decoration: underline; text-underline-offset: 3px; }
+.menu-sep { height: 1px; background: #eef1f6; margin: 4px 0; }
+[data-theme="dark"] .menu-panel { background: #1a2130; border-color: #2a3345; }
+[data-theme="dark"] .menu-head .nm { color: #e5eaf3; }
+[data-theme="dark"] .menu-row { color: #e5eaf3; }
+[data-theme="dark"] .menu-row:hover { background: #232c3d; }
+[data-theme="dark"] .menu-sep { background: #2a3345; }
+
+/* ─── 第39轮：子界面全量 demo 化（first/method/show/scan/recover/createConfirm/create/accts/page） ─── */
+.inpd { width: 100%; border: 1px solid #d7dfeb; border-radius: 8px; padding: 9px 10px; font-size: 13px; background: #fff; box-sizing: border-box; }
+.inpd:focus { outline: none; border-color: #6b7bff; }
+.textaread { width: 100%; border: 1px solid #d7dfeb; border-radius: 8px; padding: 8px 10px; font-size: 12px; font-family: ui-monospace, monospace; background: #fff; resize: vertical; box-sizing: border-box; }
+[data-theme="dark"] .inpd, [data-theme="dark"] .textaread { background: #1a2130; border-color: #2f3a4f; color: #e5eaf3; }
+.warn-cardd { border-color: #fecdd3 !important; background: #fff7f7 !important; }
+.go-cardd { border-color: #86efac !important; background: #f0fdf4 !important; }
+.info-cardd { border-color: #c7d2fe !important; background: #f8faff !important; }
+.stepnumd { width: 18px; height: 18px; border-radius: 50%; background: #16a34a; color: #fff; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+
+/* ─── 第100轮 主题五色（2026-10-06 v3：彩题变量块退役，统一消费 biolum 晨间底座）───
+   分工（biolum.css 头注释既定）：源色板/晨夜底座=biolum 语义层；消费端=彩题染色。
+   🔴 级联教训（10-05）：biolum 的 :root[data-theme=彩题] 晨间块（特异性 0,2,0）
+   会压过本文件 [data-theme=彩题]（0,1,0）的 --tx/--tx2/--txm——彩题文字被钉死
+   晨间色。根治（10-06）：本文件不再按彩题定义这些变量，文字/卡片/边框统一消费
+   biolum（彩题=晨间底座 --tx #1c1f2a 深字）；biolum 没有的孤儿变量在 :root 一次
+   性 alias 到语义层（值不落本端，同 index.css 旧名 alias 先例）。
+   彩题差异化只保留：① --accent（链接/强调色）② 末尾渐变/底色染色规则。 */
+:root {
+  --accent: #6b7bff;
+  --txm: var(--mu);
+  --card-bg: var(--card);
+  --card-bd: var(--bd);
+  --chip-bg: color-mix(in srgb, var(--accent) 12%, transparent);
+  --chip-tx: var(--accent);
+  --topbar-bg: var(--bg1);
+}
+[data-theme="pink"] { --accent: #db2777; }
+[data-theme="green"] { --accent: #15803d; }
+[data-theme="blue"] { --accent: #1d4ed8; }
+/* 兼容别名（聊天 overlay 等旧消费点）——dark 由下方组件级映射覆盖 */
+:root { --bg: var(--bg0); --muted: var(--mu); --surface-2: var(--bg2); }
+/* 2026-10-06 继承链钉死：body 曾被旧 CSS 源固定 #e6edf3（彩题下不随主题），
+   显式消费 --tx 钉回主题文字色 */
+body { color: var(--tx); }
+
+/* 组件消费变量（替代字面量——五主题全跟随） */
+.demo-shell { background: var(--bg, #eef1f6); color: var(--tx); }
+.demo-topbar { background: var(--topbar-bg); border-bottom-color: var(--card-bd); }
+.demo-topbar .acct-name { color: var(--tx); }
+.demo-topbar .ico { color: var(--accent); }
+.demo-scr { }
+.cardd, .acct-row, .devline, .methodd { background: var(--card-bg); border-color: var(--card-bd); }
+.subd { color: var(--tx2); }
+.tinyd { color: var(--txm); }
+.linkish { color: var(--accent); }
+.dividerd { background: var(--card-bd); }
+.acct-row:hover { border-color: var(--accent); }
+.acct-row .did, .acct-cardd .didt, .methodd .d { color: var(--txm); }
+.acct-row .cur { color: #16a34a; }
+.acct-row .sw, .acct-cardd .sw { color: var(--accent); }
+.methodd.on { border-color: var(--accent); }
+.backrowd .bk { color: var(--accent); }
+.chipd { background: var(--chip-bg); color: var(--chip-tx); }
+.chipd.green { background: #dcfce7; color: #15803d; }
+.chipd.gray { background: var(--chip-bg); color: var(--tx2); }
+.chipd.amber { background: #fef3c7; color: #92400e; }
+.inpd, .textaread { background: var(--card-bg); border-color: var(--card-bd); color: var(--tx); }
+.inpd:focus { border-color: var(--accent); }
+.tabbar { background: var(--topbar-bg); border-top-color: var(--card-bd); }
+.tabbar .tabbtn.ghost { background: var(--card-bg); color: var(--tx); border-color: var(--card-bd); }
+.btnd.ghost { background: var(--card-bg); color: var(--tx); border-color: var(--card-bd); }
+.demo-topbar .avatar:hover { outline-color: var(--topbar-bg); }
+.menu-panel { background: var(--topbar-bg); border-color: var(--card-bd); }
+.menu-head .nm { color: var(--tx); }
+.menu-head .sub, .menu-row .stx { color: var(--txm); }
+.menu-row { color: var(--tx); }
+.menu-row:hover { background: var(--chip-bg); }
+.menu-sep { background: var(--card-bd); }
+
+/* ─── 暗黑补充（未变量化的组件级映射；变量层已随 [data-theme=dark] 生效） ─── */
+[data-theme="dark"] #root:has(main.demo-scr) { background: #12161f; }
+[data-theme="dark"] .demo-scr { }
+[data-theme="dark"] .methodd.on { background: #1e2637; border-color: #6b7bff; }
+[data-theme="dark"] .devline .endchip { background: #232c3d; color: #c7d2e4; }
+[data-theme="dark"] .btnd.ghost { background: #1a2130; color: #c7d2e4; border-color: #2f3a4f; }
+[data-theme="dark"] .tabbar .tabbtn.ghost { background: #1a2130; color: #c7d2e4; border-color: #2f3a4f; }
+
+/* ═══ 添加设备面板（2026-10-06 问题4 重构：tab 切换器与内容标题分层，字号/基线统一，观感对齐 cardd）═══
+   根因：home.css `.sec button`(0,1,1) 的 padding:8px 16px + font-size:13px + border:none 压掉
+   tailwind 工具类(0,1,0)——h-7(28px) 的 tab 被 13px 字+16px 纵向 padding 撑爆，文字溢出与
+   下方「本机识别码（DID 码）」标题重叠（用户截图"山寨"）；`.sec input` 同理压输入框。
+   本块全部 ≥(0,2,1) 特异性收回，五主题消费 biolum 变量（--tx/--tx2/--txm/--card-bg/--card-bd/--accent）。 */
+.adddev-panel { display: flex; flex-direction: column; gap: 8px; border: 1.5px solid color-mix(in srgb, var(--accent) 45%, var(--card-bd)); border-radius: 12px; background: var(--card-bg); padding: 10px 11px; }
+.adddev-panel .adddev-tabs { display: flex; gap: 4px; padding: 3px; border-radius: 9px; background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.adddev-panel .adddev-tabs button { flex: 1; height: 26px; padding: 0; border: none; border-radius: 7px; background: transparent; color: var(--txm); font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.adddev-panel .adddev-tabs button.on { background: var(--accent); color: #fff; box-shadow: 0 1px 3px rgba(20,30,60,.22); }
+.adddev-panel .adddev-body { display: flex; flex-direction: column; gap: 7px; }
+.adddev-panel .adddev-title { margin-top: 2px; text-align: center; font-size: 12.5px; font-weight: 700; color: var(--tx); }
+.adddev-panel .adddev-sub { text-align: center; font-size: 10.5px; line-height: 1.5; color: var(--txm); }
+.adddev-panel .adddev-qr { display: flex; justify-content: center; padding: 4px 0 2px; }
+.adddev-panel .adddev-guide { font-size: 10.5px; line-height: 1.5; color: var(--txm); }
+.adddev-panel .adddev-wait { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 3px 0; font-size: 10.5px; color: var(--tx2); }
+.adddev-panel .adddev-wait .pulse { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: adddevpulse 1.2s ease-in-out infinite; }
+@keyframes adddevpulse { 0%,100% { opacity: .35 } 50% { opacity: 1 } }
+.adddev-panel .adddev-reqhead { padding-top: 2px; text-align: center; font-size: 10.5px; font-weight: 600; color: var(--accent); }
+.adddev-panel .adddev-req { width: 100%; max-width: 300px; margin: 0 auto; padding: 6px 8px; border: 1px solid var(--card-bd); border-radius: 9px; background: var(--bg); display: flex; flex-direction: column; gap: 4px; }
+.adddev-panel .adddev-alt { padding-top: 7px; border-top: 1px solid color-mix(in srgb, var(--card-bd) 60%, transparent); }
+.adddev-panel .adddev-alt summary { text-align: center; font-size: 10.5px; color: var(--txm); cursor: pointer; }
+.adddev-panel .adddev-body input { height: 28px; padding: 0 8px; border: 1px solid var(--card-bd); border-radius: 8px; background: var(--bg); color: var(--tx); font-size: 11px; outline: none; }
+.adddev-panel .adddev-body input:focus { border-color: var(--accent); }
+.adddev-panel .adddev-body button.adddev-primary { width: 100%; height: 28px; padding: 0; border: none; border-radius: 8px; background: var(--accent); color: #fff; font-size: 11.5px; font-weight: 600; cursor: pointer; }
+.adddev-panel .adddev-body button.adddev-primary:disabled { opacity: .4; cursor: not-allowed; }
+.adddev-panel .adddev-body button.adddev-done { width: 100%; height: 28px; padding: 0; border: 1px solid var(--card-bd); border-radius: 8px; background: var(--card-bg); color: var(--tx2); font-size: 11.5px; font-weight: 500; cursor: pointer; }
+.adddev-panel .adddev-body button.adddev-done:hover { background: var(--chip-bg); }
+.adddev-panel .adddev-body button.adddev-approve { flex-shrink: 0; height: 20px; padding: 0 7px; border: none; border-radius: 6px; background: #059669; color: #fff; font-size: 10.5px; font-weight: 500; cursor: pointer; }
+.adddev-panel .adddev-body button.adddev-icon { flex-shrink: 0; padding: 2px; border: none; border-radius: 5px; background: none; color: var(--txm); cursor: pointer; }
+.adddev-panel .adddev-body button.adddev-icon:hover { color: #dc2626; }
+.adddev-panel .adddev-body button.linkish { background: none; border: none; color: var(--accent); font-size: 11px; padding: 2px 4px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.adddev-panel .adddev-body button.linkish.dim { color: var(--txm); font-size: 10px; }
+.adddev-panel .adddev-secondary { margin-top: 2px; padding-top: 7px; border-top: 1px solid color-mix(in srgb, var(--card-bd) 60%, transparent); display: flex; flex-direction: column; gap: 4px; }
+.adddev-panel .adddev-secondary .srow { display: flex; align-items: center; justify-content: center; gap: 6px; line-height: 1.4; }
+.adddev-panel .adddev-secondary .srow .linkish { display: inline-flex; align-items: center; gap: 4px; line-height: 1.4; padding: 2px 4px; }
+.adddev-panel .adddev-secondary .note { font-size: 9.5px; color: var(--txm); }
+/* 2026-10-06：粘贴框 textarea（did 码长，2 行折行显示完整，便于核对） */
+.adddev-panel .adddev-body textarea.adddev-didta { min-height: 44px; padding: 6px 8px; border: 1px solid var(--card-bd); border-radius: 8px; background: var(--bg); color: var(--tx); font-size: 11px; outline: none; resize: vertical; line-height: 1.5; word-break: break-all; font-family: ui-monospace, monospace; }
+.adddev-panel .adddev-body textarea.adddev-didta:focus { border-color: var(--accent); }
+
+/* ═══ 加好友面板（2026-10-07 重排：320 窄窗通栏）═══
+   旧版左右分栏（左 input+按钮 / 右二维码）在 320 窄窗被压成：输入框 114px（占位符实测宽
+   191px → 截断成「粘贴对方有灵账」）、按钮 96px 与输入框不同宽、二维码 104px、
+   底部账号行折两行（"我的账号 … 点击 / DID: … 复制"）。headless 铁证见
+   verify-shots/friends-add/*-rects.json（before：placeholderFits=false，宽 114 < 191）。
+   本次重排：主操作（粘贴识别码 → 发送）通栏在上，二维码 + 复制行（次要）在下，8px 节奏；
+   词系统一「识别码」（不再出现「有灵账号」；DID 仅作识别码的格式示例）。
+   样式全走 biolum 变量（--accent/--card-bg/--card-bd/--bg/--tx/--tx2/--txm），五主题自适应。 */
+.addfr-panel { display: flex; flex-direction: column; gap: 8px; border: 1.5px solid color-mix(in srgb, var(--accent) 45%, var(--card-bd)); border-radius: 12px; background: var(--card-bg); padding: 10px 11px; }
+.addfr-panel .addfr-title { font-size: 12.5px; font-weight: 700; color: var(--tx); }
+.addfr-panel .addfr-guide { margin-top: -3px; font-size: 10.5px; line-height: 1.5; color: var(--txm); }
+/* 粘贴框：did 识别码 48+ 字符，单行 input 放不下（旧版即截断根因）——2 行高折行显示完整码，
+   与添加设备面板 .adddev-didta 同款处理（2026-10-06 用户实测定稿）。 */
+.addfr-panel .addfr-ta { width: 100%; min-height: 44px; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--card-bd); border-radius: 8px; background: var(--bg); color: var(--tx); font-size: 11px; line-height: 1.5; font-family: ui-monospace, monospace; word-break: break-all; resize: vertical; outline: none; }
+.addfr-panel .addfr-ta:focus { border-color: var(--accent); }
+/* 占位符用 UI 字体（中文混排更端正，且比等宽字体更窄——不截断余量更大） */
+.addfr-panel .addfr-ta::placeholder { font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; color: var(--txm); }
+.addfr-panel .addfr-warn { margin-top: -3px; font-size: 10px; line-height: 1.5; color: #e65100; }
+.addfr-panel .addfr-primary { width: 100%; height: 30px; padding: 0; border: none; border-radius: 8px; background: var(--accent); color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; }
+.addfr-panel .addfr-primary:disabled { opacity: .4; cursor: not-allowed; }
+.addfr-panel .addfr-msg { margin-top: -3px; font-size: 10px; line-height: 1.5; text-align: center; }
+.addfr-panel .addfr-sep { height: 1px; background: color-mix(in srgb, var(--card-bd) 70%, transparent); }
+.addfr-panel .addfr-mine { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 1px 0 0; }
+.addfr-panel .addfr-mine img { display: block; margin: 0 auto; border-radius: 8px; background: #fff; padding: 5px; }
+.addfr-panel .addfr-mine-cap { font-size: 11.5px; font-weight: 700; color: var(--tx); }
+.addfr-panel .addfr-mine-sub { font-size: 10.5px; color: var(--txm); }
+/* 底部账号行：label + 值 + 复制三件对齐（旧版"点击复制"混排折两行） */
+.addfr-panel .addfr-account { display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; border: 1px solid var(--card-bd); border-radius: 8px; background: var(--bg); cursor: pointer; }
+.addfr-panel .addfr-account:hover { border-color: var(--accent); }
+.addfr-panel .addfr-account-label { flex-shrink: 0; font-size: 10.5px; color: var(--txm); }
+.addfr-panel .addfr-account-did { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-family: ui-monospace, monospace; color: var(--tx2); }
+.addfr-panel .addfr-account-copy { flex-shrink: 0; font-size: 10.5px; font-weight: 600; color: var(--accent); }
+
+/* ─── 欢迎首屏（2026-10-06 重设计，设计定稿"太难看"）：品牌 → 本机账号（主操作）→ 登录其他 → 创建 ───
+   五主题全走 biolum 变量（--tx/--tx2/--txm/--card-bg/--card-bd/--accent/--chip-bg）；头像 hash 色
+   为既定产品语言（acctLayout.avatarHue 调色盘，2026-10-03 设计定稿彩色圆）不算硬编码主题色。 */
+.welcome { display: flex; flex-direction: column; gap: 13px; padding: 10px 2px 4px; }
+.welcome-hero { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 8px; padding: 16px 4px 4px; }
+.welcome-logo { width: 46px; height: 46px; border-radius: 15px; display: flex; align-items: center; justify-content: center; font-size: 21px; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--accent), #4ec9a5); box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 32%, transparent); user-select: none; }
+.welcome-hero .subd { max-width: 262px; }
+.welcome-sec-title { font-size: 11.5px; font-weight: 600; color: var(--txm); letter-spacing: .2px; margin: 4px 1px 0; }
+.welcome-accounts { display: flex; flex-direction: column; gap: 8px; }
+.welcome-acct { padding: 10px 11px 10px 10px; gap: 9px; border-radius: 12px; }
+.welcome-acct .av { width: 34px; height: 34px; font-size: 15px; font-weight: 700; }
+.welcome-acct .meta { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.welcome-acct .meta .nm { display: flex; align-items: baseline; gap: 5px; white-space: nowrap; overflow: hidden; }
+.welcome-acct .meta .nm-t { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.welcome-login-btn { margin-left: auto; flex-shrink: 0; font-size: 11.5px; font-weight: 600; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent); background: var(--chip-bg); border-radius: 999px; padding: 4px 13px; transition: background .15s, color .15s; }
+.welcome-acct:hover .welcome-login-btn { background: var(--accent); color: #fff; }
+.welcome-primary { margin-top: 2px; padding: 12px; font-size: 14px; }
+[data-theme="dark"] .welcome-logo { box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 26%, transparent); }
+
+/* ─── 第47轮旧映射（已被上方变量层取代——保留按钮渐变等装饰项） ─── */
+[data-theme="pink"] .btnd, [data-theme="pink"] .tabbar .tabbtn { background: linear-gradient(135deg,#ec5f9b,#f472b6); }
+[data-theme="green"] .btnd, [data-theme="green"] .tabbar .tabbtn { background: linear-gradient(135deg,#16a34a,#4ec9a5); }
+[data-theme="blue"] .btnd, [data-theme="blue"] .tabbar .tabbtn { background: linear-gradient(135deg,#2563eb,#4d8dff); }
+[data-theme="pink"] .demo-shell, [data-theme="pink"] #root:has(main.demo-scr) { background: #fdf2f6; }
+[data-theme="green"] .demo-shell, [data-theme="green"] #root:has(main.demo-scr) { background: #f0f7f0; }
+[data-theme="blue"] .demo-shell, [data-theme="blue"] #root:has(main.demo-scr) { background: #eef4fb; }

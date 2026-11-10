@@ -1,0 +1,153 @@
+[package]
+name = "myco-home"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "myco_home_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 浜у搧鍚嶇粺涓€(2026-09-03):cargo 鐩存帴浜у嚭 myco.exe鈥斺€旀鍓嶅寘鍚?myco-home 浜у嚭
+# myco-home.exe,鍙戝竷/閮ㄧ讲瑕佹敼鍚?杩樺拰鏀瑰悕鏈熼棿閬楃暀鐨勬棫 myco.exe 骞跺瓨(鐢ㄦ埛鐐瑰悕)銆?
+[[bin]]
+name = "myco"
+path = "src/main.rs"
+
+# p2p_e2e锛堢86杞ソ鍙嬫湇鍔″櫒鍖?e2e 鎺㈤拡锛変緷璧?tauri 澹斥€斺€擟LI 鍙樹綋
+# 锛?-no-default-features锛夎烦杩囩紪璇戯紙required-features 涓嶆弧瓒冲嵆鎺掗櫎锛夈€?
+[[bin]]
+name = "p2p_e2e"
+path = "src/bin/p2p_e2e.rs"
+required-features = ["gui"]
+
+# 璁惧缇ゅ弻瀹炰緥 E2E锛坉ocs/design/璁惧缇よ璁?md 搂4 T5 楠屾敹閾撅級锛氬缓鍙封啋鏀剁紪鈫掕澶囩兢
+# 鑷姩鍑虹幇鈫掔兢鍙戯紙缃插悕=璁惧鍚嶏級鈫掍紶鏂囦欢鈫掑悐閿€鈫掍笉鍙揪銆備笁杩涚▼瀵规媿锛堟湰鍦?identity-svc
+# + 鍙?bin 瑙掕壊锛夛紝瑙?bin 澶存敞閲娿€?
+[[bin]]
+name = "device_group_e2e"
+path = "src/bin/device_group_e2e.rs"
+required-features = ["gui"]
+
+# 濂藉弸鎻℃墜鍙屽疄渚?E2E锛?026-10-07 濂藉弸鍘绘湇鍔＄鍖栵級锛欰 鍔?B锛堜俊绠卞厹搴曪級鈫?B 鏀?
+# request锛坧oll 楠岀+褰掑睘鈫抜n-pending锛夆啋 B accept锛圥2P 鐩存帹锛夆啋 鍙?ok+绯荤粺鏉?鈫?
+# B remove 鈫?A 琛?浼氳瘽娓呫€備笁杩涚▼瀵规媿锛堟湰鍦?identity-svc + 鍙?bin 瑙掕壊锛夛紝瑙?bin 澶存敞閲娿€?
+[[bin]]
+name = "friend_e2e"
+path = "src/bin/friend_e2e.rs"
+required-features = ["gui"]
+
+# 涓夌浜掓祴鐭╅樀 E2E锛坱ests/涓夌浜掓祴鍥炲綊鎸囧崡.md锛夛細鍙厤缃?N 瀹炰緥瀵规媿銆?
+# 瑙掕壊 founder/member/exporter/importer/xfounder锛圡X_ROLE锛夛紝鎴愬憳鏁?MX_MEMBERS銆?
+# 鎴愬憳缂栧彿 MX_ID 鍙傛暟鍖栤€斺€擬1 鍔犺澶囷紙1+N 瀹炰緥锛? M2 鎭㈠鐮佸鍏ワ紙2 瀹炰緥锛?
+# M4 璺ㄧ鏀剁紪锛圵in founder 鈫?PWA/Linux 澶栭儴绔紝淇″彿鏂囦欢瀵规媿锛夈€?
+[[bin]]
+name = "matrix_e2e"
+path = "src/bin/matrix_e2e.rs"
+required-features = ["gui"]
+
+# TV-TUNNEL-VERIFY-BLOCK锛堢湡鏈洪獙璇佺敤锛岄潪浜у搧锛涘彲鏁存鍒犻櫎锛?
+
+# 2026-10-09 灭灯修复冒烟诊断（非产品，可整段删除）：在计划任务环境跑产线同款
+# presence::heartbeat_loop，配合本地 identity-svc 验证 20s 心跳持续落表。
+[[bin]]
+name = "presence_sched_diag"
+path = "src/bin/presence_sched_diag.rs"
+required-features = ["gui"]
+
+# 账号生命周期 E2E（2026-10-11 加）：走 identity_service（GUI 变体）→ 必须声明
+# required-features，否则 `--no-default-features` 的 CLI 构建把它一起编译会 E0433
+# （2026-10-19 CLI 变体修复：此前 src/bin 自动发现、无 required-features）。
+[[bin]]
+name = "account_lifecycle_e2e"
+path = "src/bin/account_lifecycle_e2e.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+gui = ["dep:tauri", "dep:tauri-plugin-single-instance", "dep:tauri-plugin-notification", "dep:ui-embed-server"]
+# 2026-11-03 开源（Phase 1）：HBL 业务集成——可选 feature，开源构建不启用。
+# 用法：cargo build --features hbl（内部 CI 加此 flag；开源 CI 不加=自动排除 hbl_ingest.rs）
+hbl = []
+# 2026-11-10 vnet 方案 A 预研（H.3.2 PeerListener）：**A 独占构建**——启用即裁剪
+# 方案 B（VNETP/1 前导解析/桥接，dsh_share.rs `start_vnetp_listener` 一族），
+# 传输面只剩 PeerListener。默认不启用（默认构建 B 全量保留，行为与裁剪前逐字节一致）。
+# vnet 的 PeerListener 已 vendor（vnet/peer_listener.rs）；A 面接线见 dsh_share.rs
+# `bind_vnet_peer_listener`，运行时切换 MYCO_VNET_TRANSPORT=peer_listener。
+vnet-a = []
+
+[build-dependencies]
+# 淇濇寔闈?optional锛歜uild.rs 鎸?CARGO_FEATURE_GUI 鏉′欢璋冪敤锛坱auri-build 鏈韩鏃?
+# 绯荤粺閾炬帴渚濊禆锛汣LI 鍙樹綋璺宠繃璋冪敤鍗充笉瑕佹眰 tauri.conf.json/frontendDist锛夈€?
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 2026-11-04 vnet 新传输层 vendoring（stun/probe/punch/relay/transport/session/crypto/connection）
+anyhow = "1"
+# 2026-10-22 vnet：同 LAN 零配置发现（V17.1/E1）
+mdns-sd = "0.11"
+tauri = { version = "2", features = ["custom-protocol", "tray-icon"], optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
+# 鎵逛笁 PC 鑱婂ぉ UI锛氱郴缁熼€氱煡锛堢獥鍙ｅ鏀舵秷鎭棤鎰熺殑鍙婃牸绾夸慨澶嶏級
+tauri-plugin-notification = { version = "2", optional = true }
+ui-embed-server = { path = "../../ui-agents/embed-server", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
+bs58 = "0.5"
+# CLI 閫氶亾锛坒eat/cli-suite锛夛細serve 闇€瑕?rt/net锛汫UI 璺緞鐨?tauri::async_runtime 涓嶅彈褰卞搷
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "time"] }
+axum = { version = "0.7", features = ["ws"] }
+# 2026-11-10 vnet 方案 A（H.3.2 PeerListener）：axum 0.7.9 的 serve 只吃
+# tokio TcpListener（无 Listener trait，0.8 才有）；dsh_share.rs 的 PeerListener
+# 适配器用 hyper-util 按连接服务（axum::serve 内部同款机械，含 WS upgrade）。
+# 版本与 axum 传递依赖同款（lock 里已有 0.1.21），离线可解析，零新增下载。
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "service", "http1"] }
+# DSH 鍒嗕韩缃戝叧锛坉sh_share.rs锛夛細WS 涓户锛坉sh remote.mux 閫忎紶锛夐渶瑕佸鎴风 WS
+tokio-tungstenite = "0.23"
+# 绗?4杞?P2P 鏈嶅姟鍣?CORS锛堟墜鏈?WebView 璺?origin 鐩磋繛锛屽悓 env direct_server锛?
+tower-http = { version = "0.5", features = ["cors", "compression-gzip", "compression-br"] }
+# 绗?4杞?P2P 鍙屾爤鐩戝惉锛歔::] + IPV6_V6ONLY=0锛圛Pv6 鐩磋繛涓?IPv4 LAN 鍚?socket 鏀讹級
+socket2 = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "stream", "rustls-tls", "gzip", "brotli", "deflate"] }
+ureq = { version = "2", features = ["json"] }
+url = "2"
+myco-core = { path = "../../../core/myco-core" }
+# 鏇存柊閾捐矾 v2(2026-09-22):sha256 瀹屾暣鎬ф牎楠?+ 鍘熺敓 zip 瑙ｅ帇(寮?PowerShell Expand-Archive)
+sha2 = "0.10"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+# HBL 鍙戦鏅鸿兘浣?hbl_ingest.rs):鏃ф帴鍙?HMAC-SHA256 绛惧悕 + uuid/涓存椂鍚嶉殢鏈烘簮锛堢函 Rust锛?
+# DSH 鍒嗕韩缃戝叧锛坉sh_share.rs 鑷?apps/env 绉绘锛夛細WS split + 鏃ュ織
+futures-util = "0.3"
+tracing.workspace = true
+hmac = "0.12"
+rand = "0.9"
+
+# 鈺愨晲鈺?2026-10-09 P2P 闅ч亾甯х骇鍔犲瘑锛坧2p_tunnel.rs锛夆晲鈺愨晲
+# 闅ч亾鍐呭鍔犲瘑锛氭彙鎵?X25519 ECDH锛堜复鏃堕挜锛屽墠鍚戜繚瀵嗭級鈫?HKDF-SHA256 娲剧敓鏂瑰悜瀵嗛挜
+# 鈫?甯х骇 AES-256-GCM锛堟瘡甯у簭鍙?nonce + 閲嶆斁绐楀彛锛夈€?
+# 鍏ㄩ儴涓庢棦鏈変緷璧栨爲鍚岀増鏈紙curve25519 瀹舵棌 / RustCrypto AEAD 鍗婃棌锛夛紝涓嶈繘鏂板鏃忥紱
+# 鍙敤绂荤嚎 registry 缂撳瓨閲屽凡瀛樺湪鐨勭増鏈紝绂荤嚎鍙瀯寤恒€?
+#   aes-gcm   0.10.3 鈫?宸插湪 Cargo.lock锛坢yco-core 鍚屾锛夛紝闆舵柊澧炰紶閫掍緷璧?
+#   x25519-dalek 2.0.1锛坰tatic_secrets锛氭祴璇曢渶瑕佺‘瀹氭€т复鏃堕挜娉ㄥ叆锛?
+#   hkdf      0.12.4 鈫?hmac 0.12 / sha2 0.10 鍚屾棌锛屽凡鍦ㄩ攣鏂囦欢
+#   getrandom 0.3.4 鈫?涓存椂閽ョ殑鐪熼殢鏈烘簮锛坋d25519-dalek 涔熺敤瀹冿級
+aes-gcm = "0.10.3"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+hkdf = "0.12.4"
+getrandom = "0.3.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Windows 涓撳睘锛坙inux CLI/GUI 鍙樹綋涓嶆媺鈥斺€攚inreg 浠呮敮鎸?windows target锛?
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+# 鍒嗕韩缃戝叧 reaper锛歄penProcess 鎺㈤拡鍒ゅ畾 pid 鐪熸锛堟壙 apps/env 鐨勫疄鐜帮級
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Power", "Win32_System_Threading"] }
+
+[dev-dependencies]
+# presence 心跳循环虚拟时钟单测（2026-10-09 灭灯修复回归锁）：start_paused 需要
+# test-util（仅测试构建并入，release/发布构建不解析 dev-deps，不进产物）。
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "test-util"] }

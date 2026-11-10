@@ -1,0 +1,1390 @@
+/**
+ * 聊天视图（ChatView）作用域样式 —— 从 phone 端抽取并嵌进 `.myco-chat-view`
+ * 作用域，避免与 canvas 全局类/同名 CSS 变量串色。
+ *
+ * 视觉目标（2026-07-26 用户定）：**克制又美观、多彩、有特效**，不要毛坯感。
+ *  - 背景：柔和渐变 + 双色氛围光斑（不是死灰白板）
+ *  - 用户气泡：accent 渐变（有层次）；assistant 白卡 + 模型色边（按模型变色）
+ *  - pending（生成中）：渐变边框流光（不是虚线）
+ *  - 模型角标：渐变 chip；代码块：mac 三圆点
+ */
+
+.myco-chat-view {
+  /* 主题变量由 ChatView 根节点 inline 设置（--mc-accent/--mc-accent-2/--mc-glow-1/--mc-glow-2），
+     这里给默认值（淡蓝），切换主题即全局变。 */
+  --mc-accent: var(--accent, #6b7bff);
+  --mc-accent-2: #5567f5;
+  --mc-glow-1: rgba(139, 92, 246, .22);
+  --mc-glow-2: rgba(59, 130, 246, .18);
+  --mc-accent-soft: color-mix(in srgb, var(--mc-accent) 12%, transparent);
+  --mc-surface: #ffffff;
+  --mc-surface-2: #f4f6fb;
+  --mc-border: #e8eaf2;
+  --mc-text: #1c1f2a;
+  --mc-text-2: #565b6b;
+  --mc-muted: #9aa0b0;
+
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  /* 宽度约束链：flex 子项默认 min-width:auto，长代码行会把整个面板撑宽——
+     每层都 min-width:0 + 溢出内收，宽度异常（展开后屏幕变宽）的根修。 */
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  position: relative;
+  background:
+    radial-gradient(1000px 620px at 88% -10%, var(--mc-glow-1), transparent 62%),
+    radial-gradient(820px 560px at 6% 110%, var(--mc-glow-2), transparent 58%),
+    linear-gradient(180deg, #f4f6fc 0%, #e7ecf7 100%);
+  transition: background .4s ease;
+}
+
+/* ═══ 暗色主题(2026-08-21:工作区暗色背景不同步根修) ═══
+   ChatView 曾只写浅色渐变/白色卡片 37 处——data-theme=dark 翻转后仍是浅底。
+   方案:变量覆盖 + 背景替换,硬编码浅色用 dark 选择器逐个翻转。 */
+[data-theme="dark"] .myco-chat-view {
+  --mc-surface: #161b22;
+  --mc-surface-2: #1c2333;
+  --mc-border: #2d333b;
+  --mc-text: #e6edf3;
+  --mc-text-2: #9aa4b2;
+  --mc-muted: #6e7681;
+  --mc-glow-1: rgba(139, 92, 246, .08);
+  --mc-glow-2: rgba(59, 130, 246, .06);
+  --mc-accent-soft: color-mix(in srgb, var(--mc-accent) 15%, transparent);
+  background:
+    radial-gradient(1000px 620px at 88% -10%, var(--mc-glow-1), transparent 62%),
+    radial-gradient(820px 560px at 6% 110%, var(--mc-glow-2), transparent 58%),
+    linear-gradient(180deg, #0d1117 0%, #10141b 100%);
+}
+/* 白色卡片→暗色面板 */
+[data-theme="dark"] .myco-chat-view .msg.ai { background: #161b22; border-color: #2d333b; }
+[data-theme="dark"] .myco-chat-view .chat-input,
+[data-theme="dark"] .myco-chat-view .chat-input textarea,
+[data-theme="dark"] .myco-chat-view .chat-config-popover { background: #161b22; border-color: #2d333b; color: #e6edf3; }
+[data-theme="dark"] .myco-chat-view .chat-input textarea::placeholder { color: #6e7681; }
+[data-theme="dark"] .myco-chat-view .chat-head { background: #161b22; border-color: #2d333b; }
+/* 代码块/mac 窗口 */
+[data-theme="dark"] .myco-chat-view .code-block { background: #0d1117 !important; border-color: #2d333b; }
+[data-theme="dark"] .myco-chat-view .code-block pre { color: #e6edf3; }
+/* nav 键/状态 pill */
+[data-theme="dark"] .myco-chat-view .nav-key { background: #1c2333; border-color: #2d333b; color: #9aa4b2; }
+[data-theme="dark"] .myco-chat-view .nav-key.nav-enter { background: var(--mc-accent); color: #fff; }
+[data-theme="dark"] .myco-chat-view .pill.idle { background: #1c2333; color: #8b949e; }
+[data-theme="dark"] .myco-chat-view .pill.offline { background: #161b22; color: #6e7681; }
+/* 会话列表/侧栏元素(如有) */
+[data-theme="dark"] .myco-chat-view .sess-list,
+[data-theme="dark"] .myco-chat-view .sess { background: #161b22; border-color: #2d333b; }
+[data-theme="dark"] .myco-chat-view .sess:hover { background: #1c2333; }
+/* 工具调用块 */
+[data-theme="dark"] .myco-chat-view .tool-call { background: #0d1117; border-color: #2d333b; }
+[data-theme="dark"] .myco-chat-view .tool-call summary { color: #9aa4b2; }
+/* 通用文本色修正 */
+[data-theme="dark"] .myco-chat-view .msg .meta { color: #6e7681; }
+[data-theme="dark"] .myco-chat-view .timestamp { color: #6e7681; }
+/* 保留浅色(原规则在前面,dark 覆盖在后) */
+.myco-chat-view {
+}
+
+/* ── 顶部条 ── */
+.myco-chat-view .chat-head {
+  position: relative;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 18px;
+  /* 纯色背景（不用 backdrop-filter——滚动时每帧 GPU 重绘 blur，是滚动掉帧主因之一） */
+  background: var(--mc-surface, #fff);
+  border-bottom: 1px solid var(--mc-border);
+  flex-shrink: 0;
+}
+.myco-chat-view .chat-head-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--mc-text);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.myco-chat-view .chat-head-meta {
+  font-size: 11px;
+  color: var(--mc-text-2);
+  white-space: nowrap;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+.myco-chat-view .chat-head-meta-click { cursor: pointer; transition: opacity .15s; }
+.myco-chat-view .chat-head-meta-click:hover { opacity: 1; }
+/* portal header（canvas 执行页 header 渲染在 .myco-chat-view 之外） */
+.chat-head-meta-click { cursor: pointer; transition: opacity .15s; }
+.chat-head-meta-click:hover { opacity: 1; }
+.myco-chat-view .chat-config-popover {
+  position: absolute; top: 100%; left: 0; z-index: 50;
+  min-width: 180px; padding: 10px; gap: 8px;
+  display: flex; flex-direction: column;
+  background: #fff; border: 1px solid var(--mc-border, #e6eaf0);
+  border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.15);
+}
+/* portal 版本：用 app 级 CSS 变量（--chrome-bg 等而非 --mc-bg） */
+.chat-config-popover {
+  position: fixed; z-index: 9999;
+  min-width: 200px; max-width: calc(100vw - 16px); padding: 12px; gap: 8px;
+  display: flex; flex-direction: column;
+  background: #fff; border: 1px solid var(--chrome-border, #e6eaf0);
+  border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,.18);
+}
+/* 智能体只读展示（2026-09-08 设计定稿：harness 启动后不可改——弹层里与模型
+   下拉视觉区分：无边框无底色纯文本，模型才是可点的下拉） */
+.chat-config-static {
+  padding: 5px 2px; font-size: 12px; font-weight: 600;
+  color: var(--text-primary, #0f172a); opacity: .85;
+}
+[data-theme="dark"] .chat-config-static { color: #e6edf3; }
+.myco-chat-view .chat-config-label { font-size: 10px; font-weight: 600; opacity: .6; margin-bottom: 3px; }
+.chat-config-label { font-size: 10px; font-weight: 600; color: var(--text-muted, #94a3b8); margin-bottom: 3px; }
+.myco-chat-view .chat-config-select {
+  width: 100%; height: 28px; padding: 0 6px; font-size: 11px;
+  background: rgba(255,255,255,.06); color: inherit;
+  border: 1px solid rgba(255,255,255,.15); border-radius: 6px;
+  cursor: pointer; outline: none;
+}
+.chat-config-select {
+  width: 100%; height: 28px; padding: 0 6px; font-size: 11px;
+  background: #f3f5f9; color: var(--text-primary, #0f172a);
+  border: 1px solid var(--chrome-border, #e6eaf0); border-radius: 6px;
+  cursor: pointer; outline: none;
+}
+.myco-chat-view .chat-config-select:focus { border-color: var(--mc-accent, #6366f1); }
+.chat-config-select:focus { border-color: var(--accent, #6366f1); }
+.myco-chat-view .chat-config-hint { font-size: 9px; opacity: .5; line-height: 1.3; }
+.chat-config-hint { font-size: 9px; color: var(--text-muted, #94a3b8); line-height: 1.3; }
+
+/* portal 版深色覆盖(曾只有 scoped 版有——portal 走 createPortal 在 chat-view 外,
+   深色主题下白底刺眼,k3 实测实测问题) */
+[data-theme="dark"] .chat-config-popover { background: #161b22; border-color: #2d333b; color: #e6edf3; }
+[data-theme="dark"] .chat-config-select { background: #0d1117; color: #e6edf3; border-color: #2d333b; }
+[data-theme="dark"] .chat-config-select:disabled { color: #6e7681; }
+[data-theme="dark"] .chat-config-hint { color: #6e7681; }
+
+
+/* 状态 pill（呼吸/渐变） */
+.myco-chat-view .pill {
+  font-size: 11px;
+  padding: 3px 11px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  font-weight: 600;
+  letter-spacing: .2px;
+}
+.myco-chat-view .pill.working {
+  background: linear-gradient(135deg, #34d399, #10b981);
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(16, 185, 129, .35);
+  animation: mc-pulse 1.4s ease-in-out infinite;
+}
+.myco-chat-view .pill.waiting_input { background: linear-gradient(135deg, #fbbf24, #f59e0b); color: #fff; box-shadow: 0 2px 8px rgba(245, 158, 11, .3); }
+.myco-chat-view .pill.idle { background: #e8ecf6; color: #5b6b8c; }
+.myco-chat-view .pill.offline { background: #eef0f3; color: var(--mc-muted); }
+@keyframes mc-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
+
+.myco-chat-view .work-time {
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  color: var(--mc-text-2);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 展开/折叠切换按钮（pill 左边） */
+.myco-chat-view .expand-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--mc-border);
+  background: var(--mc-surface-2);
+  color: var(--mc-text-2);
+  cursor: pointer;
+  flex-shrink: 0;
+  font-weight: 500;
+  transition: color .12s, border-color .12s;
+}
+.myco-chat-view .expand-toggle:hover { color: var(--mc-accent); border-color: var(--mc-accent); }
+
+/* 停止按钮（播放器停止键风：生成中显示，点=发 Esc 给 claude 打断） */
+.myco-chat-view .stop-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: linear-gradient(135deg, #ff6b6b, #e23c2e);
+  color: #fff; cursor: pointer; flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(226, 60, 46, .4);
+  transition: transform .12s, filter .12s;
+  animation: mc-stop-pulse 1.8s ease-in-out infinite;
+}
+/* 2026-10-06 hover 对比度修：变暗——白方块在红底上，变亮只会更看不清 */
+.myco-chat-view .stop-btn:hover { filter: brightness(.95); }
+.myco-chat-view .stop-btn:active { transform: scale(.92); }
+.myco-chat-view .stop-square {
+  display: block; width: 9px; height: 9px; border-radius: 2px; background: #fff;
+}
+
+/* 交互选择界面提示（picker）*/
+.myco-chat-view .interactive-hint {
+  padding: 7px 15px;
+  font-size: 12px;
+  color: var(--mc-accent);
+  background: var(--mc-accent-soft);
+  border-bottom: 1px solid var(--mc-border);
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.myco-chat-view .interactive-hint kbd {
+  font-family: ui-monospace, monospace; font-size: 11px;
+  padding: 1px 6px; border-radius: 5px;
+  background: #fff; border: 1px solid var(--mc-border);
+  box-shadow: 0 1px 0 var(--mc-border);
+  color: var(--mc-text);
+}
+
+/* 功能屏镜像（终端样式，可滚动）*/
+.myco-chat-view .picker-view {
+  margin: 0 0 18px; border: 1px solid var(--mc-border); border-radius: 12px;
+  background: #0d1117; overflow: hidden; box-shadow: 0 2px 10px rgba(22,30,60,.06);
+}
+.myco-chat-view .picker-screen {
+  max-height: 320px; overflow-y: auto; padding: 10px 14px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px; line-height: 1.55; color: #c9d1d9; white-space: pre-wrap; word-break: break-word;
+}
+.myco-chat-view .picker-line { padding: 1px 0; }
+.myco-chat-view .picker-line.is-selected { color: #fff; background: var(--mc-accent); border-radius: 4px; padding: 1px 6px; margin: 0 -6px; font-weight: 600; }
+.myco-chat-view .picker-keys { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid #1c2230; overflow-x: auto; }
+.myco-chat-view .nav-key {
+  min-width: 40px; height: 34px; padding: 0 10px; border-radius: 8px;
+  border: 1px solid var(--mc-border); background: var(--mc-surface);
+  font-size: 14px; font-weight: 600; color: var(--mc-text);
+  cursor: pointer; flex-shrink: 0; transition: filter .1s, transform .1s;
+}
+.myco-chat-view .nav-key:active { transform: scale(.94); filter: brightness(.95); }
+.myco-chat-view .nav-key.nav-enter { background: var(--mc-accent); color: #fff; border-color: transparent; }
+.myco-chat-view .nav-key.nav-esc { color: #d33a30; }
+@keyframes mc-stop-pulse {
+  0%, 100% { box-shadow: 0 2px 8px rgba(226, 60, 46, .4); }
+  50% { box-shadow: 0 2px 14px rgba(226, 60, 46, .65); }
+}
+
+/* ── 主题圆点切换器（title 栏中部，mac 三色圆圈风，多彩有质感） ── */
+/* 主题色圆点（mac 三色灯风）——单一来源：phone-chat.css 被 phone（main.tsx 全局加载）
+   和 canvas（@phone ChatView）共同加载，故定义在此、不作用域限定，ChatView 与
+   HistoryPanel 共用。index.css 不再有副本（避免双份漂移，如指示线只在一边删）。 */
+.theme-dots {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.theme-dot {
+  position: relative;
+  width: 15px; height: 15px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  box-shadow:
+    inset 0 -1.5px 3px rgba(0, 0, 0, .18),
+    inset 0 1.5px 2px rgba(255, 255, 255, .45),
+    0 1px 3px rgba(0, 0, 0, .2);
+  transition: transform .15s ease, box-shadow .15s ease;
+}
+.theme-dot:hover { transform: scale(1.15); }
+/* 选中：不放大、不加外圈、也不画下方指示条（颜色本身已一目了然） */
+.theme-dot.active { transform: none; }
+
+/* ── 消息滚动区 ── */
+.myco-chat-view .chat-scroll {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 底部锚定：scrollTop=0 即最新消息（DOM 新→旧）。打开即底、新消息自然贴底、
+     加载更早追加在视觉顶部不扰动视口；懒渲染优先画视口内的底部气泡。 */
+  display: flex;
+  flex-direction: column-reverse;
+  /* 关浏览器 scroll-anchoring：column-reverse 容器里它的补偿方向算反——
+     全局展开思维链时内容翻倍，anchoring 把 scrollTop 拖到最顶（打开即最旧消息、
+     onScroll 误判上滚解除贴底，实测 -90751 卡死在顶）。贴底由应用自管
+     （MutationObserver pin），不需要浏览器插手。 */
+  overflow-anchor: none;
+  /* 2026-09-10 视觉校验抓到：jump-nav 浮层（right:10px）压在长消息气泡上
+     遮挡文本。修=右侧预留浮层占位（48px=浮层宽 30px+间隙）。 */
+  padding: 14px 48px 20px 12px;
+  background: var(--mc-surface, #fff);
+  border-radius: 12px;  /* 白窗与浅色框衔接处圆角化 */
+  /* contain 隔离：滚动时浏览器不必重算容器外布局/绘制（滚动丝滑关键）。
+     不用 strict（会冻结 size 需显式尺寸），layout+paint+style 已够。 */
+  contain: layout paint style;
+}
+/* 2026-09-10 视觉校验抓到（4K 超宽屏）：消息区铺满全宽=行长 150-250 字符
+   难读。修=内容列宽约束+居中（气泡/工具卡/代码块都受约束）。
+   优先级：.myco-chat-view .chat-scroll > .msg 比 .msg 更具体——压过 .msg 的
+   max-width:100%。 */
+.myco-chat-view .chat-scroll > .msg {
+  max-width: min(960px, 100%);
+}
+/* 2026-09-11 实测反馈「气泡全部居中」根修：b3c45f8 曾行级双 auto——flex 交叉轴
+   auto margin 会把行收缩到内容宽并水平居中,碾掉「自己靠右/他人靠左」聊天惯例。
+   列宽约束保留(4K 行长治理意图不变),对齐按角色:自己推右、其余推左。 */
+.myco-chat-view .chat-scroll > .msg.msg-user:not(.other) { margin-left: auto; margin-right: 12px; }
+.myco-chat-view .chat-scroll > .msg.msg-assistant,
+.myco-chat-view .chat-scroll > .msg.msg-user.other { margin-right: auto; margin-left: 0; }
+/* 2026-09-10 视觉校验抓到：jump-nav 浮层（right:10px）压在长消息气泡上
+   遮挡文本。修=消息区右侧预留浮层占位（padding-right=浮层宽+间隙）。 */
+.myco-chat-view .chat-scroll {
+  padding-right: 48px;
+}
+.myco-chat-view .chat-sentinel {
+  text-align: center;
+  font-size: 11px;
+  color: var(--mc-muted);
+  padding: 4px 0 16px;
+  min-height: 18px;
+}
+.myco-chat-view .chat-empty {
+  text-align: center;
+  color: var(--mc-muted);
+  font-size: 13px;
+  padding: 56px 0;
+}
+
+/* ── 消息气泡（进入滑入 + 淡入） ── */
+.myco-chat-view .msg {
+  margin: 0 0 18px;
+  max-width: 100%;
+  min-width: 0;
+  /* contain：layout=气泡内布局变化不波及兄弟（滚动重排更省）；style=动画/计数器隔离。
+     **不**用 paint——会把 chip-tooltip/thinking-tooltip 等 overflow 的悬浮内容裁掉。 */
+  contain: layout style;
+  animation: mc-rise .22s cubic-bezier(.2, .7, .3, 1);
+}
+/* 历史气泡（挂载前已存在）不播进入动画——逐气泡永久 no-anim，不整体切 animation
+   （切来切去会全体重播 mc-rise：开屏闪一下、加载更早后顶部一直闪的根因） */
+.myco-chat-view .msg.no-anim { animation: none; }
+@keyframes mc-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+.myco-chat-view .msg {
+  /* content-visibility 去掉：在 column-reverse 滚动容器中高度跳变会引起窜动。
+     消息量通常 <200 条，全量渲染性能够用；如需优化可用虚拟列表替代。 */
+}
+.myco-chat-view .msg-time {
+  font-size: 10px;
+  color: var(--mc-text-3, #a3a9b8);
+  font-family: ui-monospace, monospace;
+  align-self: center;
+}
+.myco-chat-view .msg-role {
+  font-size: 11px;
+  color: var(--mc-muted);
+  margin: 0 4px 5px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/* 模型角标：渐变 chip */
+.myco-chat-view .msg-model {
+  font-size: 10px;
+  padding: 1.5px 8px;
+  border-radius: 999px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(135deg, #94a3b8, #64748b);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .12);
+}
+.myco-chat-view .msg-model.m-glm { background: linear-gradient(135deg, #a78bfa, #8b5cf6); }
+.myco-chat-view .msg-model.m-kimi { background: linear-gradient(135deg, #60a5fa, #3b82f6); }
+
+.myco-chat-view .msg-harness {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-weight: 600;
+  opacity: 0.55;
+  border: 1px solid rgba(255,255,255,.12);
+}
+
+.myco-chat-view .msg-body {
+  /* 2026-09-11 实测反馈「气泡全部居中」根修：b3c45f8 行级双 auto 居中 + body 拉满
+     行宽 = 左右错位视觉被碾平。行级居中保留（4K 列宽约束），气泡级对齐恢复：
+     body 按内容收缩 + 按角色 margin 推左/右（聊天惯例：自己靠右、他人/AI 靠左）。 */
+  width: fit-content;
+  max-width: 100%;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-border);
+  border-radius: 14px;
+  padding: 12px 15px;
+  box-shadow: 0 2px 10px rgba(22, 30, 60, .05);
+  overflow: visible;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--mc-text);
+}
+/* 代码块单独水平滚动（msg-body 不滚→tooltip 不被裁） */
+.myco-chat-view .msg-body pre { overflow-x: auto; }
+
+/* 用户气泡：主题渐变 + 白字(「我」专属视觉) */
+.myco-chat-view .msg-user .msg-body {
+  background: linear-gradient(135deg, var(--mc-accent), var(--mc-accent-2));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--mc-accent) 30%, transparent);
+}
+
+/* 群聊署名聚合:连续同发言人只首条带头像/署名/时间,后续消息紧凑跟进 */
+.myco-chat-view .msg.grouped { margin-top: 2px; }
+.myco-chat-view .msg.grouped .msg-body { border-top-left-radius: 6px; }
+
+/* 他人消息(user 且 author≠自己):多人房间——左侧对齐+中性卡+琥珀左边条;
+ * 跨项目 AI 转发/远程辅助者的发言与「我」的蓝底一眼区分。 */
+.myco-chat-view .msg-user.other { margin-left: 0; }
+.myco-chat-view .msg-user.other .msg-body {
+  background: var(--mc-surface-2, #f4f6fb);
+  border: 1px solid var(--mc-border, #e2e5ee);
+  border-left: 3px solid #d97706;
+  color: var(--mc-text, #1c2333);
+  box-shadow: none;
+}
+
+/* assistant 气泡：白卡 + 左主题色边（模型区分靠角标 chip，左色边统一跟主题） */
+.myco-chat-view .msg-assistant { margin-right: 0; }
+.myco-chat-view .msg-assistant .msg-body {
+  border-left: 3px solid var(--mc-accent);
+}
+
+/* markdown 正文 */
+.myco-chat-view .msg-body p { margin: 0 0 8px; }
+.myco-chat-view .msg-body p:last-child { margin-bottom: 0; }
+/* 消息正文可选中(右键复制=复制选中/整条;ChatView contextmenu 接管);
+ * 代码块也要可选中(跨气泡选中拷贝;选中期间 stick-to-bottom 暂停防断裂) */
+.myco-chat-view .msg-body { user-select: text; -webkit-user-select: text; }
+.myco-chat-view .msg-body pre,
+.myco-chat-view .msg-body code,
+.myco-chat-view .msg-plain { user-select: text; -webkit-user-select: text; }
+/* 选中高亮(提高可见度——column-reverse 下容易看不清哪些被选中) */
+.myco-chat-view .msg-body ::selection { background: rgba(107,123,255,.35); }
+.myco-chat-view .msg-plain::selection { background: rgba(107,123,255,.35); }
+.myco-chat-view .msg-body ul, .myco-chat-view .msg-body ol { margin: 6px 0 8px; padding-left: 20px; }
+.myco-chat-view .msg-body li { margin: 2px 0; }
+.myco-chat-view .msg-body h1, .myco-chat-view .msg-body h2, .myco-chat-view .msg-body h3 { font-size: 15px; font-weight: 600; margin: 12px 0 6px; }
+.myco-chat-view .msg-body a { color: var(--mc-accent); }
+.myco-chat-view .msg-body code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12.5px;
+  background: var(--mc-surface-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: #4f46e5;
+}
+.myco-chat-view .msg-user .msg-body code { background: rgba(255, 255, 255, .18); color: #fff; }
+
+/* 代码块：深色卡 + mac 三圆点。代码换行(2026-08-27 设计定稿:窄窗/长行不可
+   横滚——pre-wrap + anywhere 断长 token;曾 overflow-x:auto 横滚,手机/窄窗读代码要拖) */
+.myco-chat-view .msg-body pre {
+  position: relative;
+  background: linear-gradient(180deg, #161b26, #0d1117);
+  border-radius: 10px;
+  padding: 22px 13px 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 10px 0;
+  font-size: 12px;
+  line-height: 1.55;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04), 0 2px 8px rgba(0, 0, 0, .18);
+}
+.myco-chat-view .msg-body pre::before {
+  content: "";
+  position: absolute;
+  top: 7px; left: 11px;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #ff5f57;
+  box-shadow: 13px 0 0 #febc2e, 26px 0 0 #28c840;
+}
+.myco-chat-view .msg-body pre code { background: transparent; color: #c9d1d9; padding: 0; font-size: 12px; }
+.myco-chat-view .msg-body blockquote { border-left: 3px solid var(--mc-border); margin: 6px 0; padding: 2px 12px; color: var(--mc-text-2); }
+.myco-chat-view .msg-body table { border-collapse: collapse; margin: 6px 0; font-size: 13px; }
+.myco-chat-view .msg-body th, .myco-chat-view .msg-body td { border: 1px solid var(--mc-border); padding: 4px 8px; }
+
+/* ── pending（生成中）：渐变边框流光（不是虚线） ── */
+.myco-chat-view .msg-pending .msg-body {
+  border: 2px solid transparent;
+  /* 主题感知底色(2026-09-01 修:曾硬编码 #fff,深色主题下浅色文字全不可见);
+     流光渐变描边保留 */
+  background:
+    linear-gradient(var(--mc-surface, #fff), var(--mc-surface, #fff)) padding-box,
+    linear-gradient(120deg, #8b5cf6, #3b82f6, #06b6d4, #8b5cf6) border-box;
+  background-size: 100% 100%, 300% 100%;
+  animation: mc-border-flow 3.2s linear infinite;
+  color: var(--mc-text-2);
+}
+@keyframes mc-border-flow {
+  0% { background-position: 0 0, 0% 0; }
+  100% { background-position: 0 0, 300% 0; }
+}
+/* AI 执行中指示(K3 定稿 2026-08-28:圆环流光计时;替代 typing-dots+终端 statusText 透传) */
+.myco-chat-view .working-indicator {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 18px; font-size: 12px; color: var(--mc-accent, #6b7bff);
+  font-variant-numeric: tabular-nums;
+}
+.myco-chat-view .working-indicator .ring-track { fill: none; stroke: currentColor; stroke-opacity: .15; stroke-width: 1.5; }
+.myco-chat-view .working-indicator .ring-arc {
+  fill: none; stroke: currentColor; stroke-width: 1.5;
+  transform-origin: center; animation: mc-ring-rotate 1.2s linear infinite;
+}
+.myco-chat-view .working-indicator .ring-dot {
+  fill: currentColor; animation: mc-dot-breathe 1.6s ease-in-out infinite;
+}
+/* 分级克制:60s 旋转降速(变慢≠焦虑);180s 次级提示。不换告警色——等待不是错误 */
+.myco-chat-view .working-indicator[data-tone="slow"] .ring-arc { animation-duration: 2s; }
+.myco-chat-view .working-indicator .working-extra { font-size: 10.5px; color: var(--mc-text-2, #8b949e); }
+@keyframes mc-ring-rotate { to { transform: rotate(360deg); } }
+@keyframes mc-dot-breathe { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+@media (prefers-reduced-motion: reduce) {
+  .myco-chat-view .working-indicator .ring-arc { animation-duration: 4s; }
+  .myco-chat-view .working-indicator .ring-dot { animation: none; opacity: .8; }
+}
+.myco-chat-view .typing-dots { display: inline-flex; gap: 4px; }
+.myco-chat-view .typing-dots span {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: linear-gradient(135deg, #8b5cf6, #3b82f6);
+  animation: mc-blink 1.2s infinite;
+}
+.myco-chat-view .typing-dots span:nth-child(2) { animation-delay: .2s; }
+.myco-chat-view .typing-dots span:nth-child(3) { animation-delay: .4s; }
+@keyframes mc-blink { 0%, 60%, 100% { opacity: .25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+
+/* 生成中实时文本——单行折叠+点击展开（2026-09-13 设计定稿四轮重做） */
+.myco-chat-view .generating-text {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--mc-text-2);
+  border-left: 2px solid var(--mc-border, #d0d7de);
+  padding-left: 8px;
+}
+/* 折叠态：最新活动单行 */
+.myco-chat-view .gen-line.gen-last {
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 20px;
+}
+.myco-chat-view .gen-last-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.myco-chat-view .gen-expand-hint {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--mc-accent);
+  cursor: pointer;
+  padding: 0 4px;
+}
+/* 展开态 */
+.myco-chat-view .gen-collapse {
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--mc-accent);
+  margin-bottom: 3px;
+  user-select: none;
+}
+.myco-chat-view .gen-line.gen-thought { font-style: italic; }
+.myco-chat-view .gen-line.gen-result { color: var(--mc-muted); font-size: 12px; }
+.myco-chat-view .gen-line.gen-status { color: var(--mc-muted); font-size: 12px; }
+/* 光标（保留） */
+.myco-chat-view .gen-cursor {
+  display: inline-block;
+  color: var(--mc-accent);
+  animation: mc-cursor-blink 0.9s step-end infinite;
+  margin-left: 1px;
+}
+/* spinner */
+.myco-chat-view .spinner {
+  display: inline-block;
+  width: 13px; height: 13px;
+  border: 2px solid var(--mc-muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: mc-spin .8s linear infinite;
+  vertical-align: -2px;
+}
+@keyframes mc-spin { to { transform: rotate(360deg); } }
+
+/* ── 富媒体附件 ── */
+.myco-chat-view .msg-attachments { margin-top: 9px; display: flex; flex-direction: column; gap: 6px; }
+.myco-chat-view .attach-img {
+  max-width: 320px;
+  max-height: 320px;
+  border-radius: 10px;
+  border: 1px solid var(--mc-border);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .1);
+  display: block;
+}
+.myco-chat-view .attach-file { font-size: 12px; color: var(--mc-text-2); padding: 6px 9px; background: var(--mc-surface-2); border-radius: 6px; }
+.myco-chat-view .attach-zoomable { cursor: zoom-in; }
+/* 图片点击放大（lightbox 全屏遮罩） */
+/* lightbox 通过 createPortal 渲染到 document.body，不受 .myco-chat-view 限定 */
+.img-lightbox {
+  position: fixed; inset: 0; z-index: 99999;
+  background: rgba(10, 12, 20, .88);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  cursor: zoom-out;
+  animation: mc-fade .15s ease;
+}
+.img-lightbox img {
+  max-width: 94vw; max-height: 92vh;
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: 0 12px 60px rgba(0, 0, 0, .6);
+}
+@keyframes mc-fade { from { opacity: 0; } to { opacity: 1; } }
+
+/* ── 工具调用链（折叠=逐条 chips 可见；展开=内部参数全显） ── */
+/* 工具调用链：每个工具调用独占一行（纵向堆叠，清晰分隔） */
+.myco-chat-view .tool-chips { margin-top: 9px; display: flex; flex-direction: column; gap: 8px; }
+
+/* AskUserQuestion 卡片：把 raw questions JSON 渲染成可读提问卡（不当代码块 dump） */
+.myco-chat-view .ask-card {
+  margin-top: 9px; padding: 10px 12px;
+  background: var(--mc-accent-soft);
+  border: 1px solid color-mix(in srgb, var(--mc-accent) 28%, var(--mc-border));
+  border-radius: 10px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.myco-chat-view .ask-card-head {
+  font-size: 12px; font-weight: 600; color: var(--mc-accent);
+}
+.myco-chat-view .ask-q { display: flex; flex-direction: column; gap: 3px; }
+.myco-chat-view .ask-q-header {
+  align-self: flex-start; font-size: 10px; font-weight: 600; letter-spacing: .03em;
+  color: var(--mc-accent); background: color-mix(in srgb, var(--mc-accent) 14%, #fff);
+  padding: 1px 6px; border-radius: 5px;
+}
+.myco-chat-view .ask-q-text { font-size: 12.5px; line-height: 1.5; color: var(--mc-text); }
+.myco-chat-view .ask-opts { margin: 3px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.myco-chat-view .ask-opts li { display: flex; gap: 6px; font-size: 12px; line-height: 1.45; color: var(--mc-text-2); padding: 3px 6px; border-radius: 6px; }
+.myco-chat-view .ask-opts li.is-active { background: color-mix(in srgb, var(--mc-accent) 12%, transparent); color: var(--mc-text); }
+.myco-chat-view .ask-opt-mark { flex-shrink: 0; width: 10px; font-weight: 700; color: var(--mc-accent); }
+.myco-chat-view .ask-opt-content { flex: 1; }
+.myco-chat-view .ask-opt-label { font-weight: 600; color: var(--mc-text); }
+.myco-chat-view .ask-opt-desc { color: var(--mc-text-2); }
+.myco-chat-view .ask-hint { font-size: 10.5px; color: var(--mc-text-2); opacity: .8; }
+/* 交互选择器键条（浅色版，区别于 PickerView 的深色 picker-keys） */
+.myco-chat-view .ask-keys { display: flex; gap: 6px; margin-top: 8px; }
+.myco-chat-view .ask-key { flex: 0 0 auto; min-width: 34px; height: 30px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--mc-border); background: #fff; color: var(--mc-text); font-size: 13px; cursor: pointer; transition: background .12s, transform .06s; }
+.myco-chat-view .ask-key:hover { background: var(--mc-accent-soft); }
+.myco-chat-view .ask-key:active { transform: scale(.95); }
+.myco-chat-view .ask-key.ask-key-enter { background: var(--mc-accent); color: #fff; border-color: transparent; flex: 1; }
+.myco-chat-view .ask-key.ask-key-esc { color: #d33a30; }
+
+/* TodoPanel：会话当前「计划」常驻条（钉在消息区与输入框之间，不随消息滚走） */
+.myco-chat-view .todo-panel {
+  margin: 0; padding: 7px 12px;
+  background: var(--mc-surface-2);
+  border-top: 1px solid var(--mc-border);
+  border-bottom: 1px solid var(--mc-border);
+  border-left: 3px solid var(--mc-accent);
+  flex-shrink: 0;
+}
+.myco-chat-view .todo-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; cursor: pointer; user-select: none; }
+.myco-chat-view .todo-title { font-size: 11px; font-weight: 600; color: var(--mc-text); }
+.myco-chat-view .todo-caret { margin-left: 4px; color: var(--mc-text-2); font-size: 9px; }
+.myco-chat-view .todo-count { font-size: 10.5px; color: var(--mc-text-2); font-variant-numeric: tabular-nums; }
+.myco-chat-view .todo-bar { height: 4px; border-radius: 2px; background: var(--mc-border); overflow: hidden; margin-bottom: 7px; }
+.myco-chat-view .todo-panel.collapsed .todo-head { margin-bottom: 3px; }
+.myco-chat-view .todo-panel.collapsed .todo-bar { margin-bottom: 0; }
+.myco-chat-view .todo-bar-fill { height: 100%; background: var(--mc-accent); border-radius: 2px; transition: width .3s ease; }
+.myco-chat-view .todo-items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; max-height: 32vh; overflow-y: auto; }
+.myco-chat-view .todo-item { display: flex; align-items: flex-start; gap: 6px; font-size: 12px; line-height: 1.45; }
+.myco-chat-view .todo-icon { flex-shrink: 0; width: 14px; text-align: center; font-size: 12px; }
+.myco-chat-view .todo-text { flex: 1; color: var(--mc-text); }
+.myco-chat-view .todo-item.is-completed .todo-icon { color: #22c55e; }
+.myco-chat-view .todo-item.is-completed .todo-text { color: var(--mc-text-2); text-decoration: line-through; opacity: .75; }
+.myco-chat-view .todo-item.is-in_progress .todo-icon { color: var(--mc-accent); }
+.myco-chat-view .todo-item.is-in_progress .todo-text { font-weight: 600; }
+.myco-chat-view .todo-item.is-pending .todo-icon { color: #cbd5e1; }
+.myco-chat-view .tool-chip {
+  font-size: 12px;
+  background: color-mix(in srgb, var(--mc-accent) 5%, var(--mc-surface-2));
+  border: 1px solid color-mix(in srgb, var(--mc-accent) 32%, var(--mc-border));
+  border-left: 3px solid var(--mc-accent);
+  border-radius: 7px;
+  max-width: 100%;
+  /* 视觉强化（2026-09-10 K3 两轮点名「工具调用不可见」——灰底细边在消息流里
+     权重不足；accent 左条+着色底+着色边让用户一眼看到 AI 在调什么工具） */
+}
+.myco-chat-view .tool-chip.open { /* 纵向布局下天然独占一行，无需 flex */ }
+.myco-chat-view .tool-chip-head {
+  display: flex; align-items: baseline; gap: 8px;
+  width: 100%;
+  padding: 5px 10px;
+  background: none; border: none; cursor: pointer;
+  font-size: 12px; text-align: left;
+}
+/* 2026-10-06 hover 对比度修：tool-name 是渐变色文字，变亮在浅底上更看不清——改下划线强调 */
+.myco-chat-view .tool-chip-head:hover .tool-name { text-decoration: underline; text-underline-offset: 2px; }
+.myco-chat-view .tool-code {
+  position: relative;
+  margin: 0 10px 10px;
+  background: linear-gradient(180deg, #161b26, #0d1117);
+  border-radius: 8px;
+  padding: 20px 11px 9px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11.5px;
+  line-height: 1.5;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 1px 4px rgba(0,0,0,.15);
+}
+.myco-chat-view .tool-code::before {
+  content: "";
+  position: absolute; top: 6px; left: 10px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #ff5f57; box-shadow: 11px 0 0 #febc2e, 22px 0 0 #28c840;
+}
+.myco-chat-view .tool-code code { color: #c9d1d9; font-family: ui-monospace, monospace; background: transparent; }
+.myco-chat-view .tool-full { margin: 0 10px 10px; font-size: 12px; color: var(--mc-text-2); white-space: pre-wrap; word-break: break-word; background: var(--mc-surface-2); border-radius: 7px; padding: 8px 10px; }
+.myco-chat-view .tool-name {
+  font-weight: 700;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: color-mix(in srgb, var(--mc-accent) 65%, var(--mc-text));
+}
+.myco-chat-view .tool-dot,
+.myco-chat-view .tool-ic {
+  display: inline-block;
+  width: 15px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1;
+  vertical-align: -1px;
+  flex: none;
+}
+.myco-chat-view .tool-dot { font-size: 9px; } /* ⬤ 实心圆，缩到和 emoji 图标等宽等高对齐 */
+.myco-chat-view .tool-caret { opacity: .5; font-weight: 400; font-size: 10px; }
+.myco-chat-view .tool-summary { font-family: ui-monospace, monospace; font-size: 11px; color: var(--mc-text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 折叠态 hover tooltip：浮出看完整参数/思维链（不点开也能瞄） */
+.myco-chat-view .tool-chip, .myco-chat-view .thinking-block { position: relative; }
+.myco-chat-view .chip-tooltip {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 60;
+  width: max-content;
+  max-width: min(460px, 80vw);
+  max-height: 200px;
+  animation: mc-fade .12s ease;
+  overflow: auto;
+  background: linear-gradient(180deg, #1c2230, #12161f);
+  border: 1px solid rgba(255, 255, 255, .08);
+  border-radius: 9px;
+  box-shadow: 0 10px 34px rgba(10, 14, 30, .38);
+  padding: 10px 12px;
+  pointer-events: none;
+}
+/* 末尾几条消息 tooltip 往上弹（避免跑出页面底部看不到） */
+.myco-chat-view .msg:nth-last-child(-n+4) .chip-tooltip {
+  top: auto; bottom: 100%;
+}
+.myco-chat-view .chip-tooltip pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #c9d1d9;
+}
+
+/* 展开 checkbox popover（chat-head 展开按钮点进去） */
+.myco-chat-view .expand-menu-wrap { position: relative; }
+.myco-chat-view .expand-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 70;
+  background: rgba(255, 255, 255, .96);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--mc-border);
+  border-radius: 11px;
+  box-shadow: 0 10px 34px rgba(22, 30, 60, .16);
+  padding: 9px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 132px;
+  animation: mc-fade .12s ease;
+}
+.myco-chat-view .expand-menu .expand-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--mc-text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.myco-chat-view .expand-menu input[type="checkbox"] { accent-color: var(--mc-accent); margin: 0; }
+.myco-chat-view .expand-menu-overlay { position: fixed; inset: 0; z-index: 65; }
+
+/* pending 的 spinner 状态行（✽ Determining… (8s · thinking · ↑1.2k tokens)） */
+.myco-chat-view .spinner-status {
+  font-size: 12.5px;
+  font-weight: 600;
+  background: linear-gradient(90deg, var(--mc-accent), var(--mc-accent-2), var(--mc-accent));
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: mc-shimmer 2.2s linear infinite;
+  margin-bottom: 4px;
+}
+@keyframes mc-shimmer { from { background-position: 0% 0; } to { background-position: -200% 0; } }
+
+/* ── 思维链折叠块 ── */
+.myco-chat-view .thinking-block { margin-top: 9px; }
+.myco-chat-view .thinking-toggle { font-size: 11.5px; color: var(--mc-muted); background: none; border: none; cursor: pointer; padding: 2px 0; }
+.myco-chat-view .thinking-toggle:hover { color: var(--mc-accent); }
+/* 折叠态首行预览:更淡一号、超长截断不撑破气泡 */
+.myco-chat-view .thinking-preview { color: var(--mc-muted); opacity: .75; font-size: 11px; margin-left: 2px; }
+.myco-chat-view .thinking-body {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.62;
+  color: var(--mc-text-2);
+  background: var(--mc-surface-2);
+  border-left: 3px solid #c7b8f5;
+  padding: 9px 12px;
+  border-radius: 0 8px 8px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* 长思维链限高滚动(2026-09-01 用户:展开美化——几千字不再把整屏顶穿) */
+  max-height: min(420px, 52vh);
+  overflow-y: auto;
+}
+
+/* ── 输入栏 ── */
+.myco-chat-view .chat-input {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 11px 15px;
+  /* 纯色背景（同 chat-head，去 backdrop-filter 省 GPU 重绘） */
+  background: var(--mc-surface, #fff);
+  border-top: 1px solid var(--mc-border);
+  flex-shrink: 0;
+}
+
+/* 滚动到底小按钮（右下，上滑时出现） */
+.myco-chat-view .jump-bottom {
+  position: absolute;
+  right: 22px;
+  bottom: 86px;
+  z-index: 10;
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid var(--mc-border);
+  background: linear-gradient(135deg, var(--mc-accent), var(--mc-accent-2));
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--mc-accent) 35%, transparent);
+  transition: transform .12s, box-shadow .12s;
+}
+.myco-chat-view .jump-bottom:hover { transform: translateY(-2px); box-shadow: 0 6px 16px color-mix(in srgb, var(--mc-accent) 45%, transparent); }
+/* 「最新」按钮角标：看历史期间累计的新消息数。 */
+.myco-chat-view .jump-bottom-badge {
+  display: inline-block;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #ff3b30;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  box-shadow: 0 0 0 2px var(--mc-surface, #fff);
+  animation: mc-badge-pop .22s cubic-bezier(.2, .8, .3, 1.4);
+}
+@keyframes mc-badge-pop {
+  from { transform: scale(.4); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+.myco-chat-view .chat-input textarea {
+  flex: 1;
+  resize: none;
+  border: 1px solid var(--mc-border);
+  border-radius: 11px;
+  padding: 9px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--mc-text);
+  background: var(--mc-surface-2);
+  outline: none;
+  max-height: 120px;
+  transition: border-color .15s, box-shadow .15s;
+}
+.myco-chat-view .chat-input textarea:focus {
+  border-color: var(--mc-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--mc-accent) 14%, transparent);
+}
+.myco-chat-view .chat-send {
+  width: 38px; height: 38px;
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--mc-accent), var(--mc-accent-2));
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--mc-accent) 38%, transparent);
+  transition: transform .12s, box-shadow .12s;
+}
+.myco-chat-view .chat-send:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 5px 14px color-mix(in srgb, var(--mc-accent) 45%, transparent); }
+.myco-chat-view .chat-send:disabled { opacity: .45; cursor: default; box-shadow: none; }
+
+/* 图片上传按钮 + 待发缩略图 */
+.myco-chat-view .chat-icon-btn {
+  width: 38px; height: 38px;
+  border-radius: 11px;
+  background: var(--mc-surface-2);
+  color: var(--mc-text-2);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; border: 1px solid var(--mc-border); cursor: pointer;
+  transition: color .12s, border-color .12s;
+}
+.myco-chat-view .chat-icon-btn:hover { color: var(--mc-accent); border-color: var(--mc-accent); }
+.myco-chat-view .pending-img {
+  position: relative;
+  padding: 9px 15px 0;
+  display: flex;
+  justify-content: flex-start;
+  background: rgba(255, 255, 255, .8);
+}
+.myco-chat-view .pending-img img {
+  max-width: 120px; max-height: 120px;
+  border-radius: 10px; border: 1px solid var(--mc-border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .1);
+}
+.myco-chat-view .pending-img-x {
+  position: absolute;
+  top: 3px; left: 124px;
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, .62);
+  color: #fff;
+  border: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* 连接路径指示器（chat-head）：直连=绿，中转=琥珀，连接中=灰。 */
+.myco-chat-view .conn-badge {
+  font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 999px;
+  flex-shrink: 0; line-height: 1.5;
+}
+.myco-chat-view .conn-direct { color: #1f9d55; background: rgba(31,157,85,.12); }
+.myco-chat-view .conn-relay { color: #a0822e; background: rgba(180,150,60,.10); }
+.myco-chat-view .conn-connecting { color: var(--mc-muted); background: var(--mc-surface-2); }
+
+/* ── H4 细态三件套（state 事件驱动） ── */
+/* ③ 细态文案徽章（chat-head）：生成中/执行工具/等待批准/选择菜单/已中断/出错/空闲… */
+.myco-chat-view .fs-badge {
+  font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 999px;
+  flex-shrink: 0; line-height: 1.5; white-space: nowrap;
+}
+.myco-chat-view .fs-badge-working  { color: #1f9d55; background: rgba(31,157,85,.12); }
+.myco-chat-view .fs-badge-waiting  { color: #c08020; background: rgba(192,128,32,.14); }
+.myco-chat-view .fs-badge-idle     { color: #3d7dd8; background: rgba(61,125,216,.12); }
+.myco-chat-view .fs-badge-approval { color: #b3541e; background: rgba(217,119,6,.16); }
+.myco-chat-view .fs-badge-error    { color: #d43a30; background: rgba(212,58,48,.12); }
+.myco-chat-view .fs-pulse { animation: fs-badge-pulse 1.6s ease-in-out infinite; }
+@keyframes fs-badge-pulse { 0%,100% { opacity: 1 } 50% { opacity: .45 } }
+
+/* ② error_blocked 显形：输入区上方红色提示条（不强制禁发，视觉明确） */
+.myco-chat-view .error-blocked-bar {
+  padding: 8px 15px; font-size: 12px; font-weight: 600;
+  color: #fff; background: #d43a30;
+  border-bottom: 1px solid rgba(0,0,0,.08);
+}
+
+/* ① 审批待办化：awaiting_approval 时消息流尾部的「需要批准」卡片 */
+.myco-chat-view .approval-card {
+  margin: 0 0 18px; padding: 12px 14px;
+  border: 1px solid rgba(217,119,6,.45); border-radius: 12px;
+  background: rgba(217,119,6,.08);
+  box-shadow: 0 2px 10px rgba(180,100,10,.10);
+}
+.myco-chat-view .approval-card-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 700; color: #b3541e;
+}
+.myco-chat-view .approval-card-summary {
+  margin-top: 6px; font-size: 12px; color: var(--mc-text);
+  font-family: ui-monospace, monospace; word-break: break-word; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.myco-chat-view .approval-card-actions { display: flex; gap: 10px; margin-top: 10px; }
+.myco-chat-view .approval-btn {
+  flex: 1; padding: 8px 0; border-radius: 9px; border: none; cursor: pointer;
+  font-size: 13px; font-weight: 600;
+}
+.myco-chat-view .approval-btn:disabled { opacity: .5; cursor: default; }
+.myco-chat-view .approval-btn.approve { color: #fff; background: #1f9d55; }
+.myco-chat-view .approval-btn.approve:not(:disabled):hover { background: #178a48; }
+.myco-chat-view .approval-btn.reject { color: #d43a30; background: rgba(212,58,48,.10); }
+.myco-chat-view .approval-btn.reject:not(:disabled):hover { background: rgba(212,58,48,.18); }
+
+/* 自定义颜色选择器（长按主题点弹出） */
+.myco-chat-view .color-picker-popover {
+  position: absolute; top: calc(100% + 4px); left: 50%; transform: translateX(-50%);
+  z-index: 70; display: flex; align-items: center; gap: 6px;
+  background: rgba(255,255,255,.96); border: 1px solid var(--mc-border);
+  border-radius: 10px; padding: 6px 10px; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+}
+.myco-chat-view .color-picker-popover input[type=color] {
+  width: 30px; height: 30px; border: none; border-radius: 6px; cursor: pointer; padding: 0;
+}
+
+/* 视图切换：💬 聊天 / 🖥 终端 */
+.myco-chat-view .view-toggle { display: flex; gap: 2px; margin-left: 2px; }
+.myco-chat-view .vt-btn { width: 26px; height: 26px; border: none; background: transparent; border-radius: 6px; font-size: 13px; cursor: pointer; opacity: .55; transition: opacity .12s, background .12s; }
+.myco-chat-view .vt-btn:hover { background: var(--mc-accent-soft); opacity: .9; }
+.myco-chat-view .vt-btn.is-active { opacity: 1; background: var(--mc-accent-soft); }
+
+/* TerminalView — raw mac 终端风格（reflow 重排 + truecolor + 彩色单元格 + 键透传 + 撞边滚屏） */
+.myco-chat-view .term-view { flex: 1; min-height: 0; min-width: 0; width: 100%; max-width: 100%; display: flex; flex-direction: column; background: #1a1b26; overflow: hidden; position: relative; }
+.myco-chat-view .term-back-live { position: absolute; top: 8px; right: 12px; z-index: 5; padding: 4px 10px; font-size: 12px; border-radius: 7px; border: 1px solid var(--mc-accent); background: rgba(26,27,38,.7); color: var(--mc-accent); cursor: pointer; }
+.myco-chat-view .term-screen { flex: 1; min-height: 0; width: 100%; min-width: 0; overflow-x: hidden; overflow-y: auto; background: #1a1b26; padding: 10px 12px; box-sizing: border-box; }
+/* 字体栈由 TerminalView 内联（与字宽测量同源）；white-space: pre——换行由 reflow 控制 */
+.myco-chat-view .term-grid { margin: 0; font-size: 14px; line-height: 1.35; white-space: pre; display: block; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility; font-variant-ligatures: none; }
+.myco-chat-view .term-row { display: block; min-height: 1.35em; white-space: pre; }
+.myco-chat-view .term-row span { white-space: pre; }
+.myco-chat-view .term-cursor { animation: term-blink 1.1s steps(2, start) infinite; }
+@keyframes term-blink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0.3; } }
+.myco-chat-view .term-keys { position: absolute; bottom: 52px; left: 0; right: 0; z-index: 6; display: flex; align-items: center; gap: 5px; padding: 6px 8px; border-top: 1px solid #1c2230; background: rgba(13,17,23,.92); overflow-x: auto; }
+.myco-chat-view .term-keys-toggle { position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%); z-index: 6; width: 38px; height: 38px; border-radius: 50%; border: 1px solid rgba(255,255,255,.25); background: rgba(20,20,24,.35); color: rgba(255,255,255,.85); font-size: 13px; display: flex; align-items: center; justify-content: center; }
+.myco-chat-view .term-keys-toggle.is-on { background: rgba(99,102,241,.55); border-color: rgba(255,255,255,.45); }
+.myco-chat-view .term-key { flex: 0 0 auto; min-width: 32px; height: 30px; padding: 0 9px; border-radius: 7px; border: 1px solid #2a3040; background: #161b22; color: #c9d1d9; font-size: 12.5px; cursor: pointer; transition: background .12s, transform .06s; }
+.myco-chat-view .term-key:hover { background: #1f2630; }
+.myco-chat-view .term-key:active { transform: scale(.95); }
+.myco-chat-view .term-key.term-key-font { min-width: 30px; font-weight: 700; }
+.myco-chat-view .term-key.term-key-enter { background: var(--mc-accent); color: #fff; border-color: transparent; }
+.myco-chat-view .term-key.term-key-esc { color: #ff6b6b; }
+.myco-chat-view .term-key-sep { flex: 0 0 auto; width: 1px; height: 18px; background: #2a3040; margin: 0 2px; }
+
+/* 历史导航四键（右下竖排）：顶部/上个/下个/底部。圆钮，半透明，hover 实色。 */
+.myco-chat-view .chat-canvas-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  /* 白窗外圈细框：与输入框同系浅色（surface-2），不再是偏深的渐变灰 */
+  padding: 0 8px 8px 8px;
+  background: var(--mc-surface-2, #f4f6fb);
+}
+.myco-chat-view .jump-nav {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* 默认低透明：不侵占聊天区视觉；hover/focus/触屏按下时实色。
+     注：去掉 transition——opacity 变化的合成层重绘在 WebView 上会触发 svg 纹理串台，
+     即时切换无中间帧，降低串台概率。 */
+  opacity: .32;
+}
+.myco-chat-view .jump-nav:hover,
+.myco-chat-view .jump-nav:focus-within,
+.myco-chat-view .jump-nav:active { opacity: 1; }
+.myco-chat-view .jump-nav-btn {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--mc-border);
+  background: color-mix(in srgb, var(--mc-surface, #fff) 88%, transparent);
+  color: var(--mc-text-2, #6b7280);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(20,28,60,.10);
+  transition: transform .12s, color .12s, background .12s;
+  /* backdrop-filter 让每键成独立合成层，叠加容器 opacity 变化时 WebView 会把 svg 纹理串台
+     (图标全变 ArrowDownToLine)。去掉 backdrop-filter 改纯色半透明背景，消除合成层依赖。 */
+  isolation: isolate;
+}
+.myco-chat-view .jump-nav-btn svg { transform: translateZ(0); }
+.myco-chat-view .jump-nav-btn:hover {
+  transform: translateY(-1px);
+  color: var(--mc-accent);
+  background: var(--mc-surface, #fff);
+}
+/* 底部键上的未读角标（复用 jump-bottom-badge 样式）。 */
+
+/* portal 到 App header 中部的 chat-head（canvas 执行页）：
+   根用 display:contents（只作选择器祖先/CSS 变量载体，不产生布局盒）；
+   chat-head 本体去背景/边框/大 padding，紧凑居中，标题截断防挤压。 */
+.chat-portal-root { display: contents !important; }
+.chat-head-portal {
+  border-left: 1px solid var(--mc-border);
+  margin-left: 4px;
+  padding: 0 6px 0 14px !important;
+  background: transparent !important;
+  border-bottom: none !important;
+  gap: 8px;
+  max-width: 100%;
+  overflow: visible;
+  flex-wrap: nowrap;
+  width: 100%;
+  display: flex;
+  align-items: center;
+}
+.chat-head-portal .chat-head-side {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-head-portal .chat-head-side.is-right { justify-content: flex-end; }
+.chat-head-portal .chat-head-mid { flex-shrink: 0; display: flex; align-items: center; gap: 8px; }
+/* portal 里主题点改流内（左右两区 flex:1 平衡 → 点自然近正中），不再 absolute 压按钮 */
+.chat-head-portal .theme-dots { position: static !important; transform: none !important; }
+.chat-head-portal .chat-head-title {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  padding: 0 2px;
+}
+/* 主题点组与控制组之间加分隔线（分区感，与 header 右侧的分隔同语言） */
+.chat-head-portal .view-toggle {
+  border-left: 1px solid var(--mc-border);
+  padding-left: 8px;
+  margin-left: 2px;
+}
+.chat-head-portal .expand-menu-wrap {
+  border-left: 1px solid var(--mc-border);
+  padding-left: 8px;
+}
+.chat-head-portal .work-time { display: none; }  /* 窄 header 里不再占宽 */
+
+.myco-chat-view .jump-nav .expand-menu-wrap { position: relative; }
+.myco-chat-view .jump-nav .expand-toggle {
+  width: 30px; height: 30px; padding: 0; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  /* 与四个箭头钮区分：accent 浅底 + accent 图标，读作"功能钮"而非导航箭头 */
+  background: color-mix(in srgb, var(--mc-accent) 14%, var(--mc-surface, #fff));
+  color: var(--mc-accent);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 2px 8px rgba(20,28,60,.10);
+  font-size: 0;  /* 只留图标 */
+}
+.myco-chat-view .jump-nav .expand-menu {
+  top: auto; bottom: calc(100% + 6px); right: 0;  /* 在右缘向上开 */
+}
+
+/* 细滚动条 8px：配合右 padding 12px → 左右边距精确 20px 对称（滚动条宽度不再破坏对称） */
+.myco-chat-view .chat-scroll::-webkit-scrollbar { width: 8px; }
+.myco-chat-view .chat-scroll::-webkit-scrollbar-track { background: transparent; }
+.myco-chat-view .chat-scroll::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--mc-muted) 45%, transparent);
+  border-radius: 4px;
+}
+.myco-chat-view .chat-scroll::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--mc-muted) 70%, transparent); }
+
+/* DesktopView — 远程桌面:PC 屏幕 video contain,黑底防漏白;全屏/手势/虚拟键/缩放。
+   作用域用自身类名(不走 .myco-chat-view)——独立页(主设备卡进入)不在 chat 容器里。 */
+.desktop-view { position: relative; height: 100%; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.desktop-view.is-fullscreen, .desktop-view.is-standalone { position: fixed; inset: 0; z-index: 900; height: auto; }
+.desktop-touch { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; touch-action: none; user-select: none; -webkit-user-select: none; }
+/* 指针模式本地虚拟光标:60fps 即时反馈,不等 8fps 视频回环 */
+.desktop-cursor { position: absolute; left: 0; top: 0; z-index: 3; pointer-events: none; filter: drop-shadow(0 0 2px rgba(0,0,0,.8)); }
+.desktop-video { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+.desktop-hint { position: absolute; bottom: 44px; left: 0; right: 0; text-align: center; font-size: 11px; color: rgba(255,255,255,.55); pointer-events: none; }
+/* 右侧中部浮动按钮组(半透明圆钮,两字文案) */
+.desktop-fab { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; gap: 10px; z-index: 5; }
+/* 不要加 backdrop-filter:同形圆钮会被这个 WebView 的合成层 bug 串台(所有钮显示同一文本) */
+.desktop-fab-btn {
+  position: relative;
+  width: 42px; height: 42px; border-radius: 50%; border: 1px solid rgba(255,255,255,.2);
+  background: rgba(20,20,24,.35); color: rgba(255,255,255,.9); font-size: 12px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+}
+.desktop-fab-btn.is-on { background: rgba(99,102,241,.55); border-color: rgba(255,255,255,.45); }
+/* 独立页(设备卡进入)时的返回钮 */
+.desktop-back {
+  position: absolute; left: 10px; top: 10px; z-index: 6; width: 36px; height: 36px; border-radius: 50%;
+  border: 1px solid rgba(255,255,255,.2); background: rgba(20,20,24,.35); color: #fff; font-size: 20px; line-height: 1;
+}
+/* 底部虚拟键栏(横向滚动) */
+.desktop-keybar {
+  position: absolute; bottom: 0; left: 0; right: 0; z-index: 5;
+  display: flex; gap: 6px; padding: 6px 8px; overflow-x: auto; scrollbar-width: none;
+  background: rgba(12,12,14,.55);
+}
+.desktop-keybar::-webkit-scrollbar { display: none; }
+.desktop-key {
+  flex: 0 0 auto; min-width: 38px; height: 30px; padding: 0 8px; border-radius: 6px;
+  border: 1px solid rgba(255,255,255,.22); background: rgba(255,255,255,.08);
+  color: #eee; font-size: 12px; font-family: inherit;
+}
+.desktop-key.is-armed { background: #6366f1; border-color: #818cf8; color: #fff; }
+/* 软键盘承接框:几乎不可见但可聚焦(1px 透明,别 display:none——聚焦无效) */
+.desktop-kb-sink { position: absolute; left: -2px; bottom: 0; width: 1px; height: 1px; opacity: 0.01; border: 0; padding: 0; resize: none; }
+
+/* ── NodeRoamer 节点漫游器(2026-08-25 期1)── */
+.nr { flex-shrink: 0; border-bottom: 1px solid var(--mc-bd, #2d333b); padding: 6px 10px; display: flex; flex-direction: column; gap: 6px; }
+.nr-sec { display: flex; flex-direction: column; gap: 4px; }
+.nr-title { font-size: 11px; font-weight: 600; color: var(--mc-tx, #e6edf3); display: flex; align-items: center; gap: 6px; }
+.nr-sec + .nr-sec { border-top: 1px dashed var(--mc-bd, #2d333b); padding-top: 6px; }
+.nr-scan { margin-left: auto; font-size: 9px; opacity: .7; }
+.nr-nodes { display: flex; gap: 6px; overflow-x: auto; flex-shrink: 0; }
+.nr-node { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--mc-bd, #2d333b); border-radius: 6px; background: transparent; color: var(--mc-tx, #e6edf3); font-size: 11px; flex-shrink: 0; }
+.nr-node.on { border-color: var(--mc-ac, #6b7bff); }
+.nr-node-dot { width: 6px; height: 6px; border-radius: 50%; background: #3fb950; flex-shrink: 0; }
+.nr-node-tag { font-size: 9px; color: var(--mc-ac, #6b7bff); }
+.nr-node.add { color: var(--mc-mu, #8b949e); }
+.nr-empty { font-size: 10px; color: var(--mc-mu, #8b949e); padding: 2px 0; }
+.nr-approval { border: 1px solid #d29922; border-radius: 8px; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
+.nr-ap-head { display: flex; align-items: center; gap: 6px; }
+.nr-ap-badge { font-size: 9px; padding: 0 5px; border-radius: 6px; background: rgba(107,123,255,.16); color: #6b7bff; text-transform: uppercase; }
+.nr-ap-task { font-size: 11px; font-weight: 600; color: var(--mc-tx, #e6edf3); }
+.nr-ap-text { font-size: 10px; color: var(--mc-mu, #8b949e); line-height: 1.4; }
+.nr-ap-btns { display: flex; gap: 6px; }
+.nr-btn { flex: 1; padding: 4px 0; border-radius: 6px; border: none; font-size: 12px; }
+.nr-btn.ok { background: #238636; color: #fff; }
+.nr-btn.no { background: #da3633; color: #fff; }
+.nr-btn:disabled { opacity: .5; }
+.nr-open { background: none; border: none; color: var(--mc-ac, #6b7bff); font-size: 10px; padding: 2px 0 0; text-align: left; }
+[data-theme="light"] .nr-node { color: #1f2430; }
+[data-theme="light"] .nr-ap-task { color: #1f2430; }
+
+@keyframes ws-pulse { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
+
+/* ���߿���������(2026-09-01 �û�:Edit/Write ����Ҫ�л���+����) */
+.myco-chat-view .tool-code-wrap { margin-top: 4px; }
+.myco-chat-view .tool-code-label {
+  font-size: 10px; color: var(--mc-muted); padding: 2px 8px 0;
+  font-family: Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.myco-chat-view .tool-code-old { border-left: 2px solid #ef4444; background: rgba(239,68,68,.06); }
+.myco-chat-view .tool-code-old .tool-code-label { color: #ef4444; }
+.myco-chat-view .tool-code-new { border-left: 2px solid #22c55e; background: rgba(34,197,94,.06); }
+.myco-chat-view .tool-code-new .tool-code-label { color: #22c55e; }
+.myco-chat-view .tool-code-wrap .tool-code { margin: 2px 0 4px; border-radius: 0 6px 6px 0; }
+/* 状态胶囊条:token 用量徽标(WorkingIndicator 内,等宽数字,次级色不抢主体) */
+.myco-chat-view .working-tokens { font-size: 10.5px; color: var(--mc-text-2); font-variant-numeric: tabular-nums; flex-shrink: 0; }/* 过去时计划(2026-09-05):模型多轮未更新/久远——整行灰显降权,仍可点开看历史 */
+.myco-chat-view .todo-panel.stale { opacity: .55; border-left-color: var(--mc-border); }
+.myco-chat-view .todo-panel.stale:hover { opacity: .85; }
+/* ═══ 后台 agent 可视化(2026-09-05):Task/Agent 工具卡 → AgentCard ═══ */
+.agent-card { margin-top: 8px; border: 1px solid var(--mc-border); border-radius: 8px; overflow: hidden; background: color-mix(in srgb, var(--mc-bg-2, var(--mc-bg)) 92%, var(--mc-accent, #7aa2f7) 8%); }
+.agent-card.agent-running { border-color: color-mix(in srgb, var(--mc-accent, #7aa2f7) 45%, var(--mc-border)); }
+.agent-card-head { all: unset; display: flex; align-items: center; gap: 6px; width: 100%; box-sizing: border-box; padding: 7px 10px; cursor: pointer; font-size: 12.5px; }
+.agent-card-head:hover { background: color-mix(in srgb, var(--mc-accent, #7aa2f7) 8%, transparent); }
+.agent-kind { font-weight: 600; color: var(--mc-accent, #7aa2f7); flex-shrink: 0; }
+.agent-desc { color: var(--mc-text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.agent-badge { flex-shrink: 0; font-size: 10.5px; padding: 1px 7px; border-radius: 999px; background: var(--mc-bg-3, rgba(128,128,128,.15)); color: var(--mc-text-2); }
+.agent-badge.run { color: var(--mc-accent, #7aa2f7); animation: agent-pulse 1.6s ease-in-out infinite; }
+.agent-badge.done { color: #3fb950; }
+.agent-caret { margin-left: auto; flex-shrink: 0; color: var(--mc-text-2); font-size: 10px; }
+@keyframes agent-pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
+.agent-card-body { border-top: 1px solid var(--mc-border); padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; }
+.agent-section-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--mc-text-2); margin-bottom: 3px; }
+.agent-prompt { font-size: 12px; color: var(--mc-text-2); white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow-y: auto; }
+.agent-result { font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 340px; overflow-y: auto; border-left: 2px solid color-mix(in srgb, var(--mc-accent, #7aa2f7) 35%, var(--mc-border)); padding-left: 8px; }
+.agent-card .muted { color: var(--mc-text-2); font-size: 11.5px; }
+/* WorkingIndicator 后台 agent 计数 chip */
+.myco-chat-view .working-agents { color: var(--mc-accent, #7aa2f7); cursor: help; white-space: pre-line; }
+/* 生成中四类行的状态行(· 前缀) */
+.myco-chat-view .gen-line.gen-status { color: var(--mc-text-2); }
+
+/* ── LaTeX 数学公式（2026-09-13 设计定稿：执行器能力）── */
+.myco-chat-view .msg-body .katex { font-size: 1.05em; }
+.myco-chat-view .msg-body .katex-display {
+  margin: 8px 0; padding: 6px 8px;
+  background: var(--mc-bg, rgba(0,0,0,.03));
+  border-radius: 6px; overflow-x: auto;
+}
+.myco-chat-view .msg-body .katex-display .katex { font-size: 1.15em; }
+/* 暗色主题公式颜色 */
+[data-theme="dark"] .myco-chat-view .msg-body .katex { color: var(--mc-text, #e6edf3); }
+
+/* ═══ 批四：好友聊天屏作用域（.friend-chat-scroll）═══ */
+/* 文本泡 max-width 100% 偏宽 → 收 80%（微信语义；只作用好友聊天屏，
+   ChatView 项目终端宽屏列宽约束不动） */
+.myco-chat-view .friend-chat-scroll .msg-body { max-width: 80%; }
+/* 批五（2026-09-29 用户实测「自己发的气泡不靠右」根修）：FriendsPanel 消息行
+   外层有 wrapper（长按手势/发送态徽标），339-347 行的 .chat-scroll > .msg 子代
+   选择器接不上——自己气泡只剩 index.css 的 .msg-user{margin-left:40px}，视觉
+   跟对方一样靠左（微信语义反了）。这里用后代选择器 + fit-content 让气泡块自身
+   收缩后按角色 auto margin 推边；只作用好友聊天屏，ChatView（.msg 是
+   .chat-scroll 直接子代）走原规则零影响。 */
+.myco-chat-view .friend-chat-scroll .msg { width: fit-content; }
+.myco-chat-view .friend-chat-scroll .msg.msg-user:not(.other) { margin-left: auto; margin-right: 0; }
+.myco-chat-view .friend-chat-scroll .msg.msg-user.other { margin-left: 0; margin-right: auto; }
+/* 同一根因的次级错位：.msg 收缩成 fit-content 后宽度由署名行/气泡体中较宽者决定，
+   块盒内 body 恒贴左——自己气泡与右侧头像之间会露出空隙。flex 列 + 按角色
+   align-items，让署名行与气泡体同侧对齐（自己右齐、对方左齐）。 */
+.myco-chat-view .friend-chat-scroll .msg.msg-user:not(.other) { display: flex; flex-direction: column; align-items: flex-end; }
+.myco-chat-view .friend-chat-scroll .msg.msg-user.other { display: flex; flex-direction: column; align-items: flex-start; }
+/* 批五：气泡署名昵称可读性——10px 太小（用户实测「字小」）；给足可读宽度
+   （16em ≈ 14+ 汉字，远超 12 字符底线），超长才尾部省略（此前无约束时长名
+   会顶破署名行）。 */
+.myco-chat-view .friend-chat-scroll .msg-role .msg-model {
+  font-size: 11.5px;
+  max-width: 16em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: middle;
+}
+/* 批四：破图降级卡（媒体已被清理——不放 <img src=''> 破图） */
+.myco-chat-view .attach-broken {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 10px 12px; border-radius: 10px;
+  background: var(--mc-surface-2, #f4f6fb);
+  border: 1px dashed var(--mc-border, #d5d9e2);
+  color: var(--mc-muted, #8a93a8); font-size: 12px;
+  min-width: 140px;
+}
+.myco-chat-view .attach-broken-sub { font-size: 10.5; opacity: .8; }

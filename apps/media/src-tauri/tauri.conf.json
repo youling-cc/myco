@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "myco media",
+  "identifier": "com.myco.media",
+  "build": {
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "myco 远程",
+        "width": 960,
+        "height": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "devtools": true,
+        "decorations": false,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

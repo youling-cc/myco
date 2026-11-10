@@ -1,0 +1,907 @@
+{
+  "version": 2,
+  "note": "双端对拍共享向量。share/grant 字段与 myco dsh-shares.json 同构（serde 直接反序列化）。Rust 侧: effective_caps(share,grant) -> caps_violation_as(eff, 'api/'+method, admin=false)；JS 侧 judge-engine 同输入。expect.allow=true ⟺ violation=None。P0 三条=插件发现的分叉点。",
+  "vectors": [
+    {
+      "id": "P0-1-job-fallback",
+      "desc": "job/ 拒时报告链回落：grant 未勾 job 类高风险 id 时，拒绝 rule 报 high-risk（非具体 id）",
+      "share": {
+        "id": "sh-vec1",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "session/list",
+                "session/page"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "job.run",
+              "label": "作业",
+              "methods": [
+                "job/*"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {
+          "session.read": true
+        },
+        "visibility": null
+      },
+      "method": "job/execute",
+      "expect": {
+        "allow": false,
+        "rule": "high-risk"
+      }
+    },
+    {
+      "id": "P0-2-prefix-wildcard",
+      "desc": "prefix/* 通配：settings/* 命中子路径(settings/theme)、自身(settings/*)、裸前缀(settings)——L13983 前缀容错",
+      "share": {
+        "id": "sh-vec2",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "a": [
+            {
+              "id": "settings.write",
+              "label": "配置",
+              "methods": [
+                "settings/*"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {
+          "settings.write": true
+        },
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "settings/theme",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "settings/*",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "settings",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P0-3-empty-decl-list",
+      "desc": "任务声明为空对象时 session/list 名单外放行",
+      "share": {
+        "id": "sh-vec3",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {},
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": null,
+        "visibility": null
+      },
+      "method": "session/list",
+      "expect": {
+        "allow": true
+      }
+    },
+    {
+      "id": "P1-all-four-implies-model",
+      "desc": "四开关全开（全权）自动带 model.select：model/ 写面放行",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "session/list",
+                "session/page"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "session.input",
+              "label": "写",
+              "methods": [
+                "session/prompt"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {
+          "session.read": true,
+          "session.input": true,
+          "agent.view": true,
+          "scope.switch": true
+        },
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "model/selectProvider",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "session/selectModel",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P2-explicit-model-false-wins",
+      "desc": "显式 model.select:false 优先于全权推断：model/ 拒",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "session/list",
+                "session/page"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "session.input",
+              "label": "写",
+              "methods": [
+                "session/prompt"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {
+          "session.read": true,
+          "session.input": true,
+          "agent.view": true,
+          "scope.switch": true,
+          "model.select": false
+        },
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "model/selectProvider",
+          "expect": {
+            "allow": false,
+            "rule": "model/"
+          }
+        }
+      ]
+    },
+    {
+      "id": "P3-a09-input-off-denies-prompt",
+      "desc": "A09：owner 关 session.input → 声明移除 → session/prompt 由名单兜底拒",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "session/list",
+                "session/page"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "session.input",
+              "label": "写",
+              "methods": [
+                "session/prompt"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {
+          "session.input": false
+        },
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "session/prompt",
+          "expect": {
+            "allow": false,
+            "rule": "session/prompt"
+          }
+        },
+        {
+          "method": "session/list",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P4-missing-flag-inherits",
+      "desc": "flags 缺项=继承任务声明：session/prompt 放行（对照 P3）",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "session/list",
+                "session/page"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "session.input",
+              "label": "写",
+              "methods": [
+                "session/prompt"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {},
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "session/prompt",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P5-owner-unrestricted",
+      "desc": "owner grant：高风险面全放行",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "session/list",
+                "session/page"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "session.input",
+              "label": "写",
+              "methods": [
+                "session/prompt"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "owner",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": null,
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "files/read",
+          "expect": {
+            "allow": false,
+            "rule": "files/"
+          }
+        },
+        {
+          "method": "model/x",
+          "expect": {
+            "allow": false,
+            "rule": "model/"
+          }
+        },
+        {
+          "method": "session/prompt",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P6-wildcard-methods-still-deny-highrisk",
+      "desc": "methods=* 通配不抬升高风险：id 层按能力 id 认，files/ 仍拒",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "*"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "session.input",
+              "label": "写",
+              "methods": [
+                "*"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {},
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "files/read",
+          "expect": {
+            "allow": false,
+            "rule": "files/"
+          }
+        },
+        {
+          "method": "session/list",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P7-highrisk-id-opens-family",
+      "desc": "声明 files.read id：其方法族放行；未声明的 files.write 拒",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [],
+          "a": [
+            {
+              "id": "files.read",
+              "label": "文件读",
+              "methods": [
+                "files/read",
+                "files/list",
+                "files/stat"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {},
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "files/read",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "files/list",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "files/write",
+          "expect": {
+            "allow": false,
+            "rule": "files/"
+          }
+        }
+      ]
+    },
+    {
+      "id": "P8-read-exempt-faces",
+      "desc": "读豁免面：commands/list 放行（豁免），commands/run 拒（terminal.exec 族）",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "session/list",
+                "session/page"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "session.input",
+              "label": "写",
+              "methods": [
+                "session/prompt"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {},
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "commands/list",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "llm/listProviders",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "commands/run",
+          "expect": {
+            "allow": false,
+            "rule": "commands/"
+          }
+        }
+      ]
+    },
+    {
+      "id": "P9-unknown-method-allowed",
+      "desc": "§3.12.4 名单外放行：未知方法不默认拒",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [
+            {
+              "id": "session.read",
+              "label": "读",
+              "methods": [
+                "session/list",
+                "session/page"
+              ]
+            }
+          ],
+          "a": [
+            {
+              "id": "session.input",
+              "label": "写",
+              "methods": [
+                "session/prompt"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {},
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "unknownFace/fooBar",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P10-offcatalog-id-dropped",
+      "desc": "目录外 id（cfg.custom）从交集丢弃：settings/theme 拒于高风险层",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [],
+          "a": [
+            {
+              "id": "cfg.custom",
+              "label": "自定义",
+              "methods": [
+                "settings/*"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {},
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "settings/theme",
+          "expect": {
+            "allow": false,
+            "rule": "settings/"
+          }
+        }
+      ]
+    },
+    {
+      "id": "P11-precise-method-vs-family",
+      "desc": "terminal.exec id 只声明 job/list：job/list 放行；job/follow 拒（报告链回落 high-risk）",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [],
+          "a": [
+            {
+              "id": "terminal.exec",
+              "label": "作业",
+              "methods": [
+                "job/list"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {},
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "job/list",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "job/follow",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P12-model-id-opens-both-forms",
+      "desc": "model.select id：session/selectModel 与 model/ 前缀族都放行",
+      "share": {
+        "id": "sh-vec",
+        "title": "vec",
+        "granularity": "main",
+        "cwd": "",
+        "sessionId": null,
+        "env": [],
+        "created_at": 0,
+        "grants": [],
+        "caps": {
+          "o": [],
+          "a": [
+            {
+              "id": "model.select",
+              "label": "模型",
+              "methods": [
+                "session/selectModel"
+              ]
+            }
+          ]
+        },
+        "listing": null,
+        "stateVisibility": null,
+        "taskCard": null,
+        "state": "active",
+        "groupId": null,
+        "ownerAccount": "did:youling:owner"
+      },
+      "grant": {
+        "label": "viewer",
+        "did": "did:myco:viewerA",
+        "ro": false,
+        "exp": 9999999999999,
+        "windowMs": null,
+        "caps": {},
+        "visibility": null
+      },
+      "cases": [
+        {
+          "method": "session/selectModel",
+          "expect": {
+            "allow": true
+          }
+        },
+        {
+          "method": "model/anything",
+          "expect": {
+            "allow": true
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+[package]
+name = "ui-embed-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+serde_json.workspace = true
+serde.workspace = true
+tauri = { version = "2", features = ["custom-protocol"] }
+ureq = { version = "2", features = ["json"] }
+chrono.workspace = true

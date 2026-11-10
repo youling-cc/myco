@@ -1,0 +1,292 @@
+//! vnet 可靠传输层
+//! 在 UDP 之上提供 TCP 语义：重传、排序、流控
+//! 设计：ARQ（自动重传请求）+ 序号排序 + 指数退避
+
+use std::collections::HashMap;
+use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// 可靠传输包头
+/// [type:1B][seq:4B][ack:4B][length:2B] = 11 字节
+pub const HEADER_SIZE: usize = 11;
+
+pub const TYPE_DATA: u8 = 1;
+pub const TYPE_ACK: u8 = 2;
+
+/// 构建 ACK 包
+pub fn build_ack(ack_seq: u32) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(HEADER_SIZE);
+    packet.push(TYPE_ACK);
+    packet.extend_from_slice(&0u32.to_be_bytes()); // seq 不用
+    packet.extend_from_slice(&ack_seq.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet
+}
+
+/// 解析包
+pub fn parse_packet(packet: &[u8]) -> Option<(u8, u32, u32, &[u8])> {
+    if packet.len() < HEADER_SIZE { return None; }
+    let pkt_type = packet[0];
+    let seq = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
+    let ack = u32::from_be_bytes([packet[5], packet[6], packet[7], packet[8]]);
+    let len = u16::from_be_bytes([packet[9], packet[10]]) as usize;
+    if packet.len() < HEADER_SIZE + len { return None; }
+    Some((pkt_type, seq, ack, &packet[HEADER_SIZE..HEADER_SIZE + len]))
+}
+
+/// 可靠 UDP 发送器
+pub struct ReliableSender {
+    next_seq: u64,
+    inflight: Arc<Mutex<HashMap<u32, (Vec<u8>, Instant, u32)>>>,
+    socket: Arc<UdpSocket>,
+    peer: std::net::SocketAddr,
+    pub packets_sent: Arc<AtomicU64>,
+    pub packets_retransmitted: Arc<AtomicU64>,
+    pub packets_acked: Arc<AtomicU64>,
+}
+
+impl ReliableSender {
+    pub fn new(socket: Arc<UdpSocket>, peer: std::net::SocketAddr) -> Self {
+        Self {
+            next_seq: 0,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+            socket,
+            peer,
+            packets_sent: Arc::new(AtomicU64::new(0)),
+            packets_retransmitted: Arc::new(AtomicU64::new(0)),
+            packets_acked: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// 当前 inflight（已发送未确认）帧数——流控窗口用
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.lock().unwrap().len()
+    }
+
+    pub fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        let seq = (self.next_seq % u32::MAX as u64) as u32;
+        self.next_seq += 1;
+
+        let mut packet = Vec::with_capacity(HEADER_SIZE + data.len());
+        packet.push(TYPE_DATA);
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        packet.extend_from_slice(data);
+
+        self.socket.send_to(&packet, self.peer)?;
+        self.packets_sent.fetch_add(1, Ordering::Relaxed);
+
+        self.inflight.lock().unwrap().insert(seq, (packet, Instant::now(), 0));
+        Ok(())
+    }
+
+    pub fn handle_ack(&self, ack_seq: u32) {
+        // ACK 延迟模拟：VNET_ACK_DELAY=100 → 处理 ACK 前延迟 100ms
+        if let Some(d) = std::env::var("VNET_ACK_DELAY").ok().and_then(|v| v.parse::<u64>().ok()) {
+            if d > 0 { std::thread::sleep(std::time::Duration::from_millis(d)); }
+        }
+        // u32::MAX 哨兵 = "还没收到任何按序帧"——不清 inflight
+        // 不加这个：帧 0 丢失时后续帧乱序到达 → ACK(u32::MAX)
+        // → retain(seq > u32::MAX) = 全 false → 全部帧被清空 → 永不重传 → 会话死亡
+        if ack_seq == u32::MAX {
+            return;
+        }
+        // 接收端回的是**累积 ACK**（"我已经按序收到 <= ack_seq 的全部"），
+        // 所以必须删掉所有 <= ack_seq 的在途包。
+        // 只删单个序号会导致旧包永远留在 inflight、被无限重传（实测 10% 丢包下成功率仅 33%）。
+        let mut inflight = self.inflight.lock().unwrap();
+        let before = inflight.len();
+        inflight.retain(|seq, _| *seq > ack_seq);
+        let removed = before - inflight.len();
+        if removed > 0 {
+            for _ in 0..removed {
+                self.packets_acked.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn check_retransmit(&self) {
+        let mut inflight = self.inflight.lock().unwrap();
+        let now = Instant::now();
+        let mut dead = Vec::new();
+
+        for (seq, (packet, sent_at, retries)) in inflight.iter_mut() {
+            let timeout = Duration::from_millis(100 * (2u64.pow((*retries).min(4))));
+            if now.duration_since(*sent_at) > timeout {
+                if *retries >= 8 {
+                    dead.push(*seq);
+                    continue;
+                }
+                if self.socket.send_to(packet, self.peer).is_ok() {
+                    *sent_at = Instant::now();
+                    *retries += 1;
+                    self.packets_retransmitted.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        for seq in dead { inflight.remove(&seq); }
+    }
+}
+
+/// 可靠 UDP 接收器（排序去重）
+pub struct ReliableReceiver {
+    next_expected_seq: u32,
+    out_of_order: HashMap<u32, Vec<u8>>,
+    pub dup_count: u64,
+}
+
+impl ReliableReceiver {
+    pub fn new() -> Self {
+        Self { next_expected_seq: 0, out_of_order: HashMap::new(), dup_count: 0 }
+    }
+
+    /// 诊断用：当前接收器状态（期望的下一个序号 + 乱序缓冲大小 + 重复计数）
+    pub fn stats(&self) -> (u32, usize, u64) {
+        (self.next_expected_seq, self.out_of_order.len(), self.dup_count)
+    }
+
+    /// 处理数据包，返回（按序数据列表，要回复的 ACK 序号）
+    pub fn handle_data(&mut self, seq: u32, data: &[u8]) -> (Vec<Vec<u8>>, u32) {
+        let mut ordered = Vec::new();
+
+        // 流重置检测（两端对称，产品必需）：
+        // 任何一端重启/通道重建后 seq 归零，对端若不重置就会把新流全部判为重复丢弃
+        // （实测：客户端重启后服务端旧表项把新包全吞，0/100 全挂）。
+        //   大幅回退             = 对端换了新流（seq 归零）
+        //   大幅前跳且无乱序缓存 = 对端续流而本端是刚归零的新流（本端重启的镜像场景）
+        // 合法重传的回退不会超过在途窗口（个位数量级），64 的窗口不会误伤。
+        const RESET_WINDOW: u32 = 64;
+        if seq.wrapping_add(RESET_WINDOW) < self.next_expected_seq
+            || (seq > self.next_expected_seq.wrapping_add(RESET_WINDOW)
+                && self.out_of_order.is_empty())
+        {
+            self.next_expected_seq = seq;
+            self.out_of_order.clear();
+        }
+
+        if seq == self.next_expected_seq {
+            ordered.push(data.to_vec());
+            self.next_expected_seq = self.next_expected_seq.wrapping_add(1);
+            while let Some(buf) = self.out_of_order.remove(&self.next_expected_seq) {
+                ordered.push(buf);
+                self.next_expected_seq = self.next_expected_seq.wrapping_add(1);
+            }
+        } else if seq > self.next_expected_seq {
+            self.out_of_order.insert(seq, data.to_vec());
+        } else {
+            self.dup_count += 1;
+        }
+
+        // ── ACK 语义修复（2026-11-06 110KB 会话死亡根因）──
+        // 之前：ack = seq（刚收到的帧号）
+        //   乱序帧 120 到达 → ACK(120) → sender 累积删除 seq≤120 的帧
+        //   → 丢失的帧 119 被误标为已确认 → 永远不重传 → 会话永久卡死
+        //
+        // 修复：ack = next_expected_seq - 1（最高按序接收的帧号）
+        //   乱序帧 120 到达 → ACK(118) → sender 知道 119 还没到 → 正常重传
+        let ack = if self.next_expected_seq == 0 {
+            u32::MAX // 还没收到任何按序帧（初始状态），ACK u32::MAX 表示"无新确认"
+        } else {
+            self.next_expected_seq.wrapping_sub(1)
+        };
+
+        (ordered, ack)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_packet_roundtrip() {
+        let ack = build_ack(42);
+        let (t, _, ack_seq, _) = parse_packet(&ack).unwrap();
+        assert_eq!(t, TYPE_ACK);
+        assert_eq!(ack_seq, 42);
+    }
+
+    #[test]
+    fn test_receiver_ordering() {
+        let mut rx = ReliableReceiver::new();
+        let (d1, _) = rx.handle_data(1, b"second");
+        assert!(d1.is_empty());
+        let (d0, _) = rx.handle_data(0, b"first");
+        assert_eq!(d0.len(), 2);
+        assert_eq!(d0[0], b"first");
+        assert_eq!(d0[1], b"second");
+    }
+
+    #[test]
+    fn test_receiver_duplicate() {
+        let mut rx = ReliableReceiver::new();
+        rx.handle_data(0, b"a");
+        rx.handle_data(0, b"a");
+        assert_eq!(rx.dup_count, 1);
+    }
+
+    #[test]
+    fn test_receiver_reset_backward() {
+        // 对端重启：seq 从高位归零，本端必须重置而不是判重复丢弃
+        let mut rx = ReliableReceiver::new();
+        for i in 0..200 { rx.handle_data(i, b"x"); }
+        let (d, _) = rx.handle_data(0, b"fresh");
+        assert_eq!(d.len(), 1, "归零包必须被接受（而不是吞掉）");
+        assert_eq!(d[0], b"fresh");
+    }
+
+    #[test]
+    fn test_receiver_reset_forward() {
+        // 本端重启（期望归零）后对端续流发来高位包：重置到对端序号
+        let mut rx = ReliableReceiver::new();
+        let (d0, _) = rx.handle_data(500, b"cont");
+        assert_eq!(d0.len(), 1, "大幅前跳且无乱序上下文 = 对端续流，必须接受");
+        let (d1, _) = rx.handle_data(501, b"next");
+        assert_eq!(d1.len(), 1);
+    }
+
+    #[test]
+    fn test_receiver_no_false_reset_on_retransmit() {
+        // 合法重传（小幅回退）不能触发重置
+        let mut rx = ReliableReceiver::new();
+        for i in 0..10 { rx.handle_data(i, b"x"); }
+        // 丢包重传场景：收到 seq=5（已交付过的）——小幅回退判重复
+        let (d, _) = rx.handle_data(5, b"x");
+        assert!(d.is_empty());
+        assert_eq!(rx.dup_count, 1);
+    }
+}
+
+impl ReliableSender {
+    /// 预览下一个序号（调用方自行组帧时用）
+    pub fn peek_next_seq(&mut self) -> u32 {
+        let s = (self.next_seq % u32::MAX as u64) as u32;
+        self.next_seq += 1;
+        s
+    }
+
+    /// 发送一个「调用方已组帧并加密」的包，并纳入重传管理。
+    pub fn send_prepared(&mut self, seq: u32, sealed_frame: Vec<u8>, drop: bool) -> anyhow::Result<()> {
+        // 帧总是进 inflight（即使模拟丢包），重传由 tick 恢复
+        self.inflight
+            .lock()
+            .unwrap()
+            .insert(seq, (sealed_frame, Instant::now(), 0));
+        if !drop {
+            if let Some(pkt) = self.inflight.lock().unwrap().get(&seq) {
+                let _ = self.socket.send_to(&pkt.0, self.peer);
+            }
+            self.packets_sent.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// 不纳入重传管理的直接发送（用于 ACK）
+    pub fn send_raw_to_peer(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.socket.send_to(bytes, self.peer)?;
+        Ok(())
+    }
+}

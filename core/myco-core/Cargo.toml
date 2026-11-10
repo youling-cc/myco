@@ -1,0 +1,27 @@
+[package]
+name = "myco-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "myco_core"
+crate-type = ["rlib"]
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core", "pem"] }
+rand = "0.9"
+bs58 = "0.5"
+serde.workspace = true
+serde_json.workspace = true
+tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+sha2 = "0.10"
+aes-gcm = "0.10"
+argon2 = "0.5"
+pbkdf2 = "0.12"

@@ -1,0 +1,33 @@
+[package]
+name = "myco-pomdp"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "myco_pomdp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "myco-pomdp"
+path = "src/main.rs"
+
+[dependencies]
+myco-protocol.workspace = true
+myco-transport.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+gray_matter = "0.2"
+markdown = "1.0"
+walkdir = "2"
+serde_yaml = "0.9"
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

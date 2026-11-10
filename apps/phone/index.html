@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0b10" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>myco · 手机遥控</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // 诊断：仅当 6s 后 root 仍空（渲染失败）才显示红框；正常渲染则不显示。
+      window.__diag = function (m) {
+        var d = document.createElement('pre')
+        d.style.cssText = 'color:#c00;padding:10px;font-size:11px;white-space:pre-wrap;word-break:break-all;background:#fee;border:1px solid #c00;margin:6px'
+        d.textContent = m
+        document.body.insertBefore(d, document.body.firstChild)
+      }
+      // 2026-10-16 修「很多红字报错」（用户真机报+复现）：本诊断条只为**渲染失败**服务。
+      // 原实现把每个 error 事件都画成红框——壳 evaluateJavascript 注入代码的异常在
+      // error 事件里是 "Script error." + 空文件名/行号（典型签名），每 4s tick 或
+      // proxy 回执竞态都可能来一条，红框无限堆积吓用户。改：root 已渲染（app 正常
+      // 跑起来）后的运行期错误一律不上屏——main.tsx 的 tlog 已回传服务器取证。
+      window.addEventListener('error', function (e) {
+        var r = document.getElementById('root')
+        if (r && r.innerHTML.length > 0) return // app 已渲染 → 不上屏（有 tlog 兜底）
+        window.__diag('ERR: ' + (e.message || e.type) + ' @' + (e.filename || '') + ':' + (e.lineno || ''))
+      }, true)
+      window.addEventListener('unhandledrejection', function (e) {
+        var r = document.getElementById('root')
+        if (r && r.innerHTML.length > 0) return // 同上：渲染成功后不上屏
+        window.__diag('REJECT: ' + (e.reason && (e.reason.stack || e.reason.message || String(e.reason))))
+      })
+      setTimeout(function () {
+        var rootLen = (document.getElementById('root') || {}).innerHTML.length
+        if (rootLen > 0) return // 正常渲染，不显示
+        try {
+          var res = performance.getEntriesByType('resource').filter(function (x) { return /\.js/.test(x.name) }).map(function (x) { return x.name.split('/').pop() })
+          window.__diag('渲染失败 root=0\nUA=' + navigator.userAgent + '\nJS资源=' + (res.join('; ') || '（无→JS没加载）'))
+        } catch (e2) { window.__diag('root=0 且 diag 自身出错 ' + e2.message) }
+      }, 6000)
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

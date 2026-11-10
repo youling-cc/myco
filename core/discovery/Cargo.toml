@@ -1,0 +1,27 @@
+[package]
+name = "myco-discovery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+myco-discovery-proto = { path = "../discovery-proto" }
+myco-storage = { path = "../storage" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.0"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+dashmap = "6.0"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+lru = "0.12"
+rand = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

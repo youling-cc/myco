@@ -1,0 +1,330 @@
+html, body { height: 100%; position: relative; }
+:root { --warning: #ff8a80; } /* 第27轮:warn 色亮红,深色主题可读 */
+
+/* myco 驾驶舱基础样式(2026-09-04)——对齐手机版审美:大字体/圆角/色彩层次。
+   此前 .sec/.row/.name/.muted 等类名零 CSS 定义,全靠 inline style 撑着,
+   看起来像裸 HTML(用户实测"字小/不好看")。 */
+
+/* ── 基础卡片/区块 ── */
+.sec {
+  background: var(--surface);
+  border: 1px solid var(--chrome-border);
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin: 0 0 8px;
+}
+
+.sec-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ── 行(通用横向排列) ── */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  min-height: 28px;
+}
+
+/* ── 文字层级(对齐手机:正文 14px,标签 12px,辅助 11px) ── */
+.name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.muted {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.small {
+  font-size: 11px;
+}
+
+.muted.small {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ── 状态指示 ── */
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.dot.on {
+  background: #22c55e;
+  box-shadow: 0 0 4px rgba(34,197,94,.4);
+}
+
+/* ── 标签/徽章 ── */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--accent-light);
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 500;
+  flex-shrink: 0;
+  transition: background .15s, color .15s;
+}
+
+.chip:hover {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+/* ── 警告/错误 ── */
+.warn {
+  color: var(--warning);
+  font-size: 12px;
+}
+
+/* ── 布局辅助 ── */
+.flex1 { flex: 1; }
+.truncate {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 列表行(设备/委任/账号清单):浅蓝圆角底,悬停加深 ── */
+.list-row {
+  border-radius: 8px;
+  background: var(--accent-light);
+  margin: 2px 0;
+  transition: background .15s;
+}
+
+.list-row:hover {
+  background: color-mix(in srgb, var(--accent) 16%, var(--accent-light));
+}
+
+/* ── 输入框(对齐手机圆角风格) ── */
+.sec input,
+.sec select,
+.sec textarea {
+  background: var(--chrome-bg);
+  border: 1px solid var(--chrome-border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color .15s;
+}
+
+.sec input:focus,
+.sec select:focus,
+.sec textarea:focus {
+  border-color: var(--accent);
+}
+
+.sec input::placeholder {
+  color: var(--text-muted);
+}
+
+/* ── 按钮(对齐手机圆角+色彩) ── */
+.sec button,
+button.btn {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background .15s, transform .1s;
+}
+
+/* 2026-10-06 修复：hover 变深紫收窄为仅实心按钮（.btn）——.sec 容器内所有 button
+   都被染色的旧规则误伤透明文字按钮（.bk 返回/.linkish 链接：透明底+紫色文字，
+   hover 深紫底+紫字=对比度 1.2:1 全灭，用户实测账号页「‹ 返回」hover 看不清） */
+.sec button.btn:hover,
+button.btn:hover {
+  background: var(--accent-hover);
+}
+
+.sec button:active,
+button.btn:active {
+  transform: scale(.97);
+}
+
+.sec button:disabled,
+button.btn:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+/* ── 深色主题覆盖 ── */
+[data-theme="dark"] .sec {
+  background: var(--surface);
+  border-color: var(--chrome-border);
+}
+
+[data-theme="dark"] .name { color: var(--text-primary); }
+[data-theme="dark"] .muted { color: var(--text-muted); }
+
+/* ── 主列表滚动(2026-09-04 根修)──
+   共享 ./index.css 的 html/body/#root{overflow:hidden} 是 canvas 内区滚动
+   设计;home 的 main.col 没有滚动容器,内容超视口直接被裁——设置面板(投入权重
+   列表)滚不到底,用户实测截图。#root 变纵向 flex,main.col 吃剩余高并滚动。 */
+#root {
+  display: flex;
+  flex-direction: column;
+}
+main.col {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* ── 仪表栏+灯墙+弹层+探索横幅+双tab(demo v3·ADR-002,2026-09-05) ── */
+.dashbar { display: flex; align-items: center; gap: 7px; padding: 7px 10px 4px; user-select: none; }
+.acct-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid var(--chrome-border); border-radius: 999px; font-size: 11px; font-weight: 600; cursor: pointer; background: var(--chrome-bg); max-width: 42%; }
+.acct-chip:hover { border-color: var(--accent); }
+.acct-chip .dm { width: 6px; height: 6px; background: var(--accent); transform: rotate(45deg); border-radius: 1px; flex-shrink: 0; }
+.acct-chip .ldot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); flex-shrink: 0; }
+.lampwall { display: inline-flex; align-items: center; gap: 5px; padding: 3px 6px; border-radius: 6px; cursor: pointer; flex: 1; min-width: 0; overflow: hidden; }
+.lampwall:hover { background: var(--chrome-hover); }
+.lamp { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.lamp.red { background: var(--lamp-red); }
+.lamp.yellow { background: var(--lamp-yellow); }
+.lamp.green { background: var(--lamp-green); }
+.lamp.blue { background: var(--lamp-explore); }
+.lamp.gray { background: var(--lamp-idle); box-shadow: 0 0 0 1px var(--lamp-idle-ring); }
+.lw-num { font-size: 10px; color: var(--text-muted); white-space: nowrap; }
+.tb-ico { width: 28px; height: 26px; border: 1px solid transparent; background: transparent; color: var(--text-muted); border-radius: 7px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.tb-ico:hover { color: var(--text-primary); border-color: var(--chrome-border); }
+.pop { margin: 2px 10px 6px; background: var(--chrome-bg); border: 1px solid var(--chrome-border); border-radius: 10px; padding: 10px 12px; box-shadow: var(--shadow-lg); }
+.pop-t { font-size: 11px; color: var(--text-muted); font-weight: 700; margin-bottom: 6px; letter-spacing: .5px; }
+.pop-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; color: var(--text-secondary); }
+.pop-btn { padding: 3px 12px; border-radius: 7px; border: 1px solid var(--chrome-border); background: transparent; color: var(--text-primary); cursor: pointer; font-size: 12px; }
+.pop-btn:hover { border-color: var(--accent); color: var(--accent); }
+.pop-note { margin-top: 6px; font-size: 10px; color: var(--text-muted); }
+.explore-banner { display: flex; align-items: center; gap: 8px; margin: 4px 10px 6px; padding: 8px 12px; border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); border-radius: 8px 8px 8px 12px; text-decoration: none; color: inherit; background: linear-gradient(120deg, color-mix(in srgb, var(--accent) 10%, transparent), color-mix(in srgb, var(--teal, #5EEAD4) 6%, transparent) 55%, transparent 85%); }
+.explore-banner:hover { border-color: var(--accent); }
+.eb-main { font-size: 12.5px; font-weight: 700; color: var(--accent); white-space: nowrap; }
+.eb-sub { font-size: 10.5px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mtab-row { gap: 6px; padding: 0 10px; }
+.mtab { flex: 1; padding: 6px 0; font-size: 12px; border: 1px solid var(--chrome-border); border-radius: 8px; cursor: pointer; color: var(--text-muted); background: transparent; transition: all .18s; }
+.mtab.on { background: var(--accent); color: var(--accent-ink, #fff); font-weight: 700; border-color: var(--accent); }
+
+
+/* ── 任务树(demo v3 完整还原,2026-09-05):无卡片裸铺+紧凑行式+灯语+配速徽章 ── */
+/* 任务树主体去卡片化——demo 里内容直铺,不被大卡包裹 */
+.sec.grow { background: transparent; border: none; padding: 0 2px; margin: 0; box-shadow: none; }
+
+/* 项目行 = demo .proj:7px 行距/圆角8/hover 抬升/名 13px 600 */
+.grp > .row { padding: 7px 6px; border-radius: 8px; gap: 7px; min-height: 0; }
+.grp > .row:hover { background: var(--chrome-hover); }
+.grp > .row .caret { font-size: 9px; color: var(--text-muted); width: 10px; flex-shrink: 0; }
+.grp > .row .name { font-size: 13px; font-weight: 600; }
+.grp > .row .chip { font-size: 10px; color: var(--text-muted); background: transparent; border: 1px solid var(--chrome-border); border-radius: 999px; padding: 1px 7px; }
+
+/* 任务行 = demo .task:左缩进24/圆角7/12px/次级文字色 */
+.todo-sub .row { padding: 5px 6px 5px 24px; border-radius: 7px; font-size: 12px; min-height: 0; gap: 7px; }
+.todo-sub .row:hover { background: var(--chrome-hover); }
+.todo-sub .row .name { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.todo-sub .row .dot { width: 7px; height: 7px; }
+
+/* 灯五色(与灯墙同语义);辉光是红灯的特权(呼吸2.4s,晨态与 reduced-motion 关) */
+.lt { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.lt-red { background: var(--lamp-red); animation: home-breathe 2.4s ease-in-out infinite; }
+.lt-yellow { background: var(--lamp-yellow); }
+.lt-green { background: var(--lamp-green); }
+.lt-blue { background: var(--lamp-explore); }
+.lt-gray { background: var(--lamp-idle); box-shadow: 0 0 0 1px var(--lamp-idle-ring); }
+@keyframes home-breathe {
+  0%, 100% { box-shadow: 0 0 6px color-mix(in srgb, var(--lamp-red) 50%, transparent); opacity: 1; }
+  50% { box-shadow: 0 0 2px color-mix(in srgb, var(--lamp-red) 15%, transparent); opacity: .72; }
+}
+[data-theme='light'] .lt-red { animation: none; }
+@media (prefers-reduced-motion: reduce) { .lt-red, .explore-banner { animation: none; } }
+
+/* 配速徽章(目标%):红<60/黄<80/绿≥80,软底胶囊 */
+.due { font-size: 9px; padding: 1px 7px; border-radius: 999px; flex-shrink: 0; }
+.due.red { background: color-mix(in srgb, var(--lamp-red) 14%, transparent); color: var(--lamp-red); }
+.due.yellow { background: color-mix(in srgb, var(--lamp-yellow) 14%, transparent); color: var(--lamp-yellow); }
+.due:not(.red):not(.yellow) { background: color-mix(in srgb, var(--lamp-green) 14%, transparent); color: var(--lamp-green); }
+
+/* 探索横幅:极光渐变 8s 缓慢漂移(同屏活物≤2:横幅+红灯) */
+.explore-banner { background-size: 200% 100%; animation: home-drift 8s ease-in-out infinite alternate; }
+@keyframes home-drift { from { background-position: 0% 0 } to { background-position: 20% 0 } }
+
+/* 双tab行边距对齐 demo(tabs:6px 10px 8px) */
+.mtab-row { padding: 0 2px; margin-bottom: 8px; }
+
+/* ═══ 第16轮 灵工版简洁化(2026-09-12,docs 文档10 第16轮定稿) ═══ */
+
+/* 任务园空态:新账号无任务首见;蘑菇从菌丝网长出(myco=真菌,成果=五彩蘑菇) */
+.garden { text-align: center; padding: 26px 20px 20px; }
+.garden-t { font-size: 14.5px; font-weight: 700; margin-bottom: 6px; color: var(--tx); }
+.garden-s { font-size: 12px; color: var(--mu); line-height: 1.7; }
+.garden-g { font-size: 11px; color: var(--mu2); margin-top: 12px; line-height: 1.6; }
+
+/* 我的名片(智能体页首卡):看自己=看别人的同一组件 */
+.pcard { background: var(--card); border: 1px solid var(--bd, var(--chrome-border)); border-radius: 12px; padding: 13px 14px; }
+.pcard-head { display: flex; align-items: center; gap: 10px; }
+.pcard-avatar { width: 40px; height: 40px; border-radius: 12px; flex: 0 0 auto;
+  background: linear-gradient(135deg, var(--acc), var(--teal)); color: var(--acc-ink, #fff);
+  display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 15px; }
+.pcard-skills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 11px; }
+.pskill { font-size: 11px; background: var(--bg0); border: 1px solid var(--bd3, var(--chrome-border));
+  border-radius: 8px; padding: 3px 8px; color: var(--tx2); }
+.pskill b { color: var(--teal); font-weight: 700; }
+.pskill-lock { opacity: .6; }
+.pcard-foot { font-size: 10px; color: var(--mu2); margin-top: 10px; line-height: 1.6; }
+
+/* 成果蘑菇行(预留:平台任务接入后,验收合格单前放彩色小蘑菇;--c=物种色) */
+.shroom { width: 13px; height: 13px; flex: 0 0 auto; position: relative; }
+.shroom::before { content: ''; position: absolute; left: 4.5px; top: 5px; width: 4px; height: 7px;
+  background: var(--tx2); border-radius: 2px; }
+.shroom::after { content: ''; position: absolute; left: 0; top: 0; width: 13px; height: 9px;
+  background: var(--c, var(--acc)); border-radius: 7px 7px 3px 3px;
+  clip-path: polygon(0 100%, 0 55%, 18% 18%, 50% 0, 82% 18%, 100% 55%, 100% 100%, 72% 88%, 50% 96%, 28% 88%); }
+
+/* ⋯ 收纳弹层按钮行 */
+.pop-row .pop-btn { display: inline-flex; align-items: center; gap: 5px; }
+
+/* ═══ 磁贴条态(第18轮):窗宽 ≤36px 时防内容挤压溢出 ═══ */
+html[data-strip="v"] body { overflow: hidden; }
+html[data-strip="v"] .dashbar,
+html[data-strip="v"] .explore-banner,
+html[data-strip="v"] .mtab-row,
+html[data-strip="v"] main.col { visibility: hidden; }
+html[data-strip="v"] .titlebar { visibility: visible; }
+
+/* 第35轮 demo 对齐：底部 tab（sticky 贴滚动容器底，移动端范式） */
+.mtab-row.mtab-bottom { position: fixed; bottom: 0; left: 0; right: 0; z-index: 9; padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--chrome-border); background: var(--bg, #fff); margin: 0; }
+
+/* ══ 第36轮 demo 形态主界面 ══ */
+.card.acct-card, .card.explore-card { display: flex; align-items: center; gap: 10px; margin: 6px 10px; padding: 10px 12px; border: 1px solid var(--chrome-border); border-radius: 12px; background: var(--chrome-bg, var(--bg, #fff)); }
+.acct-avatar { width: 34px; height: 34px; border-radius: 50%; background: var(--accent-light, rgba(107,123,255,.15)); color: var(--accent); font-weight: 700; font-size: 15px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.acct-avatar.sm { width: 26px; height: 26px; font-size: 12px; }
+.card { margin: 6px 10px; padding: 10px 12px; border: 1px solid var(--chrome-border); border-radius: 12px; }
+main.col { display: flex; flex-direction: column; }
+.acct-list-row { display: flex; align-items: center; gap: 8px; padding: 7px 6px; border-radius: 8px; cursor: pointer; }
+.acct-list-row:hover { background: var(--chrome-hover); }
+.role-chip { font-size: 9.5px; padding: 1px 7px; border-radius: 999px; background: var(--chrome-hover); color: var(--text-muted); flex-shrink: 0; }
+.task-row { display: flex; align-items: center; gap: 8px; padding: 8px 6px; border-radius: 8px; cursor: pointer; }
+.task-row:hover { background: var(--chrome-hover); }
+
+
+
+main.col { padding-bottom: 56px; }

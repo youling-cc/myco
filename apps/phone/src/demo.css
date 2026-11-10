@@ -1,0 +1,154 @@
+/* ═══ myco 主界面 demo 皮肤（第37轮：整建制移植 ued/myco-multi-account-demo.html）═══
+   来源：demo html <style> 原样提取（类名/配色/字号 1:1），仅：
+   ① 去掉 demo 舞台说明区（#stage/.shells/.shell-cap/aside/.align 等）
+   ② .shell/.scr 适配产品窗口（贴满 #root，圆角/描边去掉）
+   ③ 底部 tab 内联样式固化为 .tabbar/.tabbtn
+   ④ 末尾 [data-theme=dark] 最小暗色映射（亮色为准，暗色仅保可读） */
+
+.demo-shell, .demo-topbar, .demo-scr, .cardd, .btnd, .acct-row, .devline, .tabbar, .methodd, .chipd, .tabbtn { box-sizing: border-box; }
+.demo-shell { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #eef1f6; color: #1a2233; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+
+/* 窄条顶部条 */
+.demo-topbar { display: flex; align-items: center; gap: 7px; padding: 9px 12px 7px; border-bottom: 1px solid #e6ebf3; background: #fff; flex-shrink: 0; }
+.demo-topbar .logo { width: 9px; height: 9px; border-radius: 3px; background: linear-gradient(135deg,#6b7bff,#4ec9a5); }
+.demo-topbar .nm { font-size: 12.5px; font-weight: 700; letter-spacing: .5px; }
+.demo-topbar .st { font-size: 13px; font-weight: 600; color: #1a2233; white-space: nowrap; flex: 0 1 220px; min-width: 0; overflow: hidden; text-overflow: ellipsis; line-height: 1.4; padding: 2px 3px; min-height: 21px; display: flex; align-items: center; cursor: default; }
+.demo-topbar .ico { background: none; border: none; color: #6b7bff; font-size: 13px; cursor: pointer; padding: 2px 3px; line-height: 1; }
+
+/* 屏幕滚动区（demo .scr） */
+.demo-scr { flex: 1; overflow-y: auto; padding: 14px 13px 18px; display: flex; flex-direction: column; gap: 9px; }
+
+/* 通用 UI（demo 原样） */
+.h1d { font-size: 17px; font-weight: 800; margin-top: 2px; }
+.h2d { font-size: 14px; font-weight: 700; }
+.subd { font-size: 12px; color: #5b6a83; line-height: 1.65; }
+.tinyd { font-size: 11px; color: #8a97ab; line-height: 1.55; }
+.cardd { background: #fff; border: 1px solid #e4eaf2; border-radius: 12px; padding: 11px 12px; }
+.btnd { border: none; border-radius: 10px; padding: 11px; font-size: 13.5px; font-weight: 600; cursor: pointer; background: linear-gradient(135deg,#6b7bff,#4d8dff); color: #fff; width: 100%; }
+/* 2026-10-06 hover 对比度修：变暗而非变亮（同 PC demo.css——白字渐变钮变亮更看不清） */
+.btnd:hover { filter: brightness(.95); }
+.btnd.ghost { background: #fff; color: #3b475e; border: 1px solid #d7dfeb; font-weight: 500; }
+.btnd.danger { background: #dc2626; }
+.btnd.small { padding: 7px 12px; font-size: 12px; width: auto; border-radius: 8px; }
+.linkish { background: none; border: none; color: #6b7bff; font-size: 12.5px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; padding: 4px; }
+.textlink { text-align: center; margin-top: 2px; }
+.acct-row { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid #e4eaf2; border-radius: 10px; background: #fff; cursor: pointer; }
+.acct-row:hover { border-color: #b9c6ff; }
+.acct-row .av { width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 15px; background: #eef2ff; flex-shrink: 0; }
+.acct-row .nm { font-size: 13px; font-weight: 600; }
+.acct-row .did { font-size: 10.5px; color: #8a97ab; font-family: ui-monospace, monospace; }
+.acct-row .cur { margin-left: auto; font-size: 10.5px; color: #16a34a; font-weight: 600; flex-shrink: 0; }
+.acct-row .sw { margin-left: auto; font-size: 11px; color: #6b7bff; flex-shrink: 0; }
+.dividerd { height: 1px; background: #e6ebf3; margin: 3px 0; }
+.qrd { width: 172px; height: 172px; border-radius: 12px; background: repeating-conic-gradient(#1a2233 0% 25%, #fff 0% 50%) 0 0/22px 22px; margin: 6px auto; border: 6px solid #fff; box-shadow: 0 2px 10px rgba(20,30,60,.12); position: relative; }
+.centerd { text-align: center; }
+.spinnerd { display: inline-block; width: 14px; height: 14px; border: 2px solid #c7d2fe; border-top-color: #6b7bff; border-radius: 50%; animation: demospin 1s linear infinite; vertical-align: -2px; }
+@keyframes demospin { to { transform: rotate(360deg) } }
+.chipd { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; border-radius: 999px; padding: 3px 10px; background: #eef2ff; color: #4338ca; }
+.chipd.green { background: #dcfce7; color: #15803d; }
+.chipd.gray { background: #eef1f6; color: #475569; }
+/* 2026-10-06 凭据徽章「成员」色（既有黄色 chip 风格，与 PC 同款） */
+.chipd.amber { background: #fef3c7; color: #92400e; }
+.methodd { display: flex; align-items: center; gap: 9px; padding: 10px 11px; border: 1.5px solid #e4eaf2; border-radius: 12px; background: #fff; cursor: pointer; }
+.methodd.on { border-color: #6b7bff; background: #f5f7ff; }
+.methodd .ic { width: 32px; height: 32px; border-radius: 9px; background: #eef2ff; display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
+.methodd .t { font-size: 13px; font-weight: 600; }
+.methodd .d { font-size: 11px; color: #8a97ab; }
+.methodd .na { margin-left: auto; font-size: 10px; background: #fee2e2; color: #b91c1c; border-radius: 999px; padding: 2px 7px; flex-shrink: 0; }
+.methodd .rec { margin-left: auto; font-size: 10px; background: #dcfce7; color: #15803d; border-radius: 999px; padding: 2px 7px; flex-shrink: 0; }
+.backrowd { display: flex; align-items: center; gap: 8px; position: relative; min-height: 22px; }
+/* 2026-10-10 导航栏定稿（与 PC 同款）：返回留左上、标题绝对居中（手机现有 3 处为纯返回行，
+   加此规则为将来带标题的返回页统一布局）。 */
+.backrowd .nav-title { position: absolute; left: 50%; transform: translateX(-50%); margin: 0 !important; text-align: center; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60%; }
+.backrowd .bk { background: none; border: none; color: #6b7bff; font-size: 13px; cursor: pointer; padding: 2px 4px; }
+.devline { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid #e4eaf2; border-radius: 10px; background: #fff; font-size: 12px; }
+.devline .dot { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; flex-shrink: 0; }
+.devline .x { margin-left: auto; color: #dc2626; font-size: 11px; cursor: pointer; flex-shrink: 0; }
+.devline .endchip { margin-left: auto; font-size: 10px; border-radius: 999px; padding: 3px 9px; flex-shrink: 0; background: #eef1f6; color: #475569; font-weight: 600; }
+.devline .endchip.go { background: #dcfce7; color: #15803d; }
+.devline .endchip.yl { background: #eef2ff; color: #4338ca; }
+
+/* 账号卡（home 首卡，demo 315-322） */
+.acct-cardd { cursor: pointer; }
+.acct-cardd .av { width: 34px; height: 34px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 17px; background: #eef2ff; flex-shrink: 0; }
+.acct-cardd .nm { font-size: 13px; font-weight: 600; }
+.acct-cardd .didt { font-size: 10.5px; color: #8a97ab; font-family: ui-monospace, monospace; }
+.acct-cardd .sw { margin-left: auto; font-size: 12px; color: #6b7bff; flex-shrink: 0; }
+
+/* 底部 tab（demo 348-351 内联固化）
+   2026-10-08（UI 一致性调研 S1）：tabbar 原本是滚动容器（App.tsx 的 overflowY:auto div）
+   的**内容末尾**，手机上要滚到整页最底才见 tab，用户主观感受"比 PC 乱"。
+   改 sticky 固定到视口底部——`.login-inner` 只是 flex column（index.css:110，无 overflow），
+   sticky 会正确相对最近的滚动祖先生效。z-index 保证盖住内容；背景/暗色映射沿用原定义。 */
+.tabbar { position: sticky; bottom: 0; z-index: 20; display: flex; gap: 6px; border-top: 1px solid #e6ebf3; padding: 8px 13px calc(8px + env(safe-area-inset-bottom, 0px)); background: #fff; flex-shrink: 0; }
+.tabbar .tabbtn { border: none; border-radius: 10px; padding: 8px; font-size: 13.5px; font-weight: 600; cursor: pointer; background: linear-gradient(135deg,#6b7bff,#4d8dff); color: #fff; flex: 1; }
+.tabbar .tabbtn.ghost { background: #fff; color: #3b475e; border: 1px solid #d7dfeb; font-weight: 500; }
+
+/* ─── 暗色最小映射（亮色为准，暗色保可读） ─── */
+[data-theme="dark"] .demo-shell { background: #151a24; color: #e5eaf3; }
+[data-theme="dark"] .demo-topbar { background: #1a2130; border-bottom-color: #2a3345; }
+[data-theme="dark"] .demo-topbar .st { color: #e5eaf3; }
+[data-theme="dark"] .demo-scr { }
+[data-theme="dark"] .cardd, [data-theme="dark"] .acct-row, [data-theme="dark"] .devline { background: #1a2130; border-color: #2a3345; }
+[data-theme="dark"] .subd { color: #9aa7bd; }
+[data-theme="dark"] .tinyd { color: #7a8699; }
+[data-theme="dark"] .btnd.ghost { background: #1a2130; color: #c7d2e4; border-color: #2f3a4f; }
+[data-theme="dark"] .dividerd { background: #2a3345; }
+[data-theme="dark"] .tabbar { background: #1a2130; border-top-color: #2a3345; }
+[data-theme="dark"] .tabbar .tabbtn.ghost { background: #1a2130; color: #c7d2e4; border-color: #2f3a4f; }
+[data-theme="dark"] .methodd { background: #1a2130; border-color: #2a3345; }
+[data-theme="dark"] .methodd.on { background: #1e2637; border-color: #6b7bff; }
+[data-theme="dark"] .chipd.gray, [data-theme="dark"] .devline .endchip { background: #232c3d; color: #c7d2e4; }
+
+/* ─── 第38轮：顶栏头像菜单（K3 方案：头像入口+锚定下拉，承载切换账号/检查更新/设置） ─── */
+.demo-topbar .avatar { position: relative; width: 24px; height: 24px; border-radius: 50%; background: linear-gradient(135deg,#6b7bff,#4ec9a5); color: #fff; font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; border: none; padding: 0; cursor: pointer; flex-shrink: 0; }
+.demo-topbar .avatar:hover { outline: 2px solid #eef1f6; outline-offset: 1px; }
+.demo-topbar .avatar .reddot { position: absolute; top: -2px; right: -2px; width: 6px; height: 6px; border-radius: 50%; background: #ff5a5a; border: 1.5px solid #fff; }
+.menu-mask { position: fixed; inset: 0; z-index: 90; }
+.menu-panel { position: fixed; top: 74px; right: 8px; width: 200px; background: #fff; border: 1px solid #eef1f6; border-radius: 12px; box-shadow: 0 8px 24px rgba(30,40,80,.12); z-index: 91; overflow: hidden; animation: menuin .12s ease-out; transform-origin: top right; }
+@keyframes menuin { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
+.menu-head { display: flex; align-items: center; gap: 10px; padding: 12px; }
+.menu-head .av { width: 32px; height: 32px; border-radius: 50%; background: linear-gradient(135deg,#6b7bff,#4ec9a5); color: #fff; font-size: 15px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.menu-head .nm { font-size: 13px; font-weight: 600; color: #1a2333; }
+.menu-head .sub { font-size: 11px; color: #8a94a6; margin-top: 2px; }
+.menu-row { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 12px; font-size: 13px; color: #1a2333; cursor: pointer; border: none; background: none; width: 100%; text-align: left; }
+.menu-row:hover { background: #f8fafc; }
+.menu-row .em { font-size: 15px; flex-shrink: 0; }
+.menu-row .stx { margin-left: auto; font-size: 11px; color: #8a94a6; }
+.menu-row .stx.go { color: #6b7bff; text-decoration: underline; text-underline-offset: 3px; }
+.menu-sep { height: 1px; background: #eef1f6; margin: 4px 0; }
+.login-inner .menu-panel { top: 52px; }
+[data-theme="dark"] .menu-panel { background: #1a2130; border-color: #2a3345; }
+[data-theme="dark"] .menu-head .nm { color: #e5eaf3; }
+[data-theme="dark"] .menu-row { color: #e5eaf3; }
+[data-theme="dark"] .menu-row:hover { background: #232c3d; }
+[data-theme="dark"] .menu-sep { background: #2a3345; }
+
+/* ─── 第39轮：子界面全量 demo 化（first/method/show/scan/recover/createConfirm/create/accts/page） ─── */
+.inpd { width: 100%; border: 1px solid #d7dfeb; border-radius: 8px; padding: 9px 10px; font-size: 13px; background: #fff; box-sizing: border-box; }
+.inpd:focus { outline: none; border-color: #6b7bff; }
+.textaread { width: 100%; border: 1px solid #d7dfeb; border-radius: 8px; padding: 8px 10px; font-size: 12px; font-family: ui-monospace, monospace; background: #fff; resize: vertical; box-sizing: border-box; }
+[data-theme="dark"] .inpd, [data-theme="dark"] .textaread { background: #1a2130; border-color: #2f3a4f; color: #e5eaf3; }
+.warn-cardd { border-color: #fecdd3 !important; background: #fff7f7 !important; }
+.go-cardd { border-color: #86efac !important; background: #f0fdf4 !important; }
+.info-cardd { border-color: #c7d2fe !important; background: #f8faff !important; }
+.stepnumd { width: 18px; height: 18px; border-radius: 50%; background: #16a34a; color: #fff; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+
+/* ─── 第47轮：主题五色（亮白默认/暗黑已有；粉/绿/蓝最小映射=换主色调+底） ─── */
+[data-theme="pink"] .demo-shell, [data-theme="pink"] #root:has(main.demo-scr) { background: #fdf2f6; }
+[data-theme="pink"] .btnd, [data-theme="pink"] .tabbar .tabbtn { background: linear-gradient(135deg,#ec5f9b,#f472b6); }
+[data-theme="pink"] .linkish, [data-theme="pink"] .demo-topbar .ico { color: #db2777; }
+[data-theme="pink"] .chipd { background: #fce7f0; color: #9d174d; }
+[data-theme="green"] .demo-shell, [data-theme="green"] #root:has(main.demo-scr) { background: #f0f7f0; }
+[data-theme="green"] .btnd, [data-theme="green"] .tabbar .tabbtn { background: linear-gradient(135deg,#16a34a,#4ec9a5); }
+[data-theme="green"] .linkish, [data-theme="green"] .demo-topbar .ico { color: #15803d; }
+[data-theme="green"] .chipd { background: #dcfce7; color: #15803d; }
+[data-theme="blue"] .demo-shell, [data-theme="blue"] #root:has(main.demo-scr) { background: #eef4fb; }
+[data-theme="blue"] .btnd, [data-theme="blue"] .tabbar .tabbtn { background: linear-gradient(135deg,#2563eb,#4d8dff); }
+[data-theme="blue"] .linkish, [data-theme="blue"] .demo-topbar .ico { color: #1d4ed8; }
+[data-theme="blue"] .chipd { background: #dbeafe; color: #1e40af; }
+
+/* 2026-10-06 凭据徽章语义色钉死（主设备=绿/成员=琥珀）：彩题的 .chipd 染色（上方 134/138/142，
+   同特异性且位置在后）不得覆盖徽章色——否则绿题下成员徽章会被染成与主设备同款绿。 */
+[data-theme] .chipd.green { background: #dcfce7; color: #15803d; }
+[data-theme] .chipd.amber { background: #fef3c7; color: #92400e; }

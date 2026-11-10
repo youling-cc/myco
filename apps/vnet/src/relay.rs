@@ -1,0 +1,1081 @@
+//! UDP 中继服务器 + 客户端 v2
+//! 新增：地址通告（IPv6交换）、探测包HMAC认证
+//!
+//! 一个进程 = 一个 relay socket = 一个注册地址
+
+use crate::crypto::SessionCrypto;
+use std::collections::HashMap;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const RELAY_MAGIC: u32 = 0x564E524C; // "VNRL"
+const PACKET_HEADER_SIZE: usize = 16;
+
+/// 中继包类型
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum PacketType {
+    Register = 1,
+    RegisterAck = 2,
+    Data = 3,
+    Lookup = 4,
+    LookupAck = 5,
+    Keepalive = 6,
+    /// 通告自己的额外地址（IPv6 等）
+    Announce = 7,
+    /// 查询 peer 的所有地址（中继地址 + IPv6 地址）
+    PeerInfo = 8,
+    /// PeerInfo 响应
+    PeerInfoAck = 9,
+    /// 签名注册（Rust 中继 1.0+）：payload = `did\0ts\0sigB64\0`，
+    /// 签名载荷 = `${did}\n${ts}\nrelay-register`（与 identity-svc relay.mjs 逐字一致）
+    RegisterSigned = 10,
+    /// 注销（2026-11-10 DSH 建议）：stop() 时发送，relay 立即删 peer 条目——
+    /// 不用等 TTL 过期。旧 relay 不认识此类型会忽略（无害）。
+    Unregister = 11,
+}
+
+impl From<u8> for PacketType {
+    fn from(v: u8) -> Self {
+        match v {
+            1 => PacketType::Register,
+            2 => PacketType::RegisterAck,
+            3 => PacketType::Data,
+            4 => PacketType::Lookup,
+            5 => PacketType::LookupAck,
+            6 => PacketType::Keepalive,
+            7 => PacketType::Announce,
+            8 => PacketType::PeerInfo,
+            9 => PacketType::PeerInfoAck,
+            10 => PacketType::RegisterSigned,
+            11 => PacketType::Unregister,
+            _ => PacketType::Keepalive,
+        }
+    }
+}
+
+fn build_packet(pkt_type: PacketType, peer_id: u32, payload: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(PACKET_HEADER_SIZE + payload.len());
+    packet.extend_from_slice(&RELAY_MAGIC.to_be_bytes());
+    packet.push(pkt_type as u8);
+    packet.extend_from_slice(&[0u8; 3]);
+    packet.extend_from_slice(&peer_id.to_be_bytes());
+    packet.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet
+}
+
+fn parse_packet(packet: &[u8]) -> Option<(PacketType, u32, &[u8])> {
+    if packet.len() < PACKET_HEADER_SIZE { return None; }
+    let magic = u32::from_be_bytes([packet[0], packet[1], packet[2], packet[3]]);
+    if magic != RELAY_MAGIC { return None; }
+    let pkt_type = PacketType::from(packet[4]);
+    let peer_id = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+    let payload_len = u32::from_be_bytes([packet[12], packet[13], packet[14], packet[15]]) as usize;
+    if packet.len() < PACKET_HEADER_SIZE + payload_len { return None; }
+    Some((pkt_type, peer_id, &packet[PACKET_HEADER_SIZE..PACKET_HEADER_SIZE + payload_len]))
+}
+
+// ════════════════ Peer 信息（含 IPv6） ════════════════
+
+/// peer 的完整地址信息
+#[derive(Debug, Clone)]
+pub struct PeerFullInfo {
+    /// 中继看到的地址（IPv4，可能是 NAT 后的）
+    pub relay_addr: SocketAddr,
+    /// peer 自己通告的 IPv6 地址（如果有）
+    pub ipv6_addr: Option<SocketAddr>,
+    /// peer 自己通告的公网 IPv4 地址（如果有）
+    pub public_ipv4: Option<SocketAddr>,
+    /// peer 自己通告的网络能力画像（NetStatus::to_announce_extra 的原文，
+    /// 由接收方用 NetStatus::parse_announce_extra 解析）。relay 只存转，不理解语义。
+    pub netstatus: Option<String>,
+    pub last_seen: Instant,
+}
+
+/// 序列化 PeerFullInfo 为 JSON（简单格式，便于解析）
+fn serialize_peer_info(info: &PeerFullInfo) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("relay={}", info.relay_addr));
+    if let Some(v6) = info.ipv6_addr {
+        s.push_str(&format!("|v6={}", v6));
+    }
+    if let Some(v4) = info.public_ipv4 {
+        s.push_str(&format!("|v4={}", v4));
+    }
+    // NetStatus 画像：单独一段，内容含空格（"v=3 nat=..."），用 urlencode 防空格串扰 split('|')。
+    if let Some(ns) = &info.netstatus {
+        s.push_str(&format!("|ns={}", ns.replace('|', "/").replace(' ', ",")));
+    }
+    s
+}
+
+/// 反序列化 PeerFullInfo
+fn deserialize_peer_info(s: &str) -> Option<PeerFullInfo> {
+    let mut relay_addr = None;
+    let mut ipv6_addr = None;
+    let mut public_ipv4 = None;
+    let mut netstatus = None;
+    // C 中继存储公告值时把 "v6="/"v4=" 前缀一起存了（relay_server.c 的 peer_t 注释就写着
+    // "with v6= prefix"），回传时再加一层 → 到这里可能变成 "v6=v6=<addr>"。做防御性剥离。
+    fn strip_all_prefixes<'a>(mut s: &'a str, p: &str) -> &'a str {
+        loop {
+            match s.strip_prefix(p) {
+                Some(rest) if !rest.is_empty() && rest.len() < s.len() => s = rest,
+                _ => return s,
+            }
+        }
+    }
+    for part in s.split('|') {
+        if part.contains("relay=") {
+            relay_addr = strip_all_prefixes(part, "relay=").parse().ok();
+        } else if part.contains("v6=") {
+            let a = strip_all_prefixes(part, "v6=");
+            ipv6_addr = a.parse().ok();
+        } else if part.contains("v4=") {
+            let a = strip_all_prefixes(part, "v4=");
+            public_ipv4 = a.parse().ok();
+        } else if let Some(rest) = part.strip_prefix("ns=") {
+            // 还原 serialize 的转义（空格→逗号、|→/）
+            netstatus = Some(rest.replace(',', " ").replace('/', "|"));
+        }
+    }
+    relay_addr.map(|r| PeerFullInfo {
+        relay_addr: r,
+        ipv6_addr,
+        public_ipv4,
+        netstatus,
+        last_seen: Instant::now(),
+    })
+}
+
+/// 最近一次 query_peer_info 拿到的对端 NetStatus 画像原文缓存（peer_id → ns 字符串）。
+/// query_peer_info 的 3-tuple 签名不变，对端画像经此缓存旁路暴露，
+/// 需要它的消费方（remote_net_status 写入）用 peer_netstatus() 读取。
+static PEER_NETSTATUS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, String>>> = std::sync::OnceLock::new();
+
+fn netstatus_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u32, String>> {
+    PEER_NETSTATUS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 读取某对端最近一次公告的 NetStatus 画像原文（供 remote_net_status 写入）。
+pub fn peer_netstatus(peer_id: u32) -> Option<String> {
+    netstatus_cache().lock().unwrap().get(&peer_id).cloned()
+}
+
+// ════════════════ UDP 中继服务器 ════════════════
+
+/// socket 缓冲配置（`VNET_RCVBUF` / `VNET_SNDBUF`，字节，可覆盖）。
+/// 未设 env 时按发送窗口自动配套：`window × chunk × 4`（窗口 128×1000B → 512KB，
+/// Windows 内核加倍后 ≈1MB）。依据（实测闭环）：在途突发必须小于接收缓冲，
+/// 否则打穿 OS 默认 64KB 后静默丢包（旧「窗口 64 回退」的根因）；
+/// 生产 24/24 全绿用的 1MB 与此同量级。窗口 32 时代不扩即安全的旧注释作废。
+/// relay/client/server 三种进程都调用，保证环境一致。
+pub fn apply_tunable_buffers(socket: &UdpSocket) {
+    let auto = crate::relay_arq::window_size()
+        .saturating_mul(crate::relay_arq::chunk_size())
+        .saturating_mul(4);
+    let s = socket2::SockRef::from(socket);
+    let rcv = std::env::var("VNET_RCVBUF")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(auto);
+    let snd = std::env::var("VNET_SNDBUF")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(auto);
+    if rcv > 0 {
+        let _ = s.set_recv_buffer_size(rcv);
+    }
+    if snd > 0 {
+        let _ = s.set_send_buffer_size(snd);
+    }
+}
+
+pub struct UdpRelayServer {
+    socket: Arc<UdpSocket>,
+    peers: Arc<Mutex<HashMap<u32, PeerFullInfo>>>,
+    peer_timeout: Duration,
+}
+
+impl UdpRelayServer {
+    pub fn new(listen: &str, port: u16) -> anyhow::Result<Self> {
+        let addr = format!("{}:{}", listen, port);
+        let socket = UdpSocket::bind(&addr)?;
+        socket.set_nonblocking(true)?;
+        apply_tunable_buffers(&socket);
+        println!("UDP relay server listening on {}", addr);
+        Ok(Self {
+            socket: Arc::new(socket),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            peer_timeout: Duration::from_secs(120),
+        })
+    }
+
+    pub fn run(&self) {
+        let mut buf = [0u8; 65536];
+        loop {
+            match self.socket.recv_from(&mut buf) {
+                Ok((len, src)) => self.handle_packet(&buf[..len], src),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.cleanup_expired();
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    eprintln!("UDP relay recv error: {}", e);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    fn handle_packet(&self, packet: &[u8], src: SocketAddr) {
+        let Some((pkt_type, peer_id, payload)) = parse_packet(packet) else { return };
+
+        match pkt_type {
+            PacketType::Register => {
+                let mut peers = self.peers.lock().unwrap();
+                // 保留已有的 IPv6 信息（如果有）
+                let existing = peers.get(&peer_id);
+                let info = PeerFullInfo {
+                    relay_addr: src,
+                    ipv6_addr: existing.and_then(|e| e.ipv6_addr),
+                    public_ipv4: existing.and_then(|e| e.public_ipv4),
+                    netstatus: existing.and_then(|e| e.netstatus.clone()),
+                    last_seen: Instant::now(),
+                };
+                peers.insert(peer_id, info);
+                drop(peers);
+                println!("Peer {} registered from {}", peer_id, src);
+                let ack = build_packet(PacketType::RegisterAck, peer_id, &[]);
+                let _ = self.socket.send_to(&ack, src);
+            }
+
+            PacketType::Keepalive => {
+                if let Some(entry) = self.peers.lock().unwrap().get_mut(&peer_id) {
+                    entry.last_seen = Instant::now();
+                    entry.relay_addr = src;
+                }
+            }
+
+            PacketType::Announce => {
+                // peer 通告：地址（v6=/v4=）+ 网络能力画像（ns=）
+                if let Ok(info_str) = std::str::from_utf8(payload) {
+                    let mut peers = self.peers.lock().unwrap();
+                    if let Some(entry) = peers.get_mut(&peer_id) {
+                        // 整段可能是 "ns=v=3 nat=... fw=..."（NetStatus 画像），
+                        // 或 "v6=...|v4=..."。先按 | 分段处理地址；ns 段单独识别。
+                        for part in info_str.split('|') {
+                            if let Some(addr) = part.strip_prefix("v6=") {
+                                if let Ok(parsed) = addr.parse::<SocketAddr>() {
+                                    entry.ipv6_addr = Some(parsed);
+                                    println!("Peer {} announced IPv6: {}", peer_id, parsed);
+                                }
+                            } else if let Some(addr) = part.strip_prefix("v4=") {
+                                if let Ok(parsed) = addr.parse::<SocketAddr>() {
+                                    entry.public_ipv4 = Some(parsed);
+                                }
+                            } else if let Some(rest) = part.strip_prefix("ns=") {
+                                // NetStatus 画像：存原文，由接收方解析（relay 不理解语义）
+                                entry.netstatus = Some(rest.to_string());
+                            }
+                        }
+                        entry.last_seen = Instant::now();
+                    }
+                }
+            }
+
+            PacketType::Lookup => {
+                let peers = self.peers.lock().unwrap();
+                let response = if let Some(entry) = peers.get(&peer_id) {
+                    build_packet(PacketType::LookupAck, peer_id, entry.relay_addr.to_string().as_bytes())
+                } else {
+                    build_packet(PacketType::LookupAck, peer_id, b"offline")
+                };
+                drop(peers);
+                let _ = self.socket.send_to(&response, src);
+            }
+
+            PacketType::PeerInfo => {
+                // 查询 peer 的完整地址信息（包括 IPv6）
+                let peers = self.peers.lock().unwrap();
+                let response = if let Some(entry) = peers.get(&peer_id) {
+                    let info = serialize_peer_info(entry);
+                    build_packet(PacketType::PeerInfoAck, peer_id, info.as_bytes())
+                } else {
+                    build_packet(PacketType::PeerInfoAck, peer_id, b"offline")
+                };
+                drop(peers);
+                let _ = self.socket.send_to(&response, src);
+            }
+
+            PacketType::Data => {
+                let peers = self.peers.lock().unwrap();
+                if let Some(entry) = peers.get(&peer_id) {
+                    if payload.len() >= 4 {
+                        let sender_id = u32::from_be_bytes([
+                            payload[0], payload[1], payload[2], payload[3],
+                        ]);
+                        let forward = build_packet(PacketType::Data, sender_id, &payload[4..]);
+                        let _ = self.socket.send_to(&forward, entry.relay_addr);
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    fn cleanup_expired(&self) {
+        let mut peers = self.peers.lock().unwrap();
+        let now = Instant::now();
+        let before = peers.len();
+        peers.retain(|_, entry| now.duration_since(entry.last_seen) < self.peer_timeout);
+        let removed = before - peers.len();
+        if removed > 0 {
+            println!("Cleaned {} expired peers", removed);
+        }
+    }
+}
+
+// ════════════════ 中继客户端 ════════════════
+
+/// 从 relay socket 收到的包分类
+pub enum RecvKind {
+    /// 中继转发的数据（sender_peer_id, payload）
+    RelayData(u32, Vec<u8>),
+    /// 中继控制面应答（packet_type, payload）：REGISTER_ACK / LOOKUP_ACK / PEERINFO_ACK。
+    /// 必须交给请求方判读，不能像以前一样当成 Ignored 丢掉——
+    /// 否则 LOOKUP 永远只能靠临时端口的非法来源去问，中继按零放大纪律直接丢弃。
+    RelayAck(u8, Vec<u8>),
+    /// P2P 直连数据（来源地址, payload）
+    P2pData(SocketAddr, Vec<u8>),
+    /// 对端敲门请求（单向可达），已自动回复
+    PeerProbe(SocketAddr),
+    /// 我方探测的回复（双向确认，P2P 可用）
+    ProbeReply(SocketAddr),
+    /// 其他（已丢弃或已自动处理）
+    Ignored,
+}
+
+pub struct RelayClient {
+    socket: Arc<UdpSocket>,
+    relay_addr: SocketAddr,
+    pub my_peer_id: u32,
+    /// 端到端加密（None = 未配置 --secret，明文传输）。中继只转发密文。
+    crypto: Option<Arc<std::sync::Mutex<crate::crypto::SessionCrypto>>>,
+    /// 探测包 HMAC 认证（防伪造/放大攻击）。None = 未配置 --secret。
+    probe_auth: Option<crate::crypto::ProbeAuth>,
+    /// 中继注册鉴权 token（32 字节）。None = 中继不要求鉴权（仅本地测试）。
+    relay_token: Option<[u8; 32]>,
+    /// 接收线程投递、请求方判读的中继控制面应答（有界）。
+    control_acks: Arc<std::sync::Mutex<Vec<(u8, Vec<u8>)>>>,
+    /// 最近一次收到 relay 任何回包的时刻（ms since epoch）。
+    /// 蜂窝映射腐烂检测：keepalive 持续发但这里长时间不更新 = CGN/防火墙黑洞。
+    last_relay_rx_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Clone for RelayClient {
+    fn clone(&self) -> Self {
+        Self {
+            socket: self.socket.clone(),
+            relay_addr: self.relay_addr,
+            my_peer_id: self.my_peer_id,
+            crypto: self.crypto.clone(),
+            probe_auth: self.probe_auth.clone(),
+            relay_token: self.relay_token,
+            control_acks: self.control_acks.clone(),
+            last_relay_rx_ms: self.last_relay_rx_ms.clone(),
+        }
+    }
+}
+
+/// 静默开关（CLI 的 `probe-relay --json` 用）：只影响提示性 println，不影响协议行为。
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设置静默（true = 不打印注册成功等提示，便于 JSON 输出）
+pub fn set_quiet(v: bool) {
+    QUIET.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn quiet() -> bool {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+impl RelayClient {
+    pub fn new(relay_addr: &str, my_peer_id: u32) -> anyhow::Result<Self> {
+        Self::with_crypto(relay_addr, my_peer_id, None, None)
+    }
+
+    /// 带端到端加密的构造。`crypto` 为 None 时保持明文（便于对比测试）。
+    pub fn with_crypto(
+        relay_addr: &str,
+        my_peer_id: u32,
+        crypto: Option<crate::crypto::SessionCrypto>,
+        secret: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let addr: SocketAddr = relay_addr.parse()
+            .map_err(|_| anyhow::anyhow!("Invalid relay address: {}", relay_addr))?;
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_nonblocking(true)?;
+        apply_tunable_buffers(&socket);
+        Ok(Self {
+            socket: Arc::new(socket),
+            relay_addr: addr,
+            my_peer_id,
+            crypto: crypto.map(|c| Arc::new(std::sync::Mutex::new(c))),
+            probe_auth: secret.map(|s| crate::crypto::ProbeAuth::new(s.as_bytes())),
+            relay_token: secret.map(crate::crypto::SessionCrypto::relay_token),
+            control_acks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            last_relay_rx_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    /// 最近一次收到 relay 回包距今多久（映射腐烂检测用）
+    pub fn relay_silent_for(&self) -> Option<Duration> {
+        let ms = self.last_relay_rx_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if ms == 0 { return None; }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        Some(Duration::from_millis(now.saturating_sub(ms)))
+    }
+
+    fn mark_relay_rx(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        self.last_relay_rx_ms.store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 接收线程把中继控制面应答投递给请求方（有界，最多保留 8 条）。
+    pub fn push_control_ack(&self, pkt_type: u8, payload: Vec<u8>) {
+        let mut q = self.control_acks.lock().unwrap();
+        if q.len() >= 8 {
+            q.remove(0);
+        }
+        q.push((pkt_type, payload));
+    }
+
+    /// 取走一条指定类型的控制面应答（请求方自己的，先到先得）。
+    pub fn take_control_ack(&self, pkt_type: u8) -> Option<Vec<u8>> {
+        let mut q = self.control_acks.lock().unwrap();
+        let idx = q.iter().position(|(t, _)| *t == pkt_type)?;
+        Some(q.remove(idx).1)
+    }
+
+    /// `A_lookup_peer`：从**已注册的共享 socket**发 LOOKUP。
+    /// 中继的零放大纪律只回答已注册源地址，所以不能用临时端口——
+    /// 旧的 `lookup_peer()` 用临时 socket，在本仓 relay 上永远拿不到应答。
+    pub fn request_lookup(&self, peer_id: u32) {
+        let packet = build_packet(PacketType::Lookup, peer_id, &[]);
+        let _ = self.socket.send_to(&packet, self.relay_addr);
+    }
+
+    /// 判读 `take_control_ack(PKT_LOOKUP_ACK)` 的 payload（"ip:port" 或 "offline"）
+    pub fn parse_lookup_ack(payload: &[u8]) -> Option<SocketAddr> {
+        std::str::from_utf8(payload).ok()?.trim().parse().ok()
+    }
+
+    /// 给会写映射的包（Register/Keepalive）附加 32 字节鉴权 token
+    fn with_token(&self, payload: &[u8]) -> Vec<u8> {
+        match &self.relay_token {
+            Some(t) => {
+                let mut v = Vec::with_capacity(payload.len() + 32);
+                v.extend_from_slice(payload);
+                v.extend_from_slice(t);
+                v
+            }
+            None => payload.to_vec(),
+        }
+    }
+
+    pub fn is_encrypted(&self) -> bool { self.crypto.is_some() }
+
+    /// 构造注册包（签名优先，过期回退 legacy token）。
+    fn registration_packet(&self) -> Vec<u8> {
+        let cred_payload: Option<Vec<u8>> = {
+            let cred = REGISTER_CRED
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .unwrap()
+                .clone();
+            match cred {
+                Some((did, ts, sig)) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    if (now - ts).abs() < 250_000 {
+                        let mut p = Vec::new();
+                        p.extend_from_slice(did.as_bytes());
+                        p.push(0);
+                        p.extend_from_slice(ts.to_string().as_bytes());
+                        p.push(0);
+                        p.extend_from_slice(sig.as_bytes());
+                        p.push(0);
+                        Some(p)
+                    } else {
+                        println!("[REG] 签名凭据已过期（ts={}，请宿主层重推），回退 legacy", ts);
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        let (pkt_type, auth) = match &cred_payload {
+            Some(p) => (PacketType::RegisterSigned, p.clone()),
+            None => (PacketType::Register, self.with_token(&[])),
+        };
+        build_packet(pkt_type, self.my_peer_id, &auth)
+    }
+
+    /// 周期续租：只发注册，不等待 ACK、不消费其他数据包。
+    /// relay 服务重启导致映射全丢时，下一次续租即可在新进程里重建映射。
+    pub fn renew_registration(&self) {
+        let packet = self.registration_packet();
+        let _ = self.socket.send_to(&packet, self.relay_addr);
+    }
+
+    /// 向中继注册，并**等待 REGISTER_ACK 确认**。
+    ///
+    /// 原实现只发不确认，导致三类失败全部静默：
+    ///   1. 中继 token 不匹配（C 中继直接丢弃）
+    ///   2. 源 IP 不在中继的安全组/防火墙白名单（包到不了中继）
+    ///   3. 中继未启动
+    /// 注销（DSH 2026-11-10 建议）：通知 relay 立即删除本 peer 条目。
+    /// 旧 relay 不认识 type 11 会忽略（无害）；新 relay 收到后即时清理，
+    /// 不用等 TTL 过期。Connection::stop() 自动调用。
+    pub fn unregister(&self) {
+        let pkt = build_packet(PacketType::Unregister, self.my_peer_id, &[]);
+        let _ = self.socket.send_to(&pkt, self.relay_addr);
+    }
+
+    /// 三种情况客户端都会打印 "Registered"，然后 candidates=0、永远打不通——
+    /// 2026-11-04 夜里为此排查了数小时。必须确认。
+    pub fn register(&self) -> anyhow::Result<()> {
+        // 必须用**共享 socket**收发：中继记录的对端地址是本包的源地址，
+        // 若用临时 socket 注册，中继记下的就是那个临时端口，对端永远打不通。
+        // 这里临时切到阻塞+超时窗口收 ACK，收完立刻恢复非阻塞（此时还没起业务线程）。
+        let packet = self.registration_packet();
+        self.socket.set_read_timeout(Some(Duration::from_millis(300)))?;
+        self.socket.send_to(&packet, self.relay_addr)?;
+
+        let mut buf = [0u8; 512];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match self.socket.recv_from(&mut buf) {
+                Ok((len, _)) => {
+                    if let Some((PacketType::RegisterAck, _, _)) = parse_packet(&buf[..len]) {
+                        self.socket.set_nonblocking(true).ok();
+                        if !quiet() {
+            println!("Registered to relay {} as peer {}", self.relay_addr, self.my_peer_id);
+        }
+                        return Ok(());
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => { continue; }
+                Err(_) => break,
+            }
+        }
+        self.socket.set_nonblocking(true).ok();
+
+        anyhow::bail!(
+            "中继注册失败：{} 在 3 秒内没有回 REGISTER_ACK。\n             请依次排查：\n             1) 本机公网出口 IP 是否在中继的安全组/防火墙白名单里（运营商 CGN 每次换网都会变）；\n             2) --secret 算出的 token 是否与中继侧配置一致（不一致时 C 中继直接丢弃，不回任何包）；\n             3) 中继服务是否在跑（对端 UDP 端口是否可达）。",
+            self.relay_addr
+        )
+    }
+
+    /// 通告自己的 IPv6 地址（让对端可以直连）
+    pub fn announce_ipv6(&self, ipv6: &str) -> anyhow::Result<()> {
+        let payload = format!("v6={}", ipv6);
+        let packet = build_packet(PacketType::Announce, self.my_peer_id, payload.as_bytes());
+        self.socket.send_to(&packet, self.relay_addr)?;
+        println!("Announced IPv6 {} to relay", ipv6);
+        Ok(())
+    }
+
+    /// 通告自己的公网 IPv4 地址
+    pub fn announce_ipv4(&self, ipv4: &str) -> anyhow::Result<()> {
+        let payload = format!("v4={}", ipv4);
+        let packet = build_packet(PacketType::Announce, self.my_peer_id, payload.as_bytes());
+        self.socket.send_to(&packet, self.relay_addr)?;
+        Ok(())
+    }
+
+    /// 通告自己的网络能力画像（NetStatus v2：NAT 类型/防火墙/接口成本）
+    /// 对端通过 PEERINFO 拿到后，可基于状态组合选择连接策略
+    pub fn announce_netstatus(&self, ns_str: &str) -> anyhow::Result<()> {
+        // 画像原文含空格和竖线（"v=3 nat=EIM|meas ..."），而 relay 按 | 分段、
+        // PeerInfo 也用 | 拼字段。必须在发送前转义：空格→逗号、|→/，
+        // 否则画像被 split('|') 切碎、只存到第一段（实测 ns=v=5,nat=EIM 后全丢）。
+        let escaped = ns_str.trim().replace('|', "/").replace(' ', ",");
+        let payload = format!("ns={}", escaped);
+        let packet = build_packet(PacketType::Announce, self.my_peer_id, payload.as_bytes());
+        self.socket.send_to(&packet, self.relay_addr)?;
+        Ok(())
+    }
+
+    pub fn send_to_peer(&self, peer_id: u32, data: &[u8]) -> anyhow::Result<()> {
+        // 端到端加密：只加密业务数据，peer_id 仍明文供中继路由。
+        // 中继转发的是密文，它看不到内容，也无法篡改（GCM 会验签失败）。
+        let body: Vec<u8> = match &self.crypto {
+            Some(c) => c.lock().unwrap().encrypt(data),
+            None => data.to_vec(),
+        };
+        let mut payload = Vec::with_capacity(4 + body.len());
+        payload.extend_from_slice(&self.my_peer_id.to_be_bytes());
+        payload.extend_from_slice(&body);
+        let packet = build_packet(PacketType::Data, peer_id, &payload);
+        self.socket.send_to(&packet, self.relay_addr)?;
+        Ok(())
+    }
+
+    /// 解密收到的中继数据体（无加密时原样返回）
+    fn open_body(&self, body: Vec<u8>) -> Option<Vec<u8>> {
+        match &self.crypto {
+            Some(c) => c.lock().unwrap().decrypt(&body),
+            None => Some(body),
+        }
+    }
+
+    /// 加密任意业务数据（P2P 直连路径也用同一套会话密钥）
+    pub fn seal(&self, data: &[u8]) -> Vec<u8> {
+        match &self.crypto {
+            Some(c) => c.lock().unwrap().encrypt(data),
+            None => data.to_vec(),
+        }
+    }
+
+    /// 供 TunnelStream 复用同一套端到端加密
+    pub fn crypto_arc(&self) -> Option<Arc<Mutex<SessionCrypto>>> {
+        self.crypto.clone()
+    }
+
+    /// 供 PunchEngine 等外部模块复用同一套探测签名
+    pub fn probe_auth_clone(&self) -> Option<crate::crypto::ProbeAuth> {
+        self.probe_auth.clone()
+    }
+
+    /// 给探测包附加 HMAC（无 secret 时原样返回）
+    pub fn sign_probe(&self, packet: &[u8]) -> Vec<u8> {
+        match &self.probe_auth {
+            Some(a) => a.sign_probe(packet),
+            None => packet.to_vec(),
+        }
+    }
+
+    /// 校验探测包 HMAC 并返回去掉签名后的包体；
+    /// 校验失败返回 None（应直接丢弃，防止伪造探测包触发放大/反射）。
+    pub fn verify_probe<'a>(&self, data: &'a [u8]) -> Option<&'a [u8]> {
+        match &self.probe_auth {
+            Some(a) => a.verify_probe(data),
+            None => Some(data),
+        }
+    }
+
+    /// 解密业务数据；解密失败返回 None（应丢弃，不可当明文用）
+    pub fn unseal(&self, data: &[u8]) -> Option<Vec<u8>> {
+        match &self.crypto {
+            Some(c) => c.lock().unwrap().decrypt(data),
+            None => Some(data.to_vec()),
+        }
+    }
+
+    pub fn try_recv(&self) -> Option<(u32, Vec<u8>)> {
+        match self.try_recv_kind() {
+            RecvKind::RelayData(id, payload) => Some((id, payload)),
+            RecvKind::RelayAck(t, p) => {
+                self.push_control_ack(t, p);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// 分类接收：中继数据 / P2P 数据 / 探测响应
+    pub fn try_recv_kind(&self) -> RecvKind {
+        let mut buf = [0u8; 65536];
+        match self.socket.recv_from(&mut buf) {
+            Ok((len, remote)) => {
+                self.mark_relay_rx();
+                if len >= 4 {
+                    let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+
+                    // 探测包
+                    if magic == crate::probe::PROBE_MAGIC {
+                        // 先验 HMAC 再去解析；验不过直接丢弃
+                        let body = match self.verify_probe(&buf[..len]) {
+                            Some(b) => b,
+                            None => return RecvKind::Ignored,
+                        };
+                        if let Some((ptype, nonce, ts)) = crate::probe::parse_probe_full(body) {
+                            if ptype == crate::probe::PROBE_TYPE_REQUEST {
+                                // 对端敲门 → 回显 nonce/ts 回复（供对端算 RTT）
+                                let reply = self.sign_probe(&crate::probe::build_probe_reply(nonce, ts));
+                                let _ = self.socket.send_to(&reply, remote);
+                                return RecvKind::PeerProbe(remote);
+                            } else {
+                                // 我方探测的回复 → 算 RTT，双向确认
+                                let rtt = crate::probe::rtt_us_from(ts);
+                                println!("  [P2P-RTT] probe reply from {} rtt={:.2}ms", remote, rtt as f64 / 1000.0);
+                                return RecvKind::ProbeReply(remote);
+                            }
+                        }
+                        return RecvKind::Ignored;
+                    }
+
+                    // 中继包
+                    if magic == 0x564E524C {
+                        if let Some((pkt_type, sender_id, payload)) = parse_packet(&buf[..len]) {
+                            if pkt_type == PacketType::Data {
+                                // 解密业务数据；解密失败（密钥不符/被篡改）则丢弃
+                                let opened = self.open_body(payload.to_vec());
+                                {
+                                    use std::sync::atomic::{AtomicU64, Ordering as OD};
+                                    static DBG_PKT: AtomicU64 = AtomicU64::new(0);
+                                    let k = DBG_PKT.fetch_add(1, OD::Relaxed);
+                                    if k < 12 {
+                                        println!("  [DBG-PKT] data#{} peer={} cipher={}B opened={}",
+                                            k, sender_id, payload.len(), opened.as_ref().map(|p| p.len()).unwrap_or(0));
+                                    }
+                                }
+                                return match opened {
+                                    Some(plain) => RecvKind::RelayData(sender_id, plain),
+                                    None => RecvKind::Ignored,
+                                };
+                            }
+                            // 控制面应答交回请求方判读（LOOKUP/PEERINFO/REGISTER_ACK）
+                            return RecvKind::RelayAck(pkt_type as u8, payload.to_vec());
+                        }
+                        return RecvKind::Ignored;
+                    }
+                }
+
+                // 未知 magic = P2P 直连数据
+                RecvKind::P2pData(remote, buf[..len].to_vec())
+            }
+            Err(_) => RecvKind::Ignored,
+        }
+    }
+
+    pub fn keepalive(&self) {
+        let auth = self.with_token(&[]);
+        let packet = build_packet(PacketType::Keepalive, self.my_peer_id, &auth);
+        let _ = self.socket.send_to(&packet, self.relay_addr);
+    }
+
+    /// 从中继通信的同一个 socket 直接发包到任意地址
+    /// 关键用途：P2P 打洞（保持 NAT 映射一致）
+    pub fn send_raw_to(&self, data: &[u8], target: SocketAddr) {
+        let _ = self.socket.send_to(data, target);
+    }
+
+    /// 在 relay socket 上检查探测包（P2P hole punch 响应）
+    /// 区分探测包（VNET magic）和 relay 包（VNRL magic）
+    /// 如果收到探测包：自动回复探测响应，返回 Some(remote_addr)
+    pub fn check_probe_on_relay_socket(&self) -> Option<SocketAddr> {
+        let mut buf = [0u8; 65536];
+        // 非阻塞收一个包
+        match self.socket.recv_from(&mut buf) {
+            Ok((len, remote)) => {
+                if len >= 4 {
+                    let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    if magic == crate::probe::PROBE_MAGIC {
+                        // 这是探测包！回复探测响应
+                        if crate::probe::parse_probe_packet(&buf[..len]).is_some() {
+                            let reply = self.sign_probe(&crate::probe::build_probe_packet(0));
+                            let _ = self.socket.send_to(&reply, remote);
+                            return Some(remote);
+                        }
+                    }
+                    // 如果是 relay 包（VNRL magic），放回去不可能（UDP 没有放回）
+                    // 但可以解析后返回 None，让调用方知道这不是探测包
+                    // 代价：这个 relay 包被消费了（丢数据风险）
+                }
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// 获取中继通信 socket 的本地绑定地址
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.socket.local_addr().ok()
+    }
+
+    /// 获取共享 socket 的 Arc 句柄（用于 IPv4 P2P 直发）
+    pub fn shared_socket(&self) -> Arc<UdpSocket> {
+        self.socket.clone()
+    }
+
+    /// 查询 peer 的完整信息（中继地址 + IPv6 地址）
+    /// 使用独立 socket，不干扰共享 relay socket
+    pub fn query_peer_info(&self, peer_id: u32) -> Option<(SocketAddr, Option<SocketAddr>, Option<SocketAddr>)> {
+        let packet = build_packet(PacketType::PeerInfo, peer_id, &[]);
+
+        // 用独立临时 socket
+        let tmp = UdpSocket::bind("0.0.0.0:0").ok()?;
+        tmp.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+
+        if tmp.send_to(&packet, self.relay_addr).is_err() {
+            return None;
+        }
+
+        let mut buf = [0u8; 1024];
+        let mut result: Option<(SocketAddr, Option<SocketAddr>, Option<SocketAddr>)> = None;
+        if let Ok((len, _)) = tmp.recv_from(&mut buf) {
+            if let Some((PacketType::PeerInfoAck, _, payload)) = parse_packet(&buf[..len]) {
+                if let Ok(info_str) = std::str::from_utf8(payload) {
+                    if let Some(info) = deserialize_peer_info(info_str) {
+                        // 对端 NetStatus 画像写入旁路缓存，供 remote_net_status 消费
+                        if let Some(ns) = info.netstatus {
+                            netstatus_cache().lock().unwrap().insert(peer_id, ns);
+                        }
+                        result = Some((info.relay_addr, info.ipv6_addr, info.public_ipv4));
+                    }
+                }
+            }
+        }
+
+        // ---- 候选注入合并（整合接口，见文件下方 pub 函数）----
+        // 注入候选优先占据 v4/v6 槽位（LAN 地址、p2p_server reflexive 等来自
+        // myco 层的 presence 数据）。中继观察地址保留为兜底候选；中继查询
+        // 失败但存在注入时仍返回 Some——presence 可以完全替代中继发现。
+        if let Some(cands) = peer_candidates(peer_id) {
+            let ov_v6 = cands.iter().find(|a| a.is_ipv6()).copied();
+            let ov_v4 = cands.iter().find(|a| a.is_ipv4()).copied();
+            match result {
+                Some((relay_addr, _, _)) => {
+                    result = Some((relay_addr, ov_v6, ov_v4));
+                }
+                None => {
+                    let fill = ov_v4
+                        .or(ov_v6)
+                        .or_else(|| cands.first().copied())?;
+                    result = Some((fill, ov_v6, ov_v4));
+                }
+            }
+        }
+        result
+    }
+
+    /// 查询 peer 是否在线
+    /// 使用独立 socket，不干扰共享 relay socket 的非阻塞模式
+    pub fn lookup_peer(&self, peer_id: u32) -> Option<SocketAddr> {
+        let packet = build_packet(PacketType::Lookup, peer_id, &[]);
+
+        // 用独立临时 socket，避免改变共享 socket 的阻塞模式
+        let tmp = UdpSocket::bind("0.0.0.0:0").ok()?;
+        tmp.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+
+        if tmp.send_to(&packet, self.relay_addr).is_err() {
+            return None;
+        }
+
+        let mut buf = [0u8; 256];
+        if let Ok((len, _)) = tmp.recv_from(&mut buf) {
+            if let Some((PacketType::LookupAck, _, payload)) = parse_packet(&buf[..len]) {
+                if let Ok(addr_str) = std::str::from_utf8(payload) {
+                    return addr_str.parse().ok();
+                }
+            }
+        }
+        None
+    }
+}
+
+// ==================== 签名注册凭据（宿主层注入） ====================
+// 私钥永远留在 myco 身份层：宿主用设备私钥对 `${did}\n${ts}\nrelay-register`
+// 签名后，把 (did, ts, sig_b64) 推进来；vnet 只负责附包与新鲜度判断。
+// 宿主应每 ~200 秒重推一次（凭据 ts 距今 >250s 时客户端自动回退 legacy 路径）。
+
+static REGISTER_CRED: std::sync::OnceLock<
+    std::sync::Mutex<Option<(String, i64, String)>>,
+> = std::sync::OnceLock::new();
+
+/// 注入签名注册凭据（did、秒级时间戳、base64 的 Ed25519 签名）
+pub fn set_register_credentials(did: &str, ts: i64, sig_b64: &str) {
+    *REGISTER_CRED
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap() = Some((did.to_string(), ts, sig_b64.to_string()));
+}
+
+/// 清除凭据（回退 legacy token 路径）
+pub fn clear_register_credentials() {
+    *REGISTER_CRED
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap() = None;
+}
+
+/// 当前凭据的 ts（宿主层判断是否需要重推；None = 未注入）
+pub fn register_credentials_ts() -> Option<i64> {
+    REGISTER_CRED
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(_, ts, _)| *ts)
+}
+
+// ==================== 候选注入接口（myco 整合层用） ====================
+// 设计：myco 层从 p2p_server presence 拿到对端候选（LAN/公网/v6/reflexive），
+// 经 set_peer_candidates_override 灌入；query_peer_info 的 v4/v6 槽位会被
+// 注入候选覆盖（中继观察地址保留兜底），全部现有消费点（打洞线程/探测线程/
+// 打洞引擎）自动生效，核心逻辑零改动。
+// announce_extra 记录本机额外候选（如 LAN 地址），myco 读取后经 presence 发布。
+
+/// 探测包可观测计数（诊断"listen_rx 收到的到底是什么"）：
+/// REQUEST=对端敲门、REPLY=对端回我们的探测、VERIFY_FAIL=签名不过/格式坏被丢
+pub static PROBE_REQ_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROBE_REPLY_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROBE_VERIFY_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+static PEER_CANDIDATES_OVERRIDE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<u32, Vec<SocketAddr>>>,
+> = std::sync::OnceLock::new();
+static ANNOUNCED_EXTRAS: std::sync::OnceLock<std::sync::Mutex<Vec<SocketAddr>>> =
+    std::sync::OnceLock::new();
+
+fn override_map() -> &'static std::sync::Mutex<std::collections::HashMap<u32, Vec<SocketAddr>>> {
+    PEER_CANDIDATES_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 注入某对端的候选地址列表（来自 p2p_server presence / record_reflexive_observation）
+pub fn set_peer_candidates_override(peer_id: u32, cands: Vec<SocketAddr>) {
+    override_map().lock().unwrap().insert(peer_id, cands);
+}
+
+/// 批量注入：整张 presence 表一次性灌入（替换式）
+pub fn set_all_peer_candidates(map: std::collections::HashMap<u32, Vec<SocketAddr>>) {
+    *override_map().lock().unwrap() = map;
+}
+
+/// 读取某对端的注入候选（整合层需要完整列表时用，比 query_peer_info 的
+/// 三元组槽位能携带更多候选）
+pub fn peer_candidates(peer_id: u32) -> Option<Vec<SocketAddr>> {
+    override_map().lock().unwrap().get(&peer_id).cloned()
+}
+
+/// 清空注入（测试 / presence 重灌前用）
+pub fn clear_peer_candidates_override() {
+    override_map().lock().unwrap().clear();
+}
+
+/// 静默开关（CLI 的 `probe-relay --json` 用）：只影响提示性 println，不影响协议行为。
+impl RelayClient {
+    /// 记录本机额外候选（LAN 地址等）。C 中继协议只存一个 v4/v6 槽，
+    /// 追加候选由 myco 层经 take_announced_extras 读取后发布进 presence。
+    pub fn announce_extra(&self, extras: &[SocketAddr]) {
+        let mut v = ANNOUNCED_EXTRAS
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap();
+        for a in extras {
+            if !v.contains(a) {
+                v.push(*a);
+            }
+        }
+    }
+}
+
+/// myco 层读取本机追加候选（发布进 presence 用），读取后清空
+pub fn take_announced_extras() -> Vec<SocketAddr> {
+    std::mem::take(
+        &mut *ANNOUNCED_EXTRAS
+            .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+            .lock()
+            .unwrap(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_candidate_override_registry() {
+        clear_peer_candidates_override();
+        assert!(peer_candidates(777).is_none());
+        let cands: Vec<SocketAddr> = vec![
+            "192.168.1.50:9100".parse().unwrap(),
+            "[3fff:390:9a8:6d00::5]:9100".parse().unwrap(),
+        ];
+        set_peer_candidates_override(777, cands.clone());
+        let got = peer_candidates(777).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got[0].is_ipv4() && got[1].is_ipv6());
+        clear_peer_candidates_override();
+        assert!(peer_candidates(777).is_none());
+    }
+
+    #[test]
+    fn test_announced_extras_take() {
+        let a: SocketAddr = "192.168.1.60:9100".parse().unwrap();
+        // 清掉再放，保证断言稳定
+        let _ = take_announced_extras();
+        let rc = RelayClient::new("127.0.0.1:1", 1).unwrap();
+        rc.announce_extra(&[a]);
+        rc.announce_extra(&[a]); // 去重
+        let taken = take_announced_extras();
+        assert_eq!(taken, vec![a]);
+        assert!(take_announced_extras().is_empty()); // 取走即清
+    }
+
+    #[test]
+    fn test_packet_roundtrip() {
+        let packet = build_packet(PacketType::Data, 12345, b"hello");
+        let (pkt_type, peer_id, payload) = parse_packet(&packet).unwrap();
+        assert_eq!(pkt_type, PacketType::Data);
+        assert_eq!(peer_id, 12345);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn test_peer_info_serialize() {
+        let info = PeerFullInfo {
+            relay_addr: "1.2.3.4:5000".parse().unwrap(),
+            ipv6_addr: Some("[::1]:9100".parse().unwrap()),
+            public_ipv4: None,
+            netstatus: None,
+            last_seen: Instant::now(),
+        };
+        let s = serialize_peer_info(&info);
+        assert!(s.contains("relay=1.2.3.4:5000"));
+        assert!(s.contains("v6=[::1]:9100"));
+
+        let parsed = deserialize_peer_info(&s).unwrap();
+        assert_eq!(parsed.relay_addr, info.relay_addr);
+        assert_eq!(parsed.ipv6_addr, info.ipv6_addr);
+    }
+
+    /// NetStatus 画像经 relay 存转的 roundtrip：含空格和竖线的 announce_extra
+    /// 必须在 serialize/deserialize 后逐字还原（否则对端画像解析出错）。
+    #[test]
+    fn test_peer_info_netstatus_roundtrip() {
+        let mut ns = crate::netstatus::NetStatus::default();
+        ns.version = 3; // parse_announce_extra 拒绝 version=0（无版本=格式错）
+        let extra = ns.to_announce_extra(); // 含空格 + 竖线
+        let info = PeerFullInfo {
+            relay_addr: "5.6.7.8:9000".parse().unwrap(),
+            ipv6_addr: None,
+            public_ipv4: None,
+            netstatus: Some(extra.clone()),
+            last_seen: Instant::now(),
+        };
+        let s = serialize_peer_info(&info);
+        // 序列化后不得再有裸空格或竖线把字段打散
+        assert!(!s.split('|').any(|p| p.starts_with("ns=") && p.contains(' ')),
+            "ns 段含未转义空格会污染 split('|')");
+        let parsed = deserialize_peer_info(&s).unwrap();
+        assert_eq!(parsed.netstatus.as_deref(), Some(extra.as_str()),
+            "NetStatus 画像 roundtrip 后必须逐字一致");
+        // 且能被 parse_announce_extra 正常解析
+        let restored = crate::netstatus::NetStatus::parse_announce_extra(&extra, 0);
+        assert!(restored.is_some(), "roundtrip 后的画像应可解析");
+        assert_eq!(restored.unwrap().version, 3);
+    }
+}

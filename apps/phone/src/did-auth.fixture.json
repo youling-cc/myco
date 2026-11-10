@@ -1,0 +1,71 @@
+{
+  "comment": "X-Did-Auth 跨语言对拍 fixture：pynacl（服务端验签同库）签名 ↔ JS @noble/ed25519。Ed25519 确定性 ⇒ 同 seed+msg 双侧签名必须字节级一致。生成：scripts/gen-did-auth-fixture.py",
+  "generated": "2026-09-26T10:49:19+00:00",
+  "crossVerified": true,
+  "vectors": [
+    {
+      "name": "rfc8032-test1-seed",
+      "seedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "did": "did:youling:FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z",
+      "ts": "1750000000",
+      "body": "{\"data\":\"{\\\"recognizeId\\\":\\\"r-2049\\\",\\\"skuList\\\":[{\\\"skuId\\\":\\\"88\\\",\\\"name\\\":\\\"cola\\\"}]}\"}",
+      "msgB64": "ZGlkOnlvdWxpbmc6RlZlbjNYNjY5eEx6c2k2TjJWOTFEb2l5ekh6ZzF1QWdxaVQ4alo5blM5NloKMTc1MDAwMDAwMAp7ImRhdGEiOiJ7XCJyZWNvZ25pemVJZFwiOlwici0yMDQ5XCIsXCJza3VMaXN0XCI6W3tcInNrdUlkXCI6XCI4OFwiLFwibmFtZVwiOlwiY29sYVwifV19In0=",
+      "sigB64": "/Q8aZxMkYICk5Mgcj9NeJg84CHXWH/er7US0Quht2NnChVsz4FpbycnX+gDvIYO/lKosBUpHrclo5gzg3J3FBg=="
+    },
+    {
+      "name": "chinese-body",
+      "seedHex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "did": "did:youling:586Z7H2vpX9qNhN2T4e9Utugie3ogjbxzGaMtM3E6HR5",
+      "ts": "1750000000",
+      "body": "{\"data\":\"{\\\"shopName\\\":\\\"路口便利店\\\",\\\"note\\\":\\\"三号货架·顶层\"}\",\"extra\":null}",
+      "msgB64": "ZGlkOnlvdWxpbmc6NTg2WjdIMnZwWDlxTmhOMlQ0ZTlVdHVnaWUzb2dqYnh6R2FNdE0zRTZIUjUKMTc1MDAwMDAwMAp7ImRhdGEiOiJ7XCJzaG9wTmFtZVwiOlwi6Lev5Y+j5L6/5Yip5bqXXCIsXCJub3RlXCI6XCLkuInlj7fotKfmnrbCt+mhtuWxgiJ9IiwiZXh0cmEiOm51bGx9",
+      "sigB64": "mMBVJxvwsohmGgU1uILRPAn0Rkk6CU8ed17QP62jJJIEkD3YcwlxFN4dBdWnEjsl1IHPSnojQAxkwly+7YKyDw=="
+    },
+    {
+      "name": "myco-device-did",
+      "seedHex": "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+      "did": "did:myco:Hyx62wPQGyvXCoihZq1BrbUjBRh2LuNxWiiqMkfAuSZr",
+      "ts": "1750000000",
+      "body": "{\"taskId\":\"t-77\",\"answer\":{\"skuId\":\"88\",\"confidence\":0.93},\"ok\":true}",
+      "msgB64": "ZGlkOm15Y286SHl4NjJ3UFFHeXZYQ29paFpxMUJyYlVqQlJoMkx1TnhXaWlxTWtmQXVTWnIKMTc1MDAwMDAwMAp7InRhc2tJZCI6InQtNzciLCJhbnN3ZXIiOnsic2t1SWQiOiI4OCIsImNvbmZpZGVuY2UiOjAuOTN9LCJvayI6dHJ1ZX0=",
+      "sigB64": "SRZF9ejslvHor+10EoWuZQXNMgXn4kJMErHFkVW4GRuSx7srBJwBwz96Oy4qcqyqScF+uBa+Dn4glZiyOwdhAQ=="
+    }
+  ],
+  "canonicalJson": [
+    {
+      "name": "nested-sorted",
+      "obj": {
+        "data": "{\"recognizeId\":\"r-1\"}",
+        "zz": 1,
+        "aa": [
+          3,
+          1,
+          2
+        ],
+        "mid": {
+          "b": true,
+          "a": null,
+          "中文键": "值"
+        }
+      },
+      "expected": "{\"aa\":[3,1,2],\"data\":\"{\\\"recognizeId\\\":\\\"r-1\\\"}\",\"mid\":{\"a\":null,\"b\":true,\"中文键\":\"值\"},\"zz\":1}"
+    },
+    {
+      "name": "unicode-preserved",
+      "obj": {
+        "店铺": "路口便利店",
+        "items": [
+          {
+            "sku": "可乐 330ml",
+            "n": 2
+          },
+          {
+            "sku": "薯片",
+            "n": 1
+          }
+        ]
+      },
+      "expected": "{\"items\":[{\"n\":2,\"sku\":\"可乐 330ml\"},{\"n\":1,\"sku\":\"薯片\"}],\"店铺\":\"路口便利店\"}"
+    }
+  ]
+}
