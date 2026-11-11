@@ -53,6 +53,20 @@ export const DEFAULT_STATE_FILE = () => {
 /** First port to try when the state file has no live candidate. */
 export const DEFAULT_BASE_PORT = 17878;
 
+/**
+ * Default persistent policy table (`~/.dsh/web-proxy-policy.json`).
+ *
+ * 2026-11-11 用户裁决：**授权表绝不能因插件/宿主重启而丢失**，且"表为空"必须
+ * fail-closed（503），不能回退放行。写穿落盘（原子 tmp+rename）+ 启动加载，
+ * 让"重启后仍按原授权执行"成为默认行为。
+ *
+ * @returns absolute path.
+ */
+export function DEFAULT_POLICY_STATE_FILE() {
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? ".";
+  return `${home}\\.dsh\\web-proxy-policy.json`;
+}
+
 /** How far past `basePort` the acquisition walk may go. */
 export const MAX_PORT_ATTEMPTS = 200;
 
@@ -482,7 +496,16 @@ export async function startWebListener(options = {}) {
 export async function startProxySuite(options = {}) {
   const log = typeof options.log === "function" ? options.log : () => {};
   const key = options.controlKey ?? await ensureControlKey(options.keyPath);
-  const store = options.store ?? new PolicyStore();
+  // 持久化路径**只由插件入口显式传入**（index.js → DEFAULT_POLICY_STATE_FILE()）。
+  // 默认 undefined = 不落盘：测试/临时 suite 永远不会碰到生产的
+  // ~/.dsh/web-proxy-policy.json（2026-11-11 真案：测试把 AAAA/BBBB 写进了生产文件）。
+  const store = options.store ?? new PolicyStore({
+    statePath: options.policyStatePath,
+    log,
+  });
+  if (typeof store.load === "function" && store.loaded !== true) {
+    await store.load();
+  }
   // 连接级身份（2026-11-10）：网关把 x-myco-viewer 头带进来时，按连接查策略——
   // **owner 口同样生效**（owner 口没有口级策略，但带头时按该 viewer 执行 P/A+署名）。
   // 这让「网关统一转发到状态文件的 port（17879）」也能正确归属，无需先改分口路由。
@@ -504,6 +527,8 @@ export async function startProxySuite(options = {}) {
       return undefined;
     },
     lookup: (did) => store.viewers.get(did),
+    hasAnyPolicy: () => store.viewers.size > 0,
+    keys: () => [...store.viewers.keys()],
     require: options.requireViewerHeader === true,
   };
   const owner = await startWebListener({ ...options, connection: { ...connection, require: false } });
@@ -526,8 +551,10 @@ export async function startProxySuite(options = {}) {
       const viewerDid = String(body.viewerDid);
       // openPort: 分口已删除（2026-11-10）——字段接受但忽略，不返回 port。
       if (body.closePort === true) {
-        // 撤销：删策略条目即生效（连接级身份查不到 entry → 回退口级/拒绝）。
+        // 撤销：删策略条目即生效（连接级身份查不到 entry → 拒绝）。
+        // 必须写穿落盘，否则重启后撤销失效（2026-11-11 持久化测试抓到）。
         store.viewers.delete(viewerDid);
+        if (typeof store.persist === "function") await store.persist();
         log(`web-listener: policy revoked for ${viewerDid} (closePort)`);
         send(200, { ok: true, viewerDid, closedPort: null });
         return;
@@ -572,6 +599,27 @@ export async function startProxySuite(options = {}) {
     log(`web-listener: state rewrite with controlPort failed (${String(error?.message ?? error)})`);
   }
 
+  // 内存/连接诊断（2026-11-11 host 4GB OOM 事故）：每 60s 记一行，崩前有据可查。
+  // 只读 process.memoryUsage() 与 owner 的 sockets 计数，零额外内存。
+  const diagTimer = setInterval(() => {
+    try {
+      const mem = process.memoryUsage();
+      const sockets = typeof owner.server?.getConnections === "function"
+        ? undefined
+        : undefined;
+      // arrayBuffers 是 Buffer/ArrayBuffer 的 native 占用（不进 heapUsed）——
+      // 2026-11-12 OOM 现场 RSS(2.9G) ≫ heapUsed(1.3G)+external(66M)，缺口在 native，
+      // 这条字段是把它单独量出来的关键。
+      log(`web-listener: diag rss=${Math.round(mem.rss / 1048576)}MB `
+        + `heapUsed=${Math.round(mem.heapUsed / 1048576)}MB `
+        + `heapTotal=${Math.round(mem.heapTotal / 1048576)}MB `
+        + `external=${Math.round(mem.external / 1048576)}MB `
+        + `arrayBuffers=${Math.round((mem.arrayBuffers ?? 0) / 1048576)}MB `
+        + `viewers=${store.viewers.size} pid=${process.pid}`);
+    } catch { /* diagnostics must never break the listener */ }
+  }, 60_000);
+  diagTimer.unref?.();
+
   return {
     started: true,
     owner,
@@ -579,6 +627,7 @@ export async function startProxySuite(options = {}) {
     controlPort,
     store,
     close: () => {
+      clearInterval(diagTimer);
       control.close();
       owner.close();
     },
@@ -655,6 +704,15 @@ function createProxyServer(upstream, authority, mint, resolvePolicy, log, connec
  *
  * @returns `{policy, rejected}` — rejected=true when strict mode demands an identity.
  */
+/** Best-effort list of policy keys for diagnostic logging. */
+function storeViewers(connection) {
+  try {
+    return typeof connection?.keys === "function" ? connection.keys() : [];
+  } catch {
+    return [];
+  }
+}
+
 function resolveConnectionPolicy(request, resolvePolicy, connection) {
   const portPolicy = resolvePolicy();
   if (connection === undefined) return { policy: portPolicy, rejected: false };
@@ -662,11 +720,15 @@ function resolveConnectionPolicy(request, resolvePolicy, connection) {
   if (did !== undefined) {
     const byDid = connection.lookup(did);
     if (byDid !== undefined) return { policy: byDid, rejected: false };
-    // 有效身份但查不到策略 = 未授权/已撤销 → 拒绝（不能回退口级，
-    // 否则 closePort 撤销后 owner 口无策略=全放行，撤销形同虚设）。
-    return { policy: undefined, rejected: true };
+    // 2026-11-11 用户裁决（零容忍）：**授权未就绪也必须拒绝**，绝不放行。
+    // 表空 = 控制面尚未下发（全新安装或尚未推全量）→ 503（服务未就绪，非"无权限"）；
+    // 表非空但缺该 DID = 未授权/已撤销 → 403。
+    if (typeof connection.hasAnyPolicy === "function" && connection.hasAnyPolicy() === false) {
+      return { policy: undefined, rejected: true, status: 503, reason: "authorization-not-ready" };
+    }
+    return { policy: undefined, rejected: true, status: 403, reason: `policy-missing:${did}` };
   }
-  if (connection.require === true && portPolicy !== undefined) return { policy: portPolicy, rejected: true };
+  if (connection.require === true && portPolicy !== undefined) return { policy: portPolicy, rejected: true, reason: "identity-required" };
   return { policy: portPolicy, rejected: false };
 }
 
@@ -686,9 +748,16 @@ function resolveConnectionPolicy(request, resolvePolicy, connection) {
 function proxyHttpRequest(request, response, upstream, authority, mint, log, resolvePolicy = () => undefined, connection = undefined) {
   const resolved = resolveConnectionPolicy(request, resolvePolicy, connection);
   if (resolved.rejected) {
-    response.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
-    response.end("viewer identity required");
-    log("web-listener: rejected a connection without a valid x-myco-viewer header");
+    // 诊断脚注（给页面和日志同时看）：真实原因不是"缺头"，而是
+    // 带了合法身份但策略表里没有该 DID 的授权（或严格模式要求身份）。
+    const reason = resolved.reason ?? "identity-required";
+    const status = Number.isInteger(resolved.status) ? resolved.status : 403;
+    response.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
+    response.end(status === 503
+      ? `authorization not ready (${reason})`
+      : `viewer policy missing (${reason})`);
+    log(`web-listener: rejected ${request.method} ${request.url} — ${reason} `
+      + `(policy keys: ${JSON.stringify([...storeViewers(connection)])})`);
     return;
   }
   const policy = resolved.policy;

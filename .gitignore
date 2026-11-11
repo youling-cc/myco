@@ -25,3 +25,6 @@ Thumbs.db
 .notify-*
 .tmp*/
 *.tmp.md
+
+# dsh-plugin build output
+tools/dsh-plugin/lib/

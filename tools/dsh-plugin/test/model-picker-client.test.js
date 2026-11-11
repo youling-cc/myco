@@ -133,7 +133,7 @@ describe("selectModelSelection", () => {
   });
 });
 
-// ── defaultEffortFor（2026-11-05 用户定稿：继承当前等级 / 无则 max / 退 defaultEffort）──
+// ── defaultEffortFor（2026-11-05 设计定稿：继承当前等级 / 无则 max / 退 defaultEffort）──
 describe("defaultEffortFor", () => {
   const glm = CATALOG.groups[0].models[0];          // efforts: medium/high/max, default=max
   const k31 = CATALOG.groups[1].models[0];          // efforts: low/medium/high, default=medium（无 max）

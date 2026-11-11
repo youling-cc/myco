@@ -5,21 +5,35 @@
  * "api/"+method, admin=false)` — and comparing allow/rule bit for bit.
  *
  * Vector file (single source of truth, owned by the myco session):
- *   myco-thin-node/eval/vnet/judge-vectors.json
+ *   repo-y/eval/vnet/judge-vectors.json
  *
  * Run: node test/judge-vectors.test.js
  */
 
 import { strict as assert } from "node:assert";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import { effectiveCaps, judgeMethod } from "../src/judge-engine.js";
 
-import { fileURLToPath } from "node:url";
+/**
+ * Locate the shared vector file across the two supported layouts (no absolute
+ * machine paths — those leak internal structure into the open-source export):
+ *
+ * 1. `MYCO_VECTOR_FILE` env (CI / custom checkout)
+ * 2. **single-repo layout** (open source): `tools/dsh-plugin/test/` → `<repo>/eval/vnet/…`
+ * 3. **dev layout**: `myco/dsh-plugin-identity/test/` → `repo-y/eval/vnet/…`
+ *
+ * 不写机器绝对路径（开源导出时会被判"内部路径泄漏"）。
+ */
+const CANDIDATES = [
+  process.env.MYCO_VECTOR_FILE,
+  fileURLToPath(new URL("../../../eval/vnet/judge-vectors.json", import.meta.url)),
+  fileURLToPath(new URL("../../../repo-y/eval/vnet/judge-vectors.json", import.meta.url)),
+].filter((candidate) => typeof candidate === "string" && candidate.length > 0);
 
-const VECTOR_FILE = fileURLToPath(
-  new URL("../../../eval/vnet/judge-vectors.json", import.meta.url),
-);
+const VECTOR_FILE = CANDIDATES.find((candidate) => existsSync(candidate));
 
 /**
  * Map one vector grant onto the engine's grant shape (owner by label, as

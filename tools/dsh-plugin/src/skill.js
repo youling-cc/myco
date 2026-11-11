@@ -133,7 +133,8 @@ C:\\Python314\\python.exe "${TOOLS}\\\\send.py" --to "目标" --text "短句"
 send.py 自动加两行头（调用方不用管）：
 
 \`\`\`text
-[from: 发送方名字 · 10-19 19:16]
+[from: 发送方名字 · ⚡插队 · 10-19 19:16]     # steer（默认插队）带此标记
+[from: 发送方名字 · 10-19 19:16]              # queue 无标记
 reply-to: session-xxxx-...
 
 正文

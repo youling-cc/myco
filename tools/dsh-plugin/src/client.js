@@ -27,7 +27,7 @@ const state = { sessionId: undefined, selection: undefined, catalog: undefined, 
 /**
  * @returns {boolean} whether the plugin should take over this click.
  *
- * 2026-11-05 用户定稿：就近弹窗 + 内联思考等级是对所有视口的改进（桌面原生
+ * 2026-11-05 设计定稿：就近弹窗 + 内联思考等级是对所有视口的改进（桌面原生
  * 列表在矮窗口会变成 446×454 的大面板且不含等级），所以**桌面也接管**。
  * 逃生口：localStorage['myco.picker.native'] = '1' 回到 DSH 原生选择器。
  * coarseNow 仍参与诊断日志（`__mycoPicker.diag()`）。

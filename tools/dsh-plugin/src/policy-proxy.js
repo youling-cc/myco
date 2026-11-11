@@ -21,7 +21,8 @@
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
 import { effectiveCaps, effectiveVisibility, judgeMethod, sessionVisible } from "./judge-engine.js";
 
@@ -92,12 +93,87 @@ function sortDeep(value) {
  * All lookups are synchronous: the data plane must never await to decide.
  */
 export class PolicyStore {
-  /** @param {{now?: () => number}} [options] injectable clock. */
+  /**
+   * @param {{now?: () => number, statePath?: string, log?: (m: string) => void}} [options]
+   *   injectable clock + **策略持久化路径**（2026-11-11 用户裁决：授权表绝不能因重启丢失）。
+   */
   constructor(options = {}) {
     this.now = options.now ?? Date.now;
+    this.log = typeof options.log === "function" ? options.log : () => {};
+    this.statePath = typeof options.statePath === "string" && options.statePath.length > 0
+      ? options.statePath
+      : undefined;
     /** @type {Map<string, {allow?: Set<string>, sessions?: Set<string>, port?: number, updatedAt: number}>} */
     this.viewers = new Map();
     this.seenNonces = new Map();
+    this.loaded = false;
+  }
+
+  /**
+   * Load the persisted policy table (write-through mirror of control-plane pushes).
+   * Missing/corrupt file = empty table (a fresh install); never throws.
+   * @returns the number of entries loaded.
+   */
+  async load() {
+    if (this.statePath === undefined) { this.loaded = true; return 0; }
+    let raw;
+    try {
+      raw = await readFile(this.statePath, "utf8");
+    } catch {
+      this.loaded = true;
+      return 0;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      for (const [did, entry] of Object.entries(parsed.viewers ?? {})) {
+        const engine = entry?.engine;
+        const simple = entry?.simple;
+        if (engine === undefined && simple === undefined) continue;
+        this.viewers.set(did, {
+          kind: engine === undefined ? "simple" : "engine",
+          admin: engine?.admin === true,
+          label: engine?.label,
+          judgeCaps: engine?.judgeCaps,
+          judgeVis: engine?.judgeVis,
+          allow: Array.isArray(simple?.allow) ? new Set(simple.allow) : undefined,
+          sessions: Array.isArray(simple?.sessions) ? new Set(simple.sessions) : undefined,
+          updatedAt: typeof entry?.updatedAt === "number" ? entry.updatedAt : this.now(),
+        });
+      }
+      this.log(`policy-store: loaded ${this.viewers.size} viewer(s) from ${this.statePath}`);
+    } catch {
+      this.log(`policy-store: ${this.statePath} unreadable — starting empty`);
+    }
+    this.loaded = true;
+    return this.viewers.size;
+  }
+
+  /** Write-through persist (atomic: tmp + rename). Best-effort; failures only log. */
+  async persist() {
+    if (this.statePath === undefined) return;
+    const viewers = {};
+    for (const [did, entry] of this.viewers) {
+      viewers[did] = {
+        updatedAt: entry.updatedAt,
+        engine: entry.kind === "engine"
+          ? { admin: entry.admin, label: entry.label, judgeCaps: entry.judgeCaps, judgeVis: entry.judgeVis }
+          : undefined,
+        simple: entry.kind === "simple"
+          ? { allow: entry.allow === undefined ? undefined : [...entry.allow],
+              sessions: entry.sessions === undefined ? undefined : [...entry.sessions] }
+          : undefined,
+      };
+    }
+    const payload = JSON.stringify({ version: 1, savedAt: this.now(), viewers }, null, 2);
+    const tmp = `${this.statePath}.tmp-${process.pid}`;
+    try {
+      await mkdir(dirname(this.statePath), { recursive: true });
+      await writeFile(tmp, payload, "utf8");
+      await rename(tmp, this.statePath);
+    } catch (error) {
+      try { await unlink(tmp); } catch { /* ignore */ }
+      this.log(`policy-store: persist failed (${String(error?.message ?? error)})`);
+    }
   }
 
   /**
@@ -116,6 +192,8 @@ export class PolicyStore {
       const existing = this.viewers.get(viewerDid);
       const port = existing?.port;
       this.viewers.delete(viewerDid);
+      // 撤销必须写穿落盘，否则重启后撤销失效（2026-11-11 持久化测试抓到）。
+      void this.persist();
       return { ok: true, closed: true, port };
     }
 
@@ -155,6 +233,7 @@ export class PolicyStore {
       };
     }
     this.viewers.set(viewerDid, entry);
+    void this.persist();
     return { ok: true, policy: entry };
   }
 

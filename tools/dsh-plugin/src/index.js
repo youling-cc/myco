@@ -47,7 +47,7 @@ import {
   resolveMycoExe,
 } from "./identity.js";
 import { mycoSkill } from "./skill.js";
-import { startProxySuite } from "./web-listener.js";
+import { DEFAULT_POLICY_STATE_FILE, startProxySuite } from "./web-listener.js";
 
 /** Cordis plugin name. */
 export const name = "myco";
@@ -238,6 +238,7 @@ export function apply(ctx, config) {
     void startProxySuite({
       env: process.env,
       config: settings.webListener,
+      policyStatePath: DEFAULT_POLICY_STATE_FILE(),
       log: (message) => {
         ctx.logger?.info?.(message);
         listenerNote("info", message);
