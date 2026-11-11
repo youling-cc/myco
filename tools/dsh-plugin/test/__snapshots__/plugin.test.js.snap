@@ -1,0 +1,62 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`injected text > garbage output: only the base lines survive 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-lambda"
+`;
+
+exports[`injected text > half logged in (role=unlinked, valid rootDid): no DID lines 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-gamma
+- title: 申诉管理"
+`;
+
+exports[`injected text > half logged in (valid rootDid, missing deviceDid): no DID lines 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-delta
+- title: 申诉管理"
+`;
+
+exports[`injected text > logged in: session id, title, and both DIDs 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-alpha
+- title: 申诉管理
+- youling账号: <did:youling:z6MkExampleAccountDIDxxxxxxxxxxxxxxxxxxxxxxxxx>
+- myco设备: <did:myco:z6MkExampleDeviceDIDxxxxxxxxxxxxxxxxxxxxxxxxxx>"
+`;
+
+exports[`injected text > logged out: a valid device DID is still not shown 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-beta
+- title: 申诉管理"
+`;
+
+exports[`injected text > missing executable: only the base lines survive 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-nu"
+`;
+
+exports[`injected text > no title service at all: base lines plus DIDs, without a title line 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-zeta
+- youling账号: <did:youling:z6MkExampleAccountDIDxxxxxxxxxxxxxxxxxxxxxxxxx>
+- myco设备: <did:myco:z6MkExampleDeviceDIDxxxxxxxxxxxxxxxxxxxxxxxxxx>"
+`;
+
+exports[`injected text > non-zero exit: only the base lines survive 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-mu"
+`;
+
+exports[`injected text > timeout: only the base lines survive 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-kappa
+- title: 慢查询"
+`;
+
+exports[`injected text > title missing: the title line disappears entirely 1`] = `
+"[myco:session-identity] 本会话自身身份（myco runtime context）
+- sessionId: session-epsilon
+- youling账号: <did:youling:z6MkExampleAccountDIDxxxxxxxxxxxxxxxxxxxxxxxxx>
+- myco设备: <did:myco:z6MkExampleDeviceDIDxxxxxxxxxxxxxxxxxxxxxxxxxx>"
+`;

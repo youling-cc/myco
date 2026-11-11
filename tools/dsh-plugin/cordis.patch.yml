@@ -1,0 +1,6 @@
+# @myco/dsh-plugin 的 bundle 层：把插件行插入 profile 组合。
+# 安装（dsh plugin add / plugin_manager install_bundle）后由 app-boot 作为 profile 层应用。
+- insert:
+    - id: myco
+      name: '@myco/dsh-plugin'
+      config: {}

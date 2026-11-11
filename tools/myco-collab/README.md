@@ -1,5 +1,9 @@
 # myco-collab — Agent Collaboration Plugin
 
+> **⚠️ Deprecated — superseded by [`tools/dsh-plugin/`](../dsh-plugin/)** (DSH-native plugin:
+> session identity + collaboration directory + cross-session messaging). This directory is
+> kept for reference only.
+
 An MCP (Model Context Protocol) server that enables AI agents running in
 [DSH](https://github.com/user/dsh) (DeepSeek Harness) or other MCP-compatible
 harnesses (Claude Code, Codex, etc.) to connect to and collaborate through
