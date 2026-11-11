@@ -28,6 +28,43 @@ struct ClientHandle {
 static CLIENTS: OnceLock<Mutex<std::collections::HashMap<u32, ClientHandle>>> = OnceLock::new();
 static SERVER: OnceLock<Mutex<Option<Arc<AtomicBool>>>> = OnceLock::new();
 
+/// 最近一次 start 失败的人读原因（2026-11-11 手机 rc=4 真案）。
+/// 嵌入方（Android）拿不到进程 stderr——eprintln 在 Android 默认进 /dev/null，
+/// 宿主只看到一个裸 rc 码根本没法排障。这里把失败串出来，宿主用
+/// [`vnet_last_error`] 读；成功启动即清空。
+static LAST_ERR: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn last_err_slot() -> &'static Mutex<String> {
+    LAST_ERR.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn record_err(s: String) {
+    *last_err_slot().lock().unwrap() = s;
+}
+
+fn clear_err() {
+    last_err_slot().lock().unwrap().clear();
+}
+
+/// 读最近一次 start 失败原因（NUL 结尾 UTF-8 写入 buf）。
+/// 返回 0=OK 5=缓冲区太小 4=内部错误（错误串含 NUL）。
+#[no_mangle]
+pub extern "C" fn vnet_last_error(buf: *mut c_char, buflen: c_int) -> c_int {
+    let s = last_err_slot().lock().unwrap().clone();
+    let c = match CString::new(s) {
+        Ok(c) => c,
+        Err(_) => return VNET_ERR_INTERNAL,
+    };
+    let bytes = c.to_bytes_with_nul();
+    if buf.is_null() || buflen < bytes.len() as c_int {
+        return VNET_ERR_BUFSMALL;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+    }
+    VNET_OK
+}
+
 fn clients_map() -> &'static Mutex<std::collections::HashMap<u32, ClientHandle>> {
     CLIENTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -77,18 +114,26 @@ pub extern "C" fn vnet_client_start(
     let conn = match crate::vnet::connection::Connection::with_secret_and_port(&relay_s, peer_id, target_peer_id, sec, None) {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            eprintln!("[vnet-ffi] client construct failed: {:#}", e);
+            let msg = format!("client construct failed: {:#}", e);
+            eprintln!("[vnet-ffi] {msg}");
+            record_err(msg);
             return VNET_ERR_INTERNAL;
         }
     };
     // detached：accept 循环跑独立线程，本调用立刻返回（JNI 调用线程不能被阻塞）
     match conn.start_client_detached(local_port) {
         Ok(()) => {
+            clear_err();
             clients_map().lock().unwrap().insert(peer_id, ClientHandle { conn });
             VNET_OK
         }
         Err(e) => {
-            eprintln!("[vnet-ffi] client_start failed: {:#}", e);
+            let msg = format!("client_start failed: {:#}", e);
+            eprintln!("[vnet-ffi] {msg}");
+            record_err(msg);
+            // 启动失败必须把 Connection 停掉：否则 peer_id 占位与 relay 映射泄漏，
+            // 宿主下次同 peer_id 只会拿到 PEER_ID_IN_USE（2026-11-11 手机真案）。
+            conn.stop();
             VNET_ERR_INTERNAL
         }
     }

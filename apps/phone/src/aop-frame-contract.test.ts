@@ -1,6 +1,6 @@
 /**
  * AopFrame 帧契约测试(Rust↔TS 双侧同读 tests/contract/aop-frame.json):
- * - Rust 侧:apps/canvas/src-tauri/src/aop/frames.rs #[cfg(test)] contract_samples_all_parse
+ * - Rust 侧:apps/canvas/src-tauri/src/labs/frames.rs #[cfg(test)] contract_samples_all_parse
  * - TS 侧(本文件):字段 camelCase 齐备、executorKind/kind 枚举合法、from 为 DID。
  * 帧语义:o/s/a/r 四元组 + 归属(slug/layer/attempt/executorKind/kind/at/from)。
  */

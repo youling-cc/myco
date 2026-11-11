@@ -377,7 +377,7 @@ pub async fn device_revoke(pubkey_or_did: String) -> Result<serde_json::Value, S
 #[tauri::command]
 pub fn delegation_list() -> Result<serde_json::Value, String> {
     // 第69轮修：走 core 委托库（config_dir=youling/，第66轮收敛后的真身）。
-    // 原读 myco_config_dir()=死的 youling-myco/ 目录（env 时代残留）——目录收编后
+    // 原读 myco_config_dir()=死的 repo-b/ 目录（env 时代残留）——目录收编后
     // 副本停更，这里会读到陈旧委任状。
     let recs = myco_core::delegation::Delegations::load().list();
     let data = serde_json::to_value(&recs).unwrap_or(serde_json::json!([]));

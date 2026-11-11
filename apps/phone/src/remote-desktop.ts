@@ -97,6 +97,27 @@ export function loadLocalForwards(): VnetForward[] {
   }
 }
 
+/**
+ * 写入/更新一条本地转发（2026-11-11：设备级 vnet 隧道拿到的本地口要落到这里，
+ * RDP 卡才认得到地址）。
+ *
+ * 关键：按 **(device, port)** 唯一——同设备同目标端口只保留**一条**，且以本次传入的
+ * localPort 为准。不这么做的后果是真机实测到的：任务卡 env 里写死的 PC 侧口
+ * （23389/23911）也在这张表里，于是同一 (device,3389) 出现两个 localPort，
+ * `pickRdpForward` 可能挑到手机上没有监听的那个死口。
+ */
+export function upsertLocalForward(f: VnetForward): boolean {
+  try {
+    const kept = loadLocalForwards().filter((x) => !(x.port === f.port && sameDevice(x.device, f.device)))
+    const label = f.label ?? `${f.port === RDP_TARGET_PORT ? '远程桌面' : '隧道'} 127.0.0.1:${f.localPort}`
+    kept.push({ ...f, label, enabled: f.enabled !== false })
+    localStorage.setItem(VNET_STORE_KEY, JSON.stringify(kept))
+    return true
+  } catch {
+    return false
+  }
+}
+
 interface VnetBridge {
   state?: () => unknown
 }

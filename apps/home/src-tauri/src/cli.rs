@@ -1411,7 +1411,11 @@ fn sender_label_parts(
 /// - steer 插队：`[from: 名字 · ⚡插队 · 10-19 19:16]`（被打断是必要信息）；
 /// - 拿不到 sessionId（--from 无法映射且无 env）：只出 from 行，**不给 reply-to**
 ///   —— 宁缺勿错，绝不指向一个猜出来的会话。
-fn format_chat_header(from_name: &str, sender_sid: Option<&str>, steer: bool) -> String {
+///
+/// 跨账号复用（2026-11-11 `msg_route.rs`）：只借它的**首行**（名字/时间/⚡插队标记
+/// 同一套格式化，不另写第二份）；跨账号的 `reply-to`（账号 did）/`reply-to-session`
+/// 由 `msg_route::render_inbound_text` 在其后追加。函数本身行为不变。
+pub(crate) fn format_chat_header(from_name: &str, sender_sid: Option<&str>, steer: bool) -> String {
     let name = from_name.trim();
     let name = if name.is_empty() { "myco" } else { name };
     let stamp = chrono::Local::now().format("%m-%d %H:%M");

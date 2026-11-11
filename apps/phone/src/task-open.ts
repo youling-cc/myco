@@ -41,7 +41,31 @@ import {
   type TaskEnv,
   type VnetBridge,
 } from './task-env'
-import { copyText, hasRdpBridge, openRdpViaShell } from './remote-desktop'
+import { copyText, hasRdpBridge, openRdpViaShell, loadLocalForwards, sameDevice } from './remote-desktop'
+
+/**
+ * 手机侧设备隧道的本地口段（Java `P2pSyncTunnel.PORT_BASE` 起自动分配）。
+ *
+ * 2026-11-11 真案：任务卡 env 里的 `localPort`（23389 / 23911）是 **PC 侧** 口——
+ * 手机上没有监听。照它把地址交给远程桌面 App，表现就是"复制成功但连不上"，
+ * 复制失败时更糟（用户手上连个能试的地址都没有）。手机侧必须用**本机**隧道口。
+ */
+const PHONE_TUNNEL_PORT_MIN = 25910
+const PHONE_TUNNEL_PORT_MAX = 25999
+
+/** 本机隧道里「到 env.device 的 env.port」那条转发的本地口；没有则 0。 */
+function pickPhoneForward(env: TaskEnv): number {
+  try {
+    const target = targetPortOf(env)
+    const hit = loadLocalForwards().find(
+      (f) => f.port === target && sameDevice(f.device, env.device ?? '')
+        && f.localPort >= PHONE_TUNNEL_PORT_MIN && f.localPort <= PHONE_TUNNEL_PORT_MAX,
+    )
+    return hit ? hit.localPort : 0
+  } catch {
+    return 0
+  }
+}
 
 /** 任务卡动作（与 Rust `share_card_record` / PC 同形状）。 */
 export interface TaskCardAction {
@@ -229,7 +253,9 @@ export async function openTaskEnv(
     onBuilding?: (note: string) => void
   } = {},
 ): Promise<EnvOpenOutcome> {
-  const address = addressOf(env)
+  // 手机侧优先用**本机**设备隧道的口（见 pickPhoneForward 注释）
+  const phonePort = pickPhoneForward(env)
+  const address = phonePort > 0 ? `127.0.0.1:${phonePort}` : addressOf(env)
   const gate = opts.gate ?? 'unknown'
   const d = opts.deps || {}
   const copy = d.copy || copyText
@@ -267,7 +293,7 @@ export async function openTaskEnv(
     }
   }
 
-  const localPort = localPortOf(env)
+  const localPort = phonePort > 0 ? phonePort : localPortOf(env)
   const port = targetPortOf(env)
   let added: { ok?: boolean; err?: string } | undefined
   try {
@@ -371,11 +397,15 @@ export async function openTaskEnv(
       ? '（首次连接：弹证书时勾选「不再要求连接到这台电脑」再点「连接」，随后黑屏几秒属正常）'
       : ''
     const ok = await copy(address)
+    // 2026-11-11 真机：WebView 里 clipboard 常常没有用户手势 → 复制必败，而原提示
+    // 只写"自动复制失败，请重试一次"，用户手上根本没有地址可粘。地址必须出现在
+    // 提示里（远程桌面 App 里手输一次即可）。
+    const addrHint = `（地址 ${address}）`
     return {
       state: 'ready',
       note: ok
-        ? `已复制连接地址，请在你的${appName} 里粘贴连接${firstConnect}`
-        : `请在你的${appName} 里连接（自动复制失败，请重试一次）${firstConnect}`,
+        ? `已复制连接地址，请在你的${appName} 里粘贴连接${addrHint}${firstConnect}`
+        : `请在你的${appName} 里连接${addrHint}（自动复制失败，手动输入即可）${firstConnect}`,
       address,
       started: ok,
     }

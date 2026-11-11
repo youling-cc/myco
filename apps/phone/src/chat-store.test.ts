@@ -1033,6 +1033,25 @@ describe('批五：分享者自己的任务卡（registerSharedTask + peerTaskVi
     expect(listTasks().some((x) => x.taskId === 'peer-task-self-1')).toBe(true)
   })
 
+  it('2026-11-11：registerSharedTask 透传 env/caps/action（手机建「ADB 调试」环境卡的入库路径）', () => {
+    const gid = 'grp-dev-adb1'
+    const payload = {
+      taskId: 'peer-task-adb-x1', title: 'ADB 调试',
+      env: [{ kind: 'adb', device: 'did:myco:zPhoneDev', port: 5555, localPort: 15555 }],
+      caps: ['vnet.forward'],
+      action: { env: [{ kind: 'adb', device: 'did:myco:zPhoneDev', port: 5555, localPort: 15555 }] },
+      createdAt: 1,
+    }
+    const t = registerSharedTask(gid, MY, '我', payload)
+    expect(t.env).toEqual(payload.env)
+    expect(t.caps).toEqual(payload.caps)
+    expect(t.action?.env).toEqual(payload.action.env)
+    // 无 env 的普通卡不受影响（字段缺省不落）
+    const plain = registerSharedTask(gid, MY, '我', { taskId: 'peer-task-plain-x2', title: '普通卡', createdAt: 2 })
+    expect(plain.env).toBeUndefined()
+    expect(plain.caps).toBeUndefined()
+  })
+
   it('registerSharedTask 幂等：同 taskId 再登记不重复（对账/多端回流安全）', () => {
     registerSharedTask(PEER, MY, '我', P())
     registerSharedTask(PEER, MY, '我', P({ title: '别的标题' }))

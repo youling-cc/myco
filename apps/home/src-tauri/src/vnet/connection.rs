@@ -422,6 +422,41 @@ fn peer_id_release(peer_id: u32) {
     active_peer_ids().lock().unwrap().remove(&peer_id);
 }
 
+/// 构造期 peer_id 占位的 RAII 守卫（2026-11-11 手机 rc=4 真案）。
+///
+/// 事故：`peer_id_try_acquire` 把 id 塞进全局集合，只有 `Connection::stop()` 才
+/// 释放。而 `with_secret_and_port` 在 acquire 之后还有 relay 注册（5 次退避重试）
+/// ——任何一步失败都走 `?` 提前返回，id 便永久留在集合里；之后同 id 的每次 start
+/// 都在第一行秒失败 `PEER_ID_IN_USE`，宿主只看到恒定的 rc=4（VNET_ERR_INTERNAL），
+/// 永远自愈不了（手机端实测 4/4 全失败）。
+///
+/// 约定：构造成功即把所有权**交接**给 Connection（此后由 stop() 释放）；
+/// 构造失败则 Drop 自动释放，下一次尝试仍然有机会。
+struct PeerIdGuard {
+    peer_id: u32,
+    armed: bool,
+}
+
+impl PeerIdGuard {
+    fn acquire(peer_id: u32) -> anyhow::Result<Self> {
+        peer_id_try_acquire(peer_id)?;
+        Ok(Self { peer_id, armed: true })
+    }
+
+    /// 所有权交接给 Connection：Drop 不再释放。
+    fn hand_off(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PeerIdGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            peer_id_release(self.peer_id);
+        }
+    }
+}
+
 // ── 同机跨进程 peer_id 冲突防护（2026-11-10 串扰经验沉淀）──
 // 同进程防护见 peer_id_try_acquire；这里是跨进程面。事故链（实测 same_peer 复现）：
 //   同机两个 vnet 进程用同一 peer_id 注册 relay（旧进程残留 + 新进程启动）
@@ -1277,7 +1312,9 @@ impl Connection {
         // 同进程 peer_id 冲突防护（2026-11-10 串扰事故 vendor 991e0adc）：
         // 两个 Connection 用同一 peer_id → relay 路由互抢 → 帧串扰 → 数据损坏。
         // 创建时立即拒绝，不让带病运行。
-        peer_id_try_acquire(my_peer_id)?;
+        // 2026-11-11：改为 RAII 守卫——构造期任何一步失败都自动释放，
+        // 否则 id 永久泄漏，之后同 id 每次 start 都秒失败（手机 rc=4 真案）。
+        let peer_guard = PeerIdGuard::acquire(my_peer_id)?;
         // 同机跨进程占位（newcomer-wins）：新进程接管本 peer_id，
         // 旧进程在 keepalive 体检里发现后退位，不再互抢 relay 映射。
         let claim = PeerClaim::steal(&std::env::temp_dir(), my_peer_id, "client");
@@ -1353,23 +1390,36 @@ impl Connection {
                 println!("  [OK] Announced IPv6: {}", s);
             }
         }
-        let mut listen_pub_val: Option<std::net::SocketAddr> = None;
+        // ── STUN 公网映射公告：纯优化，必须离开构造关键路径 ──
+        // 2026-11-11 真案：这 3 个 STUN 服务器各自 3s 上限、串行查询，全在
+        // `with_secret_and_port` 里同步跑；嵌入方（Android JNI）从调用线程进来时，
+        // UI 线程被冻住十几分钟。STUN 只决定「P2P 直连能不能用」，中继路径不依赖
+        // 它——改成后台线程异步学映射、学到再补公告。
+        let listen_pub_arc: Arc<Mutex<Option<std::net::SocketAddr>>> =
+            Arc::new(Mutex::new(None));
         if let Some(ref s) = listen_sock {
             s.set_nonblocking(true).ok();
-            let lp = s.local_addr().map(|a| a.port()).unwrap_or(0);
-            for srv in ["stun.chat.bilibili.com:3478", "stun.hitv.com:3478", "stun.miwifi.com:3478"] {
-                if let Ok(pubaddr) = crate::vnet::stun::query_stun_on_socket(srv, s) {
-                    listen_pub_val = Some(pubaddr);
-                    let _ = relay.announce_ipv4(&pubaddr.to_string());
-                    println!("  [RDV] Listen {} -> public {}, announced", lp, pubaddr);
-                    break;
-                }
-            }
-            if listen_pub_val.is_none() {
-                println!("  [RDV] WARN: listen {} STUN failed", lp);
-            }
+            let sock_bg = s.clone();
+            let relay_bg = relay.clone();
+            let pub_bg = listen_pub_arc.clone();
+            let _ = std::thread::Builder::new()
+                .name("vnet-stun-announce".into())
+                .spawn(move || {
+                    let lp = sock_bg.local_addr().map(|a| a.port()).unwrap_or(0);
+                    for srv in ["stun.chat.bilibili.com:3478", "stun.hitv.com:3478", "stun.miwifi.com:3478"] {
+                        if let Ok(pubaddr) = crate::vnet::stun::query_stun_on_socket(srv, &sock_bg) {
+                            *pub_bg.lock().unwrap() = Some(pubaddr);
+                            let _ = relay_bg.announce_ipv4(&pubaddr.to_string());
+                            println!("  [RDV] Listen {} -> public {}, announced", lp, pubaddr);
+                            return;
+                        }
+                    }
+                    println!("  [RDV] WARN: listen {} STUN failed", lp);
+                });
         }
 
+        // 构造成功：peer_id 所有权交接给 Connection（此后由 stop() 释放）
+        peer_guard.hand_off();
         Ok(Self {
             my_peer_id,
             target_peer_id,
@@ -1388,7 +1438,7 @@ impl Connection {
             probe_reply_rx: Arc::new(AtomicU64::new(0)),
             probe_verify_fail: Arc::new(AtomicU64::new(0)),
             listen_sock: listen_sock.clone(),
-            listen_pub: Arc::new(Mutex::new(listen_pub_val)),
+            listen_pub: listen_pub_arc,
             announced_v6: Arc::new(Mutex::new(None)),
             p2p_port_override: preferred_p2p_port,
             self_dial: my_peer_id == target_peer_id,

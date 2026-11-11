@@ -77,39 +77,39 @@ impl AopClient {
 
     pub async fn create(&self, cfg: AopSessionConfig) -> Result<SessionInfo, String> {
         let body = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
-        self.data(self.post("/api/aop/create", &body)).await
+        self.data(self.post("/api/labs/create", &body)).await
     }
 
     pub async fn destroy_task(&self, task_id: &str) -> bool {
         let body = serde_json::json!({ "taskId": task_id });
-        self.data::<bool>(self.post("/api/aop/destroy_task", &body))
+        self.data::<bool>(self.post("/api/labs/destroy_task", &body))
             .await
             .unwrap_or(false)
     }
 
     pub async fn list(&self) -> Vec<SessionInfo> {
-        let req = self.http.get(format!("{}/api/aop/list", self.base));
+        let req = self.http.get(format!("{}/api/labs/list", self.base));
         self.data(req).await.unwrap_or_default()
     }
 
     pub async fn send_message(&self, session_id: &str, text: &str) -> Result<(), String> {
         let body = serde_json::json!({ "sessionId": session_id, "text": text });
-        self.data(self.post("/api/aop/message", &body)).await
+        self.data(self.post("/api/labs/message", &body)).await
     }
 
     pub async fn stop(&self, session_id: &str) -> Result<(), String> {
         let body = serde_json::json!({ "sessionId": session_id });
-        self.data(self.post("/api/aop/stop", &body)).await
+        self.data(self.post("/api/labs/stop", &body)).await
     }
 
     pub async fn pause(&self, session_id: &str) -> Result<(), String> {
         let body = serde_json::json!({ "sessionId": session_id });
-        self.data(self.post("/api/aop/pause", &body)).await
+        self.data(self.post("/api/labs/pause", &body)).await
     }
 
     pub async fn resume(&self, session_id: &str) -> Result<(), String> {
         let body = serde_json::json!({ "sessionId": session_id });
-        self.data(self.post("/api/aop/resume", &body)).await
+        self.data(self.post("/api/labs/resume", &body)).await
     }
 
     pub async fn human_submit(&self, session_id: &str, sub: HumanSubmission) -> Result<(), String> {
@@ -119,27 +119,27 @@ impl AopClient {
             "note": sub.note,
             "artifacts": sub.artifacts,
         });
-        self.data(self.post("/api/aop/human_submit", &body)).await
+        self.data(self.post("/api/labs/human_submit", &body)).await
     }
 
     pub async fn frames_of(&self, session_id: &str) -> Vec<AopFrame> {
-        let req = self.http.get(format!("{}/api/aop/frames/{session_id}", self.base));
+        let req = self.http.get(format!("{}/api/labs/frames/{session_id}", self.base));
         self.data(req).await.unwrap_or_default()
     }
 
     pub async fn messages_of(&self, session_id: &str) -> Vec<ChatMessage> {
-        let req = self.http.get(format!("{}/api/aop/history/{session_id}", self.base));
+        let req = self.http.get(format!("{}/api/labs/history/{session_id}", self.base));
         let v: serde_json::Value = self.data(req).await.unwrap_or_default();
         serde_json::from_value(v.get("messages").cloned().unwrap_or_default()).unwrap_or_default()
     }
 
     pub async fn dataset_toggle(&self, session_id: &str, on: bool) -> Result<serde_json::Value, String> {
         let body = serde_json::json!({ "sessionId": session_id, "on": on });
-        self.data(self.post("/api/aop/dataset_toggle", &body)).await
+        self.data(self.post("/api/labs/dataset_toggle", &body)).await
     }
 
     pub async fn snapshot_events_json(&self) -> String {
-        let req = self.http.get(format!("{}/api/aop/events_snapshot", self.base));
+        let req = self.http.get(format!("{}/api/labs/events_snapshot", self.base));
         match self.data::<serde_json::Value>(req).await {
             Ok(v) => v
                 .get("snapshotJson")
@@ -165,12 +165,12 @@ impl AopClient {
     }
 }
 
-/// SSE 长连读 /api/aop/events:跳过首帧快照,事件原样转发进广播;断线 3s 重连。
+/// SSE 长连读 /api/labs/events:跳过首帧快照,事件原样转发进广播;断线 3s 重连。
 async fn sse_loop(base: String, tx: broadcast::Sender<String>) {
     use futures_util::StreamExt;
     loop {
         let resp = match reqwest::Client::new()
-            .get(format!("{base}/api/aop/events"))
+            .get(format!("{base}/api/labs/events"))
             .send()
             .await
         {

@@ -65,6 +65,17 @@ public final class VnetTransport {
         return peerIdFor("vnet-peer" + targetDid + ":server:" + targetPort);
     }
 
+    /**
+     * 设备级 multi-forward server 的 peer_id（与 PC `vnet_forward.rs::multi_server_peer_id_for`
+     * 同式）。2026-11-11 真机定界：myco 现役 `MYCO_VNET_MULTI_FORWARD=1` 配置下对端**只**
+     * 起这一条 server，逐端口 server（`:server:9100`）根本不启动——用逐端口 id 连过去会
+     * `[A_lookup_peer] no_answer`，静默预算耗尽后流被关（手机上表现为 10s 读超时或
+     * "unexpected end of stream"）。所以凡是对端设备，一律走这个设备级 id + add_forward。
+     */
+    public static int multiServerPeerId(String targetDid) {
+        return peerIdFor("vnet-peer" + targetDid + ":server:multi-forward-v1");
+    }
+
     /** 手机自己作为客户端的 peer_id（掺入目标与本地口，保证不与任何服务端 id 撞）。 */
     public static int clientPeerId(String localDid, String targetDid, int localPort) {
         return peerIdFor("vnet-peer" + localDid + "#client#" + targetDid + ":port:" + localPort);

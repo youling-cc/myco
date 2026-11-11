@@ -13,13 +13,14 @@
 
 import { currentIdentity, getRootIdentity, getAttestation, listPresence, signFriendHandshake, registerPresence, currentYoulingName, fetchPresenceByRoot, signAuthHeader, type PresenceAddrs } from './identity'
 import { signWithDeviceKey } from './delegation'
-import { ingestWireMsg, p2pDeliverWithReply, setRelayDeliver, setRelayDeliverReply, peerDevicesOf } from './p2p'
+import { ingestWireMsg, p2pDeliverWithReply, setRelayDeliver, setRelayDeliverReply, setVnetP2pTunnel, peerDevicesOf } from './p2p'
 import { accountDidEq } from './didUtil'
 import { relayCandidate } from './p2p-tunnel'
 import { openSharedTask, prefetchShareEntry, makeSingleFlight, makeSerialQueue, openHttpTunnelSession, httpOverTunnel, type HttpTunnelSession, type OpenTaskDeps, type OpenTaskResult } from './dsh-open'
 import { OPEN_RETRY_DELAYS_MS, isTransientOpenFailure, retryNote, finalOpenNote, retryTransient, pickHealTargets, withSourceDevice, waitUntil, type SourceDeviceState } from './open-retry'
 import { removeTasksByShareId } from './chat-store'
 import { clearRelayFail, noteRelayFail, relayFailFromNative } from './relay-fail'
+import { ensureVnetIdentity } from './vnet-identity'
 import { effectiveInboundPorts, verifyVnetPeerRoster } from './vnet-inbound'
 import {
   NativeProxyBridge,
@@ -363,7 +364,118 @@ export function wireChatRelayFallback(): void {
   // 2026-10-14 取票中继兜底（真机异网破案：点卡"源设备不在线"根因——取票只走
   // 直推）。同一条帧内 HTTP，响应体的 reply（票据）一并带回。
   setRelayDeliverReply(async (accountDid, envelope, preferDevice) => relayDeliverOnce(accountDid, envelope, preferDevice))
+  // 2026-11-11 对账（/p2p/sync/digest|index|batch）的 vnet 隧道兜底：PC 切 vnet
+  // 传输模式后 p2p 数据面只绑 127.0.0.1:9100，手机直连必败 → 设备群 task-share
+  // 卡拉不到（任务卡列表空）。libvnet 通道是唯一活路（8321 mux 的 PC 侧
+  // relay_provider_start 已于 2026-11-06 退场为空壳，中继腿永远超时，不再兜底）。
+  // ensure 走**异步桥**（libvnet 注册重试在 native 线程，同步桥会冻住 WebView），
+  // 缓存 30s 减少注册往返；取不到口 → null（对账下一拍自愈重试）。
+  setVnetP2pTunnel((deviceDid) => ensureSyncTunnelFor(deviceDid))
 }
+
+/** 设备隧道端口映射缓存（`device|targetPort` → {localPort, at}）。30s 内复用；
+ *  下一拍 ensure 自愈重建（灭屏僵尸防御在 Java 侧）。 */
+const SYNC_TUNNEL_TTL_MS = 30_000
+const syncTunnelCache = new Map<string, { localPort: number; at: number }>()
+
+/** 本机→对端某端口：常用端口（对账/分享网关/RDP）。 */
+export const DEVICE_PORT_SYNC = 9100
+export const DEVICE_PORT_SHARE = 13911
+export const DEVICE_PORT_RDP = 3389
+
+/** 异步 ensure 的回调序号（window 临时回调名，用完即删）。 */
+let syncTunnelCbSeq = 0
+
+/** 异步桥单次等待上限：libvnet Connection 构造同步做 relay 注册重试（5 次
+ *  × 3s ACK + 退避）+ STUN ≈ 30s——vnet 侧修好前按最坏预算等，到点放弃
+ *  （结果回调迟到就丢弃，下一拍重试）。 */
+const SYNC_TUNNEL_ENSURE_TIMEOUT_MS = 35_000
+
+/**
+ * 确保「本机 → deviceDid:targetPort」有一个本地回环口，返回该口。
+ *
+ * 一条设备级 vnet 连接 + 每端口一条 add_forward（Java 侧 P2pSyncTunnel 管）；
+ * 本地口由 Java 从 25910 起自动分配，这里不写死端口——写死会和"同时接 DSH 与
+ * RDP"打架（2026-11-11 单隧道实现踩过：两端口抢同一口必失败）。
+ */
+async function ensureDeviceForward(deviceDid: string, targetPort: number): Promise<number | null> {
+  const key = `${deviceDid}|${targetPort}`
+  const now = Date.now()
+  const hit = syncTunnelCache.get(key)
+  if (hit && now - hit.at < SYNC_TUNNEL_TTL_MS) return hit.localPort
+  const id = tunnelIdentity()
+  if (!id) return null
+  // 异步桥（p2pTunnelEnsureAsync）：同步版会冻住 JS 线程（libvnet 注册重试
+  // 在调用线程跑 ~30s），真机事故实证——必须走后台线程 + 回调。
+  const shell = (window as unknown as {
+    MycoShell?: { p2pTunnelEnsureAsync?: (callbackJs: string, json: string) => void }
+  }).MycoShell
+  if (!shell || typeof shell.p2pTunnelEnsureAsync !== 'function') return null
+  // 起隧道前必须让 libvnet 拿到本机身份：PC 侧 MYCO_PEER_IDENTITY=1 后，未认证
+  // 的入站流一律 AUTH_REQUIRED 拒绝；不注入的表现就是"回环口能建、请求发出去
+  // 没下文"（10s 读超时 / unexpected end of stream）。见 vnet-identity.ts。
+  ensureVnetIdentity()
+  return new Promise<number | null>((resolve) => {
+    let settled = false
+    const finish = (port: number | null): void => {
+      if (settled) return
+      settled = true
+      try { delete (window as unknown as Record<string, unknown>)[cbName] } catch { /* ignore */ }
+      if (port && port > 0) {
+        syncTunnelCache.set(key, { localPort: port, at: Date.now() })
+        resolve(port)
+      } else {
+        console.log(`[p2p-sync] 设备隧道 ensure 失败（…${deviceDid.slice(-4)}:${targetPort}）`)
+        resolve(null)
+      }
+    }
+    const cbName = `__mycoSyncTunnelCb${++syncTunnelCbSeq}`
+    ;(window as unknown as Record<string, unknown>)[cbName] = (r: { ok?: boolean; localPort?: number }) => {
+      finish(r && r.ok === true && typeof r.localPort === 'number' ? r.localPort : null)
+    }
+    try {
+      // 必须**带接收者**调用：`const f = shell.p2pTunnelEnsureAsync; f(...)` 在
+      // Android WebView 上会抛 "Java bridge method can't be invoked on a
+      // non-injected object"（2026-11-11 真机实测，与本仓 task-open 那条
+      // openInBrowser 解绑坑同源）。解绑后 catch 里直接 finish(null)，界面上只看到
+      // "vnet 隧道 ensure 失败"，native 侧一行日志都没有——正是这个坑。
+      shell.p2pTunnelEnsureAsync!(cbName, JSON.stringify({
+        targetDevice: deviceDid,
+        targetPort,
+        // localPort 不传 = Java 自动分配（25910 起）
+        device: id.device,
+      }))
+    } catch {
+      finish(null)
+      return
+    }
+    setTimeout(() => finish(null), SYNC_TUNNEL_ENSURE_TIMEOUT_MS)
+  })
+}
+
+/** 对账专用：本机 → 对端 p2p 数据面(9100)。 */
+async function ensureSyncTunnelFor(deviceDid: string): Promise<number | null> {
+  return ensureDeviceForward(deviceDid, DEVICE_PORT_SYNC)
+}
+
+/**
+ * RDP 专用：本机 → 对端 3389，并把拿到的本地口落进 `myco.vnetForwards`，
+ * 这样 `rdpStatus()/pickRdpForward()` 立刻能给出 `127.0.0.1:<port>`。
+ *
+ * 2026-11-11 真案：卡片里写死的 `localPort:23389` 是 **PC 侧**口，手机上没有监听
+ * ——点卡只能弹"请在远程桌面 App 里连接"加一句"自动复制失败"。现在本地口由设备
+ * 隧道自动分配（25910 起），必须回写才认得到。
+ */
+export async function ensureRdpForwardFor(deviceDid: string): Promise<number | null> {
+  const lp = await ensureDeviceForward(deviceDid, DEVICE_PORT_RDP)
+  if (!lp) return null
+  try {
+    const { upsertLocalForward, RDP_TARGET_PORT } = await import('./remote-desktop')
+    upsertLocalForward({ device: deviceDid, port: RDP_TARGET_PORT, localPort: lp, enabled: true })
+  } catch { /* 落盘失败不影响本拍连接 */ }
+  return lp
+}
+
 
 /**
  * 中继投递一次（定向源设备优先），成功返回响应体对象（含 reply），失败 null。
@@ -460,10 +572,17 @@ async function chatRelayPost(
     const tReq = Date.now()
     const resp = await httpOverTunnel(ent.session, req, { timeoutMs: 6000, host: '127.0.0.1', keepAlive: true })
     console.log('[chat-relay] ' + (reused ? '复用' : '新建') + ' POST ' + (Date.now() - tReq) + 'ms status=' + resp.status)
-    if (resp.status !== 200) throw new Error(`HTTP ${resp.status}`)
+    if (resp.status !== 200) {
+      // 2026-11-11 取证（DSH协议应用 要求）：失败分支记 status/content-type/
+      // content-encoding/body 头 200 字节（hex + utf8 双份）——区分"拿到 body
+      // 但解析挂了" vs "隧道层没响应"，定 chat 是否还有中继腿可走。
+      console.log('[chat-relay-forensic] ' + relayForensicOf(resp, req.path))
+      throw new Error(`HTTP ${resp.status}`)
+    }
     try {
       return JSON.parse(resp.body) as Record<string, unknown>
     } catch {
+      console.log('[chat-relay-forensic] parse-fail ' + relayForensicOf(resp, req.path))
       return null
     }
   } catch {
@@ -472,8 +591,30 @@ async function chatRelayPost(
   }
 }
 
-async function relayDeliverOnce(
-  accountDid: string,
+/** 2026-11-11 中继腿失败取证行（DSH协议应用 要求）：status / content-type /
+ *  content-encoding / body 头 200 字节的 hex + utf8 双份。纯函数（可单测）。 */
+export function relayForensicOf(
+  resp: { status: number; headers: Record<string, string>; body: string },
+  path: string,
+): string {
+  const head = (resp.body || '').slice(0, 200)
+  let hex = ''
+  for (let i = 0; i < head.length; i++) {
+    hex += head.charCodeAt(i).toString(16).padStart(2, '0')
+  }
+  const h = resp.headers || {}
+  return JSON.stringify({
+    path,
+    status: resp.status,
+    ct: h['content-type'] || h['Content-Type'] || '',
+    ce: h['content-encoding'] || h['Content-Encoding'] || '',
+    bodyLen: (resp.body || '').length,
+    utf8: head,
+    hex: hex.slice(0, 400),
+  })
+}
+
+async function relayDeliverOnce(  accountDid: string,
   envelope: Record<string, unknown>,
   preferDevice?: string,
   opts: { record?: boolean } = {},

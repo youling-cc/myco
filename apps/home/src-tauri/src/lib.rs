@@ -68,6 +68,12 @@ pub mod hbl_ingest;
 pub mod msg;
 /// 消息库只读 HTTP 面（/api/msg/*，S3/S4 验收用；mode=off 时明确报错不假绿）
 pub mod msg_api;
+/// 2026-11-11 跨账号 DSH 会话消息（kind=`dsh-session-msg`）：`POST /api/msg/route`
+/// （好友/分享任务 owner 校验 → P2P 投递）+ `GET /api/chat_state`（薄包装）+ 入站
+/// 注入本机 DSH 会话（署名头 + 既有 `session/prompt` 代理）。见 msg_route.rs 头契约。
+/// 依赖 chat_service（tauri）→ 仅 GUI 变体。
+#[cfg(feature = "gui")]
+pub mod msg_route;
 /// T201 生产适配层（模式/路径/句柄缓存/一次性迁移）；默认 `MYCO_MSG_STORE=off` 零副作用
 pub mod msg_store;
 /// 统一端口档案 `config_dir()/ports.json`（mgmt 动态换口 + gw/tunnel 实际值
@@ -901,6 +907,8 @@ fn get_allowed_hosts() -> Vec<String> {
         "did.youling.cc".into(),
         "localhost".into(),
         "127.0.0.1".into(),
+        // 安全白名单双 IP（过渡期 vnext 活到 9/29，平台 callback 可能从任一 IP 来）
+        "myco.youling.cc".into(),
     ];
     // 从环境变量 MYCO_DID_BASE 推导（未设时默认生产域名）
     let base =

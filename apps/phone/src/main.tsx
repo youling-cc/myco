@@ -47,6 +47,10 @@ document.addEventListener('visibilitychange', () => {
 // 聊天投递的云中继兜底（2026-10-12"直连优先、不通走中转"，与分享链路同构）：
 // 手机异地（跨 v6 段）直推/对账全断时，经 8321 mux 的 WS 隧道投到对端 :9100。
 wireChatRelayFallback()
+// 2026-11-11：把本机设备身份尽早注入 libvnet。PC 侧启用 peer identity 后，
+// 未认证的入站 vnet 流一律被拒——不注入的表现是"隧道能建、请求发出去没下文"，
+// 排查成本极高（详见 vnet-identity.ts）。失败不阻塞启动，起隧道前还会再试一次。
+void import('./vnet-identity').then((m) => m.ensureVnetIdentity()).catch(() => {})
 // 2026-10-20 B1（AlarmManager 唤醒兜底）：原生 FreezeWakeReceiver 每 ~9min 注入本钩子，
 // 强制一次 chatPoll（拉信箱 + 官方通知 pending，新消息会触发系统通知），并补一次隧道 tick。
 // 冻结期 relay 入站字节被压制（delivery_suspended）时，靠它主动拉，而不是等 push。

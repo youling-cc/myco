@@ -7,7 +7,8 @@
  *
  * 断言的是**行为**（到底拉没拉起客户端、复制了什么），不是文案快照：
  *   ① 有 env → env 路由；无 env → 仍 share 路由（向后兼容）；
- *   ② RDP 无壳桥 → 复制 `127.0.0.1:<localPort>` + "请在你的远程桌面 App 里连接"；
+ *   ② RDP 无壳桥 → 复制**本机隧道口**（`127.0.0.1:25910-25999`，取不到才回退卡片地址）
+ *      + "请在你的远程桌面 App 里连接"，提示行自带地址（2026-11-11：剪贴板常拿不到）；
  *   ③ DSH → `MycoShell.openInBrowser(http://127.0.0.1:<localPort>/)`；
  *   ④ presence 离线 / caps 拒绝 / 固定口起不来 → **不启动客户端**（不谎报 ready）。
  */
@@ -29,6 +30,7 @@ import {
   type EnvOpenDeps,
 } from './task-open'
 import type { TaskEnv } from './task-env'
+import { fnBodyOf } from './test-support/fn-body'
 
 interface Calls {
   copy: string[]
@@ -69,6 +71,27 @@ function deps(
     },
   }
   return { ...base, ...over, calls }
+}
+
+/**
+ * 假 localStorage：`pickPhoneForward` 从 `myco.vnetForwards` 读「本机隧道口」表，
+ * 这里只喂这一张表（RDP 地址选择的行为断言用）。
+ */
+function withLocalForwards(list: unknown[]): () => void {
+  const g = globalThis as unknown as { localStorage?: unknown }
+  const prev = g.localStorage
+  g.localStorage = {
+    getItem: (k: string) => (k === 'myco.vnetForwards' ? JSON.stringify(list) : null),
+    setItem: () => undefined,
+    removeItem: () => undefined,
+    clear: () => undefined,
+    key: () => null,
+    length: 0,
+  }
+  return () => {
+    if (prev === undefined) delete g.localStorage
+    else g.localStorage = prev
+  }
 }
 
 ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m))
@@ -124,8 +147,8 @@ describe('列表行路由：env 卡 → 环境；老卡 → 分享入口', () =>
   })
 })
 
-describe('RDP：手机没有 mstsc → 自动复制地址 + 明确下一步（2026-10-25：不显示地址本身）', () => {
-  it('没有壳桥 → 复制 127.0.0.1:23389（剪贴板拿全地址）并提示到远程桌面 App 里粘贴', async () => {
+describe('RDP：手机没有 mstsc → 拿本机隧道口 + 明确下一步（2026-11-11：提示行必须带地址）', () => {
+  it('没有壳桥、也没有本机隧道口 → 回退卡片地址（addressOf）并提示到远程桌面 App 里粘贴', async () => {
     const d = deps({ rdpBridge: false })
     const r = await openTaskEnv(RDP, { gate: 'ok', deps: d })
     expect(r.state).toBe('ready')
@@ -134,13 +157,47 @@ describe('RDP：手机没有 mstsc → 自动复制地址 + 明确下一步（20
     expect(d.calls.copy).toEqual(['127.0.0.1:23389'])
     expect(r.note).toContain('已复制连接地址')
     expect(r.note).toContain('请在你的远程桌面 App 里粘贴连接')
-    expect(r.note).not.toContain('127.0.0.1')
+    // 2026-11-11 真机：WebView 里 clipboard 常没有用户手势 → 复制必败；提示行必须
+    // 自带地址（addrHint），否则用户手上根本没有可粘贴的东西。
+    expect(r.note).toContain('（地址 127.0.0.1:23389）')
     // 2026-11-01 真机（用户手机连 ECS Linux 报"没连上"）：RDP 服务端是自签证书，
     // 首次连接必弹证书确认，点取消就等于连不上。提示行必须把这一步和
     // 连接后的几秒黑屏说清楚，别让用户误判成"地址/端口填错"。
     expect(r.note).toContain('证书')
     expect(r.note).toContain('不再要求连接到这台电脑')
     expect(r.note).toContain('黑屏')
+  })
+
+  it('有本机隧道口（25910-25999）→ 复制隧道口，绝不把卡片里 PC 侧的 23389 当手机地址', async () => {
+    const restore = withLocalForwards([
+      { localPort: 25911, device: 'did:myco:zPC', port: 3389, enabled: true },
+    ])
+    try {
+      const d = deps({ rdpBridge: false })
+      const r = await openTaskEnv(RDP, { gate: 'ok', deps: d })
+      expect(d.calls.copy).toEqual(['127.0.0.1:25911'])
+      expect(r.address).toBe('127.0.0.1:25911')
+      expect(r.note).toContain('（地址 127.0.0.1:25911）')
+      // 反向锁：卡片里的 localPort(23389) 是 **PC 侧**口，手机上没人监听——
+      // 只要本机隧道口在，就不许再拿它当手机地址（2026-11-11 真机"复制成功连不上"）。
+      expect(d.calls.copy[0]).not.toBe('127.0.0.1:23389')
+    } finally {
+      restore()
+    }
+  })
+
+  it('隧道口落在 25910-25999 之外 → 不采用（回退卡片地址），段外端口不许当隧道口', async () => {
+    const restore = withLocalForwards([
+      { localPort: 26000, device: 'did:myco:zPC', port: 3389, enabled: true },
+    ])
+    try {
+      const d = deps({ rdpBridge: false })
+      const r = await openTaskEnv(RDP, { gate: 'ok', deps: d })
+      expect(d.calls.copy).toEqual(['127.0.0.1:23389'])
+      expect(r.address).toBe('127.0.0.1:23389')
+    } finally {
+      restore()
+    }
   })
 
   it('有壳桥（MycoShell.openRdp）→ 直接用远程桌面打开，不复制', async () => {
@@ -500,27 +557,51 @@ describe('失败态：不启动客户端、不谎报成功', () => {
 })
 
 describe('接线（源码合同）：手机任务列表行 env 优先于分享入口', () => {
-  it('openShare 先走 openTaskEnv，再回落到 openTaskShare（顺序不得反）', () => {
+  it('openShare 分支顺序：adb → dsh → env（RDP 先拉本机隧道）→ 分享卡兜底', () => {
     const src = readFileSync(new URL('./components/FriendsPanel.tsx', import.meta.url), 'utf8')
-    const body = src.slice(src.indexOf('const openShare ='))
-    const envAt = body.indexOf('openTaskEnv(')
-    const shareAt = body.indexOf('openTaskShare(')
-    expect(envAt).toBeGreaterThan(-1)
-    expect(shareAt).toBeGreaterThan(envAt)
+    const body = fnBodyOf(src, 'openShare')
     // 列表行要能看见 env（卡面 env 缺失时老卡照旧走分享入口）
     expect(src).toContain('declaredEnvsOfCard(')
+    // 2026-11-11 两条前置特例路由（必须出现在通用 env 直开之前）：
+    // ① 本机 adb 卡 → 手机当 vnet server（adbServerStart），不是 env 直开；
+    // ② DSH 卡带分享坐标 → 取票链 openTaskShare（网关入口要新鲜 mt 票，
+    //    卡上 entryUrl 是设备域形态在手机不可直达）。
+    const adbAt = body.indexOf("env.kind === 'adb'")
+    const dshAt = body.indexOf("env.kind === 'dsh'")
+    const envAt = body.indexOf('openTaskEnv(')
+    expect(adbAt).toBeGreaterThan(-1)
+    expect(dshAt).toBeGreaterThan(-1)
+    expect(envAt).toBeGreaterThan(-1)
+    expect(adbAt).toBeLessThan(dshAt)
+    expect(dshAt).toBeLessThan(envAt)
+    // 通用 env 直开之前：RDP 先把设备隧道拉起来并回写本机口
+    // （卡片里写死的 localPort 是 PC 侧口，手机上没人监听 → 直接 openTaskEnv 必连不上）
+    const rdpPrepAt = body.indexOf('ensureRdpForwardFor(env.device)')
+    expect(rdpPrepAt).toBeGreaterThan(-1)
+    expect(rdpPrepAt).toBeLessThan(envAt)
+    // 通用 env 直开之后才是无 env 老卡的分享入口兜底
+    expect(body.indexOf('openTaskShare(', envAt)).toBeGreaterThan(envAt)
   })
 })
 
 describe('接线（源码合同）：DSH 列表行不露「↗ 浏览器」（2026-11-01 设计定稿移除）', () => {
-  it('系统浏览器入口不得回归；主路径仍走 openTaskEnv（应用内壳）', () => {
+  it('系统浏览器入口不得回归；RDP 主路径＝先 ensureRdpForwardFor 再 openTaskEnv（应用内壳）', () => {
     const src = readFileSync(new URL('./components/FriendsPanel.tsx', import.meta.url), 'utf8')
     // 2026-10-31 曾加「↗ 浏览器」次要动作；当晚设计定稿移除（系统浏览器独立存储分区，
     // 空态不可控）。源码合同改为：入口不得回归。
     expect(src).not.toContain('↗ 浏览器')
     expect(src).not.toContain('openTaskEnvExternal(')
     expect(src).not.toContain('canOpenEnvExternal(')
-    expect(src).toContain('void openTaskEnv(') // 主路径仍走应用内壳
+    // 主路径仍走应用内壳 openTaskEnv；RDP 的前置是「先有本机隧道口」——
+    // 2026-11-11 改写成 `const prep = ensureRdpForwardFor(...); void prep.then(() => openTaskEnv(env, ...))`，
+    // 断言顺序而不是某一句字面量，否则一句重构就假警。
+    const body = fnBodyOf(src, 'openShare')
+    const prepAt = body.indexOf('ensureRdpForwardFor(env.device)')
+    const envAt = body.indexOf('openTaskEnv(env,')
+    expect(prepAt).toBeGreaterThan(-1)
+    expect(envAt).toBeGreaterThan(prepAt)
+    // prep 只对 RDP 生效（别让 adb/dsh 也白等隧道）
+    expect(body).toContain("env.kind === 'rdp' && env.device")
   })
 })
 

@@ -1,6 +1,6 @@
 // official-read.test.mjs — /official/read 双鉴权（平台代读 TD-021~025）+ 多 token 单测（node --test）
 // 2026-10-24 有灵myco：任务直达卡实现批第①步（identity-svc）。
-// 口径来源：youling-myco/eval/task-dispatch/task.md v1.3 §C 组 + 契约 §9.1（平台设计页 v0.2）。
+// 口径来源：repo-b/eval/task-dispatch/task.md v1.3 §C 组 + 契约 §9.1（平台设计页 v0.2）。
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'

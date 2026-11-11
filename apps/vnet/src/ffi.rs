@@ -28,6 +28,43 @@ struct ClientHandle {
 static CLIENTS: OnceLock<Mutex<std::collections::HashMap<u32, ClientHandle>>> = OnceLock::new();
 static SERVER: OnceLock<Mutex<Option<Arc<AtomicBool>>>> = OnceLock::new();
 
+/// 最近一次 start 失败的人读原因（2026-11-11 手机 rc=4 真案）。
+/// 嵌入方（Android）拿不到进程 stderr——eprintln 在 Android 默认进 /dev/null，
+/// 宿主只看到一个裸 rc 码根本没法排障（"隧道建立失败 rc=4"排查了一晚上）。
+/// 这里把失败串出来，宿主用 [`vnet_last_error`] 读；成功启动即清空。
+static LAST_ERR: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn last_err_slot() -> &'static Mutex<String> {
+    LAST_ERR.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn record_err(s: String) {
+    *last_err_slot().lock().unwrap() = s;
+}
+
+fn clear_err() {
+    last_err_slot().lock().unwrap().clear();
+}
+
+/// 读最近一次 start 失败原因（NUL 结尾 UTF-8 写入 buf）。
+/// 返回 0=OK 5=缓冲区太小 4=内部错误（错误串含 NUL）。
+#[no_mangle]
+pub extern "C" fn vnet_last_error(buf: *mut c_char, buflen: c_int) -> c_int {
+    let s = last_err_slot().lock().unwrap().clone();
+    let c = match CString::new(s) {
+        Ok(c) => c,
+        Err(_) => return VNET_ERR_INTERNAL,
+    };
+    let bytes = c.to_bytes_with_nul();
+    if buf.is_null() || buflen < bytes.len() as c_int {
+        return VNET_ERR_BUFSMALL;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+    }
+    VNET_OK
+}
+
 fn clients_map() -> &'static Mutex<std::collections::HashMap<u32, ClientHandle>> {
     CLIENTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -77,18 +114,117 @@ pub extern "C" fn vnet_client_start(
     let conn = match crate::connection::Connection::with_secret_and_port(&relay_s, peer_id, target_peer_id, sec, None) {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            eprintln!("[vnet-ffi] client construct failed: {:#}", e);
+            let msg = format!("client construct failed: {:#}", e);
+            eprintln!("[vnet-ffi] {msg}");
+            record_err(msg);
             return VNET_ERR_INTERNAL;
         }
     };
     // detached：accept 循环跑独立线程，本调用立刻返回（JNI 调用线程不能被阻塞）
     match conn.start_client_detached(local_port) {
         Ok(()) => {
+            clear_err();
             clients_map().lock().unwrap().insert(peer_id, ClientHandle { conn });
             VNET_OK
         }
         Err(e) => {
-            eprintln!("[vnet-ffi] client_start failed: {:#}", e);
+            let msg = format!("client_start failed: {:#}", e);
+            eprintln!("[vnet-ffi] {msg}");
+            record_err(msg);
+            // 启动失败必须把 Connection 停掉：否则 peer_id 占位与 relay 映射泄漏，
+            // 宿主下次同 peer_id 只会拿到 PEER_ID_IN_USE（2026-11-11 手机真案）。
+            conn.stop();
+            VNET_ERR_INTERNAL
+        }
+    }
+}
+
+/// 启动 multi-forward 客户端（对端是 `:server:multi-forward-v1` 那种设备级 server）。
+///
+/// 为什么需要单独的入口（2026-11-11 手机真机定界）：myco 现役配置
+/// `MYCO_VNET_MULTI_FORWARD=1` 下，PC **只**起一条 multi-forward server
+/// （peer_id=SHA256("vnet-peer"||did||":server:multi-forward-v1")），
+/// 逐端口 server（`:server:9100` 之类）根本不启动。用单目标 API 连逐端口
+/// peer_id 会 `[A_lookup_peer] no_answer` → 静默预算耗尽 → 流被关。本机 CLI
+/// 客户端对同一 peer_id 也一样失败（A/B 实证），不是手机侧问题。
+///
+/// 语义：注册/建链在**调用线程**完成（与单目标版一致），forward 由
+/// [`vnet_client_add_forward`] 追加，端口监听在 libvnet 线程里。
+#[no_mangle]
+pub extern "C" fn vnet_client_start_multi(
+    relay: *const c_char,
+    peer_id: u32,
+    target_peer_id: u32,
+    secret: *const c_char,
+) -> c_int {
+    let (relay_s, secret_s) = match (opt_cstr(relay), opt_cstr(secret)) {
+        (Some(r), Some(s)) => (r, s),
+        _ => return VNET_ERR_ARG,
+    };
+    {
+        let map = clients_map().lock().unwrap();
+        if map.contains_key(&peer_id) {
+            return VNET_ERR_RUNNING;
+        }
+    }
+    let sec = if secret_s.is_empty() { None } else { Some(secret_s.as_str()) };
+    let conn = match crate::connection::Connection::with_secret_and_port(&relay_s, peer_id, target_peer_id, sec, None) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            let msg = format!("client_start_multi construct failed: {:#}", e);
+            eprintln!("[vnet-ffi] {msg}");
+            record_err(msg);
+            return VNET_ERR_INTERNAL;
+        }
+    };
+    conn.enable_multi_forward();
+    // start_client_multi 在 multi 模式下只起接收/keepalive/探测线程，
+    // 不建 listener、不阻塞（listener 由 add_forward 各自绑定），所以直接同步调。
+    if let Err(e) = conn.start_client_multi() {
+        let msg = format!("client_start_multi failed: {e}");
+        eprintln!("[vnet-ffi] {msg}");
+        record_err(msg);
+        conn.stop();
+        return VNET_ERR_INTERNAL;
+    }
+    clear_err();
+    clients_map().lock().unwrap().insert(peer_id, ClientHandle { conn });
+    VNET_OK
+}
+
+/// 给已启动的 multi-forward 客户端追加一条转发（本地口 → 对端 target）。
+/// 返回 0=成功 1=参数错误 3=该 peer_id 未运行 4=内部错误（原因见 vnet_last_error）。
+#[no_mangle]
+pub extern "C" fn vnet_client_add_forward(peer_id: u32, local_port: u16, target_port: u16) -> c_int {
+    if local_port == 0 || target_port == 0 {
+        return VNET_ERR_ARG;
+    }
+    let conn = {
+        let map = clients_map().lock().unwrap();
+        match map.get(&peer_id) {
+            Some(h) => h.conn.clone(),
+            None => return VNET_ERR_NOT_RUNNING,
+        }
+    };
+    match conn.add_forward(crate::forward::ForwardSpec { local_port, target_port }) {
+        Ok(info) => {
+            if info.local_port != local_port {
+                let msg = format!(
+                    "add_forward port drift: requested {local_port}, got {}",
+                    info.local_port
+                );
+                eprintln!("[vnet-ffi] {msg}");
+                record_err(msg);
+                let _ = conn.remove_forward(info.local_port);
+                return VNET_ERR_INTERNAL;
+            }
+            clear_err();
+            VNET_OK
+        }
+        Err(e) => {
+            let msg = format!("add_forward :{local_port} -> :{target_port} failed: {e:#}");
+            eprintln!("[vnet-ffi] {msg}");
+            record_err(msg);
             VNET_ERR_INTERNAL
         }
     }
@@ -253,6 +389,37 @@ pub extern "C" fn vnet_set_register_credentials(
     };
     crate::relay::set_register_credentials(&d, ts, &s);
     VNET_OK
+}
+
+/// 注入本机设备身份（DID + 32 字节 seed 的 hex），此后**本进程发起的每条流**
+/// 都会先发 AUTH 帧（`identity::build_auth_frame`），对端启用 peer identity 时才
+/// 会放行。
+///
+/// 为什么必须有：2026-11-11 手机真机——PC 侧 `MYCO_PEER_IDENTITY=1` 后，
+/// 入站未认证流一律 `AUTH_REQUIRED` 拒绝。手机只起 client 不注身份 →
+/// 本地回环口能建、握手能成、请求字节发出去就再无下文（宿主只看到 10s 读超时
+/// 或 "unexpected end of stream"）。这是「手机→PC 数据面不通」的最后一层。
+///
+/// 隐私边界：私钥只经此函数进内存，不落盘、不进日志。
+#[no_mangle]
+pub extern "C" fn vnet_set_local_identity(did: *const c_char, seed_hex: *const c_char) -> c_int {
+    let (Some(d), Some(s)) = (opt_cstr(did), opt_cstr(seed_hex)) else {
+        return VNET_ERR_ARG;
+    };
+    match crate::identity::set_local_identity_from_seed(&d, &s) {
+        Some(_key_id) => VNET_OK,
+        None => VNET_ERR_ARG,
+    }
+}
+
+/// 本机设备身份是否已注入（0=未注入 1=已注入）。宿主用它决定是否还要补注入。
+#[no_mangle]
+pub extern "C" fn vnet_has_local_identity() -> c_int {
+    if crate::identity::local_did().is_some() {
+        1
+    } else {
+        0
+    }
 }
 
 /// 注入单个对端候选地址（presence 数据，逐个调用累积）。

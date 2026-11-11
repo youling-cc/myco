@@ -377,7 +377,7 @@ describe('visGrantDirty · 逐人脏判定（基线=展开快照）', () => {
 
 describe('visPath* · 路径归一（同一个项目两种写法不能算两个）', () => {
   it('samePath：反斜杠/正斜杠、大小写、尾分隔符都不算差异', () => {
-    expect(visSamePath('D:\\Projects\\AOP\\myco', 'd:/projects/aop/myco/')).toBe(true)
+    expect(visSamePath('D:\\Projects\\labs\\myco', 'd:/projects/labs/myco/')).toBe(true)
     expect(visSamePath('D:\\a', 'D:\\b')).toBe(false)
     expect(visSamePath('', '')).toBe(false)
     expect(visPathKey('C:\\X\\')).toBe('c:/x')
@@ -390,9 +390,9 @@ describe('visPath* · 路径归一（同一个项目两种写法不能算两个�
     expect(visPathUnder('', 'D:\\p')).toBe(false)
   })
   it('tail / parent：同名项目靠父目录区分', () => {
-    expect(visPathTail('D:\\AOP\\myco')).toBe('myco')
-    expect(visPathTail('D:\\AOP\\myco\\')).toBe('myco')
-    expect(visPathParent('D:\\AOP\\myco')).toBe('AOP')
+    expect(visPathTail('D:\\labs\\myco')).toBe('myco')
+    expect(visPathTail('D:\\labs\\myco\\')).toBe('myco')
+    expect(visPathParent('D:\\labs\\myco')).toBe('labs')
     expect(visPathParent('D:\\myco')).toBe('D:') // 盘符就是它的父段
   })
 })
@@ -434,11 +434,11 @@ describe('会话→项目归属映射（option 字段 / schema.sessionCwds）', 
 
 describe('visFilterSessionsByProjects · 会话勾选先按项目筛（未选=全部；拿不到映射=全部+说明）', () => {
   const OPTS: VisOption[] = [
-    { value: 's-a', label: 'A 项目里的', cwd: 'D:\\AOP\\myco\\ui' },
-    { value: 's-b', label: 'B 项目里的', cwd: 'D:\\AOP\\other' },
+    { value: 's-a', label: 'A 项目里的', cwd: 'D:\\labs\\myco\\ui' },
+    { value: 's-b', label: 'B 项目里的', cwd: 'D:\\labs\\other' },
     { value: 's-c', label: '归属不明' },
   ]
-  const PROJS = ['D:\\AOP\\myco']
+  const PROJS = ['D:\\labs\\myco']
   it('未选项目 → 全部、不筛（mapped:true）', () => {
     const r = visFilterSessionsByProjects(OPTS, [])
     expect(r.items).toEqual(OPTS)
@@ -459,11 +459,11 @@ describe('visFilterSessionsByProjects · 会话勾选先按项目筛（未选=�
     expect(r.hidden + r.hiddenUnknown).toBe(0)
   })
   it('会话 cwd 是项目子目录也算该项目；多项目取并集；无归属会话不算', () => {
-    expect(visSessionInProjects({ cwd: 'D:\\AOP\\myco\\sub' }, PROJS)).toBe(true)
-    expect(visSessionInProjects({ cwd: 'D:\\AOP\\myco2' }, PROJS)).toBe(false)
+    expect(visSessionInProjects({ cwd: 'D:\\labs\\myco\\sub' }, PROJS)).toBe(true)
+    expect(visSessionInProjects({ cwd: 'D:\\labs\\myco2' }, PROJS)).toBe(false)
     expect(visSessionInProjects({}, PROJS)).toBe(false)
     expect(visSessionInProjects({ cwd: 'D:\\x' }, [])).toBe(true)
-    const r = visFilterSessionsByProjects(OPTS, ['D:\\AOP\\myco', 'D:\\AOP\\other'])
+    const r = visFilterSessionsByProjects(OPTS, ['D:\\labs\\myco', 'D:\\labs\\other'])
     expect(r.items.map((o) => o.value)).toEqual(['s-a', 's-b'])
   })
 })
@@ -513,10 +513,10 @@ describe('visScopeLabel / visCeilingLabel · 多项目个数（N）', () => {
 
 describe('buildVisibilityPayload · 完整回写体（projects 契约 2026-10-24）', () => {
   it('project 档：带 projects 白名单（去空），projectCwd 统一 null（后端=沿用分享 cwd 语义）', () => {
-    const d = { ...visDraftFrom(CUR, ITEMS), space: 'project', projects: ['D:\\AOP\\myco', '  '] }
+    const d = { ...visDraftFrom(CUR, ITEMS), space: 'project', projects: ['D:\\labs\\myco', '  '] }
     expect(buildVisibilityPayload(CUR, ITEMS, d)).toEqual({
       space: 'project', sessions: ['s-1'], windowMs: 21600000,
-      projects: ['D:\\AOP\\myco'], projectCwd: null,
+      projects: ['D:\\labs\\myco'], projectCwd: null,
     })
   })
   it('session 档：sessions 与 projects 都带（后端先按项目筛再按会话筛）', () => {

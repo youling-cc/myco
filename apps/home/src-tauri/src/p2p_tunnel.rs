@@ -150,6 +150,124 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as TMessage;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
+// ═══════════════════════════════════════════════════════════════════════
+// 诊断行毫秒时间戳（2026-11-11 RDP 三连断经验沉淀）
+//
+// 事故现场：PC 日志抽样 20 万行，`[vnet-keeper]` 占 35%，但**一行时间戳都没有**
+// （裸 `eprintln!`）——"20:54/20:58 重启 → 21:00 三次 RDP，前两次连上就断"这条
+// 时间线只能靠计数和文件 mtime 反推，无法证实也无法证伪。
+//
+// 契约：
+// · 只加前缀、**一个字节都不改消息正文**（`{ts} {原行}`），现有 grep 锚点
+//   （`[vnet-keeper]` / `[p2p-tunnel]` …）与解析脚本继续可用；
+// · 毫秒精度、本地时区（与 `relay-trace.log` 的 `%H:%M:%S%.3f` 同口径，
+//   但补全年月日——事故跨天时 `%H:%M:%S` 无法定位）；
+// · 跨平台（chrono，无 Windows API），不影响非 Windows 构建；
+// · 每次调用一次 `chrono::Local::now()`，不加锁、不碰全局表——这些行都是低频
+//   诊断（keeper 每拍/建链每跳），热点行另有节流（见 vnet_lease 的 keeper_log）。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 日志时间戳格式：`2026-11-11 21:00:00.123`（定宽 23 字符，便于按列 diff）。
+pub(crate) const LOG_TS_FMT: &str = "%Y-%m-%d %H:%M:%S%.3f";
+
+/// 把给定时刻格式化成日志时间戳（纯函数；单测钉住"定宽 + 毫秒补零"）。
+pub(crate) fn format_log_ts(dt: chrono::DateTime<chrono::Local>) -> String {
+    dt.format(LOG_TS_FMT).to_string()
+}
+
+/// 可打印时间戳（`impl Display`，不额外分配 String；`elog!` 用它）。
+pub(crate) fn log_ts(dt: chrono::DateTime<chrono::Local>) -> impl std::fmt::Display {
+    dt.format(LOG_TS_FMT)
+}
+
+/// 当前时刻的日志时间戳字符串。
+pub(crate) fn now_log_ts() -> String {
+    format_log_ts(chrono::Local::now())
+}
+
+/// 一行诊断文本 = `时间戳 + 空格 + 原消息`（纯函数；"只加前缀不改正文"的测试锚点）。
+pub(crate) fn format_log_line(dt: chrono::DateTime<chrono::Local>, msg: &str) -> String {
+    format!("{} {msg}", format_log_ts(dt))
+}
+
+/// 带毫秒时间戳的诊断行：参数与 `eprintln!` 完全一致，只多一个 `{ts} ` 前缀。
+///
+/// 用法（本 crate 内任意模块）：`crate::p2p_tunnel::elog!("[vnet-keeper] …")`。
+/// 为什么是宏而不是 `fn elog(&str)`：后者要求调用点先 `format!`（多一次分配）
+/// 或丢掉 `{:?}`/内联参数；宏把 `format_args!` 直接喂给 `eprintln!`，只在真正
+/// 打印时才格式化，且**完全不改变**原消息的 `{}`/`{x}` 捕获语义。
+macro_rules! elog {
+    ($($arg:tt)*) => {{
+        eprintln!(
+            "{} {}",
+            $crate::p2p_tunnel::log_ts(chrono::Local::now()),
+            format_args!($($arg)*)
+        );
+    }};
+}
+pub(crate) use elog;
+
+#[cfg(test)]
+mod log_ts_tests {
+    use super::*;
+    use chrono::TimeZone as _;
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32, ms: u32) -> chrono::DateTime<chrono::Local> {
+        chrono::Local
+            .with_ymd_and_hms(y, mo, d, h, mi, s)
+            .single()
+            .expect("本地时区该时刻应唯一")
+            + chrono::Duration::milliseconds(i64::from(ms))
+    }
+
+    /// 事故要求的格式：`2026-11-11 21:00:00.123`（定宽、毫秒三位、本地时区）。
+    #[test]
+    fn log_ts_is_fixed_width_millisecond_local_time() {
+        let dt = at(2026, 11, 11, 21, 0, 0, 123);
+        assert_eq!(format_log_ts(dt), "2026-11-11 21:00:00.123");
+        assert_eq!(format_log_ts(dt).len(), 23, "定宽 23 字符（含毫秒补零）");
+        // 毫秒必须补零到三位（`%.3f`），否则排序/比对会错位
+        assert_eq!(format_log_ts(at(2026, 1, 2, 3, 4, 5, 7)), "2026-01-02 03:04:05.007");
+        assert_eq!(format_log_ts(at(2026, 1, 2, 3, 4, 5, 0)), "2026-01-02 03:04:05.000");
+        // 跨天定位能力（事故跨 20:54 → 21:00 的边界）
+        assert_eq!(format_log_ts(at(2026, 11, 12, 0, 0, 1, 999)), "2026-11-12 00:00:01.999");
+        // Display 版（elog! 真正用的那条）与 String 版必须逐字节一致
+        assert_eq!(log_ts(dt).to_string(), format_log_ts(dt));
+    }
+
+    /// **只加前缀、不改正文**：前缀之后必须逐字节等于原消息（含中文/箭头/`{:?}` 结果）。
+    #[test]
+    fn log_line_prefixes_without_touching_body() {
+        let dt = at(2026, 11, 11, 21, 0, 0, 123);
+        let body = "[vnet-keeper] 固定口漂移 → 收编现状 :23389（不 close，避免重建循环）：did:myco:x:5555";
+        let line = format_log_line(dt, body);
+        assert_eq!(line, format!("2026-11-11 21:00:00.123 {body}"));
+        assert!(line.ends_with(body), "正文必须原样保留在行尾");
+        assert!(line.starts_with("2026-11-11 21:00:00.123 "), "时间戳前缀独立成段");
+        // 阈值：前缀恰好 24 字节（23 字符 + 一个空格），消息体可以从第 24 字节起切
+        assert_eq!(&line[..24], "2026-11-11 21:00:00.123 ");
+        assert_eq!(&line[24..], body);
+    }
+
+    /// 实时路径冒烟：`now_log_ts()` 必须是当下（误差 < 1h）、形状恒定。
+    #[test]
+    fn now_log_ts_has_expected_shape() {
+        let ts = now_log_ts();
+        assert_eq!(ts.len(), 23, "{ts}");
+        let bytes = ts.as_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            let ok = match i {
+                4 | 7 => *b == b'-',
+                10 => *b == b' ',
+                13 | 16 => *b == b':',
+                19 => *b == b'.',
+                _ => b.is_ascii_digit(),
+            };
+            assert!(ok, "位置 {i} 字符非法：{ts}");
+        }
+    }
+}
+
 /// 隧道握手信封头（原文即签名载荷）。
 pub const TUNNEL_HANDSHAKE_HEADER: &str = "x-myco-tunnel";
 /// 握手协议版本。
@@ -485,7 +603,7 @@ fn tunnel_authorized(account: &str, device: &str, port: u16) -> bool {
     match hook {
         Some(f) => f(account, device, port),
         None => {
-            eprintln!("[p2p-tunnel] 未安装授权钩子 → 拒绝 {account}/{device}:{port}（网关需 set_tunnel_authorizer 开闸）");
+            elog!("[p2p-tunnel] 未安装授权钩子 → 拒绝 {account}/{device}:{port}（网关需 set_tunnel_authorizer 开闸）");
             false
         }
     }
@@ -517,7 +635,7 @@ const TUNNEL_AUDIT_CAP: usize = 256;
 static TUNNEL_AUDIT: LazyLock<Mutex<Vec<TunnelAudit>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn audit_push(rec: TunnelAudit) {
-    eprintln!(
+    elog!(
         "[p2p-tunnel] {} account={} device={} port={} peer={}",
         rec.result, rec.account, rec.device, rec.port, rec.peer
     );
@@ -893,7 +1011,7 @@ fn gen_ephemeral() -> (X25519Secret, [u8; 32]) {
         bytes[0..16].copy_from_slice(&t);
         bytes[16..24].copy_from_slice(&n);
         bytes[24..32].copy_from_slice(&t[8..16]);
-        eprintln!("[p2p-tunnel] 警告：getrandom 不可用，临时钥退化生成（安全性下调）");
+        elog!("[p2p-tunnel] 警告：getrandom 不可用，临时钥退化生成（安全性下调）");
     }
     let s = X25519Secret::from(bytes);
     let p = X25519Public::from(&s).to_bytes();
@@ -999,7 +1117,7 @@ pub(crate) async fn crypto_handshake_client(
     ws.send(TMessage::Binary(io.confirm_frame()))
         .await
         .map_err(|e| FrameError::Io(format!("{e:?}")))?;
-    eprintln!("[p2p-tunnel] crypto-handshake ms={}", t0.elapsed().as_millis());
+    elog!("[p2p-tunnel] crypto-handshake ms={}", t0.elapsed().as_millis());
     Ok(io)
 }
 
@@ -1018,7 +1136,7 @@ pub async fn handle_tunnel(
     let extra = tunnel_extra_ports();
     // ⓪ 协议版本（query `?v=2`，最廉价先挡）：老 v1 客户端/缺参数一律 400（不静默降级）
     if !query_version_ok(&uri, TUNNEL_PROTOCOL_VERSION) {
-        eprintln!(
+        elog!(
             "[p2p-tunnel] 拒绝：协议版本不符（query 非 v{TUNNEL_PROTOCOL_VERSION}）peer={peer}"
         );
         audit_push(audit(&peer, "", "", 0, TunnelReject::BadHandshake));
@@ -1064,7 +1182,7 @@ pub async fn handle_tunnel(
     // ③ 廉价闸（设备一致 + 端口白名单）——过了才做重放去重/归属（可能云名册 HTTP）
     if let Err(r) = tunnel_gate_decision(&signer, &hs.device, hs.port, &extra, true, true) {
         if matches!(r, TunnelReject::PortNotAllowed) {
-            eprintln!("[p2p-tunnel] port-not-allowed raw={raw}");
+            elog!("[p2p-tunnel] port-not-allowed raw={raw}");
         }
         audit_push(audit(&peer, &hs.account, &hs.device, hs.port, r));
         return r.into_response();
@@ -1110,7 +1228,7 @@ pub async fn handle_tunnel(
     });
     let (account, device, port) = (hs.account.clone(), hs.device.clone(), hs.port);
     let resume_capable = hs.resume_capable();
-    eprintln!("[p2p-tunnel] handle_tunnel resume_capable={resume_capable} cap={:?} raw={raw}", hs.cap);
+    elog!("[p2p-tunnel] handle_tunnel resume_capable={resume_capable} cap={:?} raw={raw}", hs.cap);
     ws.on_upgrade(move |socket| tunnel_serve(socket, raw, peer, account, device, port, resume_capable))
 }
 
@@ -1169,7 +1287,7 @@ async fn tunnel_serve(
 ) {
     let mut socket = socket;
     let t0 = std::time::Instant::now();
-    eprintln!("[p2p-tunnel] tunnel_serve-start device={device} port={port} peer={peer}");
+    elog!("[p2p-tunnel] tunnel_serve-start device={device} port={port} peer={peer}");
     // 加密握手：失败=明确拒绝（审计 enc-fail），不降级
     let io = match crypto_handshake_server(&mut socket, &handshake_raw).await {
         Ok(io) => io,
@@ -1179,11 +1297,11 @@ async fn tunnel_serve(
             // 误读成双方互踢（实际多为拨号取消/赛跑败者被 RST）。
             let benign = matches!(&e, FrameError::Io(m) if peer_aborted_handshake(m));
             if benign {
-                eprintln!(
+                elog!(
                     "[p2p-tunnel] 对端在加密握手前断开（拨号取消/半开回收）→ {device}:{port}"
                 );
             } else {
-                eprintln!("[p2p-tunnel] 加密握手失败（{e}）→ 拒绝 {device}:{port}");
+                elog!("[p2p-tunnel] 加密握手失败（{e}）→ 拒绝 {device}:{port}");
             }
             audit_push(TunnelAudit {
                 ts: chrono::Utc::now().timestamp_millis(),
@@ -1203,7 +1321,7 @@ async fn tunnel_serve(
     };
     // cap=resume：先做逻辑会话首帧握手（SESSION_OPEN / RESUME），再进入 resume 数据泵。
     // 老客户端不声明 cap，完全走旧 v1 路径。
-    eprintln!("[p2p-tunnel] tunnel_serve resume_capable={resume_capable} device={device} port={port}");
+    elog!("[p2p-tunnel] tunnel_serve resume_capable={resume_capable} device={device} port={port}");
     let mut resume_pump: Option<(
         tunnel_resume_frames::ResumeIo,
         Arc<Mutex<tunnel_resume_frames::ResumeSession>>,
@@ -1211,22 +1329,22 @@ async fn tunnel_serve(
         Vec<u8>,
     )> = None;
     if resume_capable {
-        eprintln!("[p2p-tunnel] session-resume start device={device} port={port}");
+        elog!("[p2p-tunnel] session-resume start device={device} port={port}");
         let mut resume_io = tunnel_resume_frames::ResumeIo::new(io.keys.clone(), TunnelRole::Responder);
         let first = match socket.next().await {
             Some(Ok(Message::Binary(d))) => d,
             Some(Ok(Message::Close(_))) => {
-                eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} 对端关闭");
+                elog!("[p2p-tunnel] session-resume fail device={device} port={port} 对端关闭");
                 let _ = socket.close().await;
                 return;
             }
             Some(Ok(_)) | None => {
-                eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} 首帧缺失");
+                elog!("[p2p-tunnel] session-resume fail device={device} port={port} 首帧缺失");
                 let _ = socket.close().await;
                 return;
             }
             Some(Err(e)) => {
-                eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
+                elog!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
                 let _ = socket.close().await;
                 return;
             }
@@ -1245,7 +1363,7 @@ async fn tunnel_serve(
         let action = match tunnel_resume_frames::server_accept_first_frame(&mut resume_io, &first, 0, u64::MAX) {
             Ok((a, _ack)) => a,
             Err(e) => {
-                eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
+                elog!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
                 let _ = socket.close().await;
                 return;
             }
@@ -1258,13 +1376,13 @@ async fn tunnel_serve(
                 ) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
+                        elog!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
                         let _ = socket.close().await;
                         return;
                     }
                 };
                 if let Err(e) = socket.send(Message::Binary(ack)).await {
-                    eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} 回包失败 {e}");
+                    elog!("[p2p-tunnel] session-resume fail device={device} port={port} 回包失败 {e}");
                     let _ = socket.close().await;
                     return;
                 }
@@ -1280,7 +1398,7 @@ async fn tunnel_serve(
                     let owner = { RESUME_SESSION_OWNERS.lock().unwrap().get(&sid).cloned() };
                     let owner_ok = resume_owner_matches(owner, &account, &device);
                     if !owner_ok {
-                        eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} 会话归属不符");
+                        elog!("[p2p-tunnel] session-resume fail device={device} port={port} 会话归属不符");
                         let _ = socket.close().await;
                         return;
                     }
@@ -1288,7 +1406,7 @@ async fn tunnel_serve(
                     let replay = match replay_result {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
+                            elog!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
                             let _ = socket.close().await;
                             return;
                         }
@@ -1302,19 +1420,19 @@ async fn tunnel_serve(
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
+                            elog!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
                             let _ = socket.close().await;
                             return;
                         }
                     };
                     if let Err(e) = socket.send(Message::Binary(ack)).await {
-                        eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} 回包失败 {e}");
+                        elog!("[p2p-tunnel] session-resume fail device={device} port={port} 回包失败 {e}");
                         let _ = socket.close().await;
                         return;
                     }
                     let replay_len = replay.len();
                     resume_pump = Some((resume_io, sess, replay_from, replay));
-                    eprintln!("[p2p-tunnel] leg-switch device={device} port={port} replay_bytes={replay_len}");
+                    elog!("[p2p-tunnel] leg-switch device={device} port={port} replay_bytes={replay_len}");
                 } else {
                     // RESUME miss（例如 x11vnc/提供端重启导致旧会话消失）：
                     // 回 SESSION_ACK 让客户端重置为新会话，而不是直接关连接、让 RFB 首字节丢失。
@@ -1328,22 +1446,22 @@ async fn tunnel_serve(
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
+                            elog!("[p2p-tunnel] session-resume fail device={device} port={port} {e}");
                             let _ = socket.close().await;
                             return;
                         }
                     };
                     if let Err(e) = socket.send(Message::Binary(ack)).await {
-                        eprintln!("[p2p-tunnel] session-resume fail device={device} port={port} 回包失败 {e}");
+                        elog!("[p2p-tunnel] session-resume fail device={device} port={port} 回包失败 {e}");
                         let _ = socket.close().await;
                         return;
                     }
-                    eprintln!("[p2p-tunnel] session-resume fallback-open device={device} port={port}");
+                    elog!("[p2p-tunnel] session-resume fallback-open device={device} port={port}");
                     resume_pump = Some((resume_io, sess, 0, Vec::new()));
                 }
             }
         }
-        eprintln!("[p2p-tunnel] session-resume ok device={device} port={port}");
+        elog!("[p2p-tunnel] session-resume ok device={device} port={port}");
     }
     let target = format!("127.0.0.1:{port}");
     let tcp = match tokio::time::timeout(
@@ -1354,7 +1472,7 @@ async fn tunnel_serve(
     {
         Ok(Ok(t)) => t,
         other => {
-            eprintln!(
+            elog!(
                 "[p2p-tunnel] 上游 {target} 连接失败: {:?}",
                 other.err().map(|e| e.to_string())
             );
@@ -1371,13 +1489,13 @@ async fn tunnel_serve(
         }
     };
     let _ = tcp.set_nodelay(true);
-    eprintln!("[p2p-tunnel] upstream-ready {target} peer={peer} ms={}", t0.elapsed().as_millis());
+    elog!("[p2p-tunnel] upstream-ready {target} peer={peer} ms={}", t0.elapsed().as_millis());
     // 2026-10-23 真机排障（手机 forward 隧道 upgraded→closed 但目标服务零请求）：
     // 默认静默；`MYCO_TUNNEL_TRACE=1` 时打印"上游已连接"与"哪一侧先结束"，
     // 用于区分「根本没连上目标 / 连上但无数据 / 手机先关 / 上游先关」四种情况。
     let trace = std::env::var_os("MYCO_TUNNEL_TRACE").is_some();
     if trace {
-        eprintln!("[p2p-tunnel] trace 上游 {target} 已连接 → 开始中继 {device}:{port} peer={peer}");
+        elog!("[p2p-tunnel] trace 上游 {target} 已连接 → 开始中继 {device}:{port} peer={peer}");
     }
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (tcp_rx, tcp_tx) = tcp.into_split();
@@ -1420,13 +1538,13 @@ async fn tunnel_serve(
         }
     }
     if trace {
-        eprintln!(
+        elog!(
             "[p2p-tunnel] trace 中继结束 {device}:{port} 先结束={first} result={:?}",
             res.as_ref().map(|_| ()).map_err(|e| e.to_string())
         );
     }
     if let Err(e) = res {
-        eprintln!("[p2p-tunnel] 加密层错误（{e}）→ 关闭 {device}:{port}");
+        elog!("[p2p-tunnel] 加密层错误（{e}）→ 关闭 {device}:{port}");
         audit_push(TunnelAudit {
             ts: chrono::Utc::now().timestamp_millis(),
             account: account.clone(),
@@ -1558,7 +1676,7 @@ where
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if first_read {
-                            eprintln!("[p2p-tunnel] pump-up-first-read ms={}", t0.elapsed().as_millis());
+                            elog!("[p2p-tunnel] pump-up-first-read ms={}", t0.elapsed().as_millis());
                             first_read = false;
                         }
                         layer.feed_bytes(ws_tx, &buf[..n]).await?;
@@ -1618,7 +1736,7 @@ where
         match m {
             Ok(Message::Binary(d)) => {
                 if first_frame {
-                    eprintln!("[p2p-tunnel] pump-down-first-frame ms={}", t0.elapsed().as_millis());
+                    elog!("[p2p-tunnel] pump-down-first-frame ms={}", t0.elapsed().as_millis());
                     first_frame = false;
                 }
                 if d.len() > FRAME_MAX_PAYLOAD {
@@ -1800,7 +1918,7 @@ where
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if first_read {
-                            eprintln!("[p2p-tunnel] pump-up-first-read ms={}", t0.elapsed().as_millis());
+                            elog!("[p2p-tunnel] pump-up-first-read ms={}", t0.elapsed().as_millis());
                             first_read = false;
                         }
                         layer.feed_bytes(ws_tx, &buf[..n]).await?;
@@ -1839,7 +1957,7 @@ where
         match m {
             Ok(Message::Binary(d)) => {
                 if first_frame {
-                    eprintln!("[p2p-tunnel] pump-down-first-frame ms={}", t0.elapsed().as_millis());
+                    elog!("[p2p-tunnel] pump-down-first-frame ms={}", t0.elapsed().as_millis());
                     first_frame = false;
                 }
                 if d.len() > FRAME_MAX_PAYLOAD {
@@ -1894,7 +2012,7 @@ where
         match m {
             Ok(TMessage::Binary(d)) => {
                 if first_frame {
-                    eprintln!("[p2p-tunnel] pump-down-first-frame ms={}", t0.elapsed().as_millis());
+                    elog!("[p2p-tunnel] pump-down-first-frame ms={}", t0.elapsed().as_millis());
                     first_frame = false;
                 }
                 if d.len() > FRAME_MAX_PAYLOAD {
@@ -1904,7 +2022,7 @@ where
                 if let Err(e) =
                     write_all_client_local(&mut tcp_tx, &data, LOCAL_WRITE_STALL_TIMEOUT).await
                 {
-                    eprintln!("[p2p-tunnel] 本地目标写入失败，关闭隧道：{e}");
+                    elog!("[p2p-tunnel] 本地目标写入失败，关闭隧道：{e}");
                     return Err(e);
                 }
             }
@@ -2398,7 +2516,7 @@ fn warm_start(device_did: &str, target_port: u16, bases: Vec<String>) {
                 warm_drain(&key);
                 WARM_TOUCH.lock().unwrap().remove(&key);
                 WARM_RUNNERS.lock().unwrap().remove(&key);
-                eprintln!("[p2p-tunnel] 预热池收工（{key}）");
+                elog!("[p2p-tunnel] 预热池收工（{key}）");
                 return;
             }
             // 补池：**按缺口并发补**（2026-10-14 P1 真案根修）。
@@ -2681,7 +2799,7 @@ fn load_contexts_from_path(path: &std::path::Path) -> Vec<NetworkContext> {
         return Vec::new();
     };
     let Ok(f) = serde_json::from_str::<NetworkContextsFile>(&s) else {
-        eprintln!(
+        elog!(
             "[vnet-route] 网络上下文文件损坏，按空重建（{}）",
             path.display()
         );
@@ -2746,7 +2864,7 @@ fn schedule_context_save() {
             }
             let snap = contexts_snapshot();
             if let Err(e) = save_contexts_to_path(&path, &snap) {
-                eprintln!("[vnet-route] 网络上下文落盘失败（降级继续）：{e}");
+                elog!("[vnet-route] 网络上下文落盘失败（降级继续）：{e}");
             }
         }
         CTX_SAVE_RUNNING.store(false, Ordering::SeqCst);
@@ -2914,7 +3032,7 @@ pub(crate) fn current_context() -> Arc<Mutex<NetworkContext>> {
     if g.contexts.len() >= NET_CTX_MAX {
         if let Some(victim) = pick_lru_victim(&g, &nid) {
             g.contexts.remove(&victim);
-            eprintln!("[vnet-route] 网络上下文 LRU 淘汰 {victim}（上限 {NET_CTX_MAX} 槽）");
+            elog!("[vnet-route] 网络上下文 LRU 淘汰 {victim}（上限 {NET_CTX_MAX} 槽）");
         }
     }
     let ctx = Arc::new(Mutex::new(NetworkContext::new(&nid, now)));
@@ -2981,7 +3099,7 @@ fn update_route_fail_with_cooldown(device: &str, base: &str, allow_cooldown: boo
         if allow_cooldown && r.fail_count >= ROUTE_COOLDOWN_FAILS {
             r.cooldown_until = now.saturating_add(ROUTE_COOLDOWN_MS);
             r.fail_count = 0;
-            eprintln!(
+            elog!(
                 "[vnet-route] 路由冷却 {}s（{device} ← {base}；连续失败 {ROUTE_COOLDOWN_FAILS} 次）",
                 ROUTE_COOLDOWN_MS / 1000
             );
@@ -3003,7 +3121,7 @@ fn audit_route_hit(device: &str, base: &str, rtt_ms: u64, source: &str) {
             ROUTE_HIT_RACE.fetch_add(1, Ordering::Relaxed);
         }
     }
-    eprintln!(
+    elog!(
         "[vnet-route] vnet-route-hit device={device} base={base} rtt_ms={rtt_ms} source={source}"
     );
 }
@@ -3058,7 +3176,7 @@ async fn dial_with_context(
             }
             _ => {
                 ROUTE_CACHE_FAIL.fetch_add(1, Ordering::Relaxed);
-                eprintln!("[vnet-route] 缓存路由不通 → 探索赛跑（{device}）");
+                elog!("[vnet-route] 缓存路由不通 → 探索赛跑（{device}）");
                 update_route_fail_with_cooldown(device, &route.preferred_base, !is_cloud_relay_base(&route.preferred_base));
             }
         }
@@ -3141,7 +3259,7 @@ pub(crate) fn write_file_atomic(path: &std::path::Path, body: &str) {
     })();
     if let Err(e) = res {
         let _ = std::fs::remove_file(&tmp);
-        eprintln!("[p2p-tunnel] 原子写 {} 失败：{e}", path.display());
+        elog!("[p2p-tunnel] 原子写 {} 失败：{e}", path.display());
     }
 }
 
@@ -3259,7 +3377,7 @@ pub async fn restore_remembered_tunnels() {
             for attempt in 0..150 {
                 match tunnel_open(&device, port).await {
                     Ok(local) => {
-                        eprintln!(
+                        elog!(
                             "[p2p-tunnel] 重启恢复隧道成功（第 {} 跳，{}ms，总 {}ms）：{device}:{port} → 本地 :{local}",
                             attempt + 1,
                             t0.elapsed().as_millis(),
@@ -3277,7 +3395,7 @@ pub async fn restore_remembered_tunnels() {
                         // 回落随机口（那正是本次事故）。记一条人话日志后放弃本条，
                         // 保留 memo/kept，等用户释放端口或下次启动再试。
                         if e.contains("固定本地口") {
-                            eprintln!(
+                            elog!(
                                 "[p2p-tunnel] 重启恢复放弃：{device}:{port} 约定固定口不可用（{e}）"
                             );
                             last_err.clear();
@@ -3289,12 +3407,12 @@ pub async fn restore_remembered_tunnels() {
                 }
             }
             if !last_err.is_empty() {
-                eprintln!("[p2p-tunnel] 重启恢复隧道未成（重试 30 次，对端可能离线）：{device}:{port}（{last_err}）");
+                elog!("[p2p-tunnel] 重启恢复隧道未成（重试 30 次，对端可能离线）：{device}:{port}（{last_err}）");
                 // 2026-10-20 R10：过期设备 did 会永远空转（真案：手机换设备 did 后 memo 里留着旧 did）。
                 // 恢复失败且错误是"目标设备未注册中继/不在线"→ 删除该条记忆，下次按新设备重记。
                 if last_err.contains("未注册中继") || last_err.contains("不在线") || last_err.contains("无可拨地址") {
                     port_memo_remove(&device, port);
-                    eprintln!("[p2p-tunnel] 已清理过期隧道记忆：{device}:{port}");
+                    elog!("[p2p-tunnel] 已清理过期隧道记忆：{device}:{port}");
                 }
             }
         }));
@@ -3401,7 +3519,7 @@ fn preferred_local_load_once() {
         return;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
-        eprintln!(
+        elog!(
             "[p2p-tunnel] 固定口档案损坏，忽略：{}",
             preferred_local_path().display()
         );
@@ -3564,7 +3682,7 @@ async fn bind_preferred_local(device: &str, port: u16) -> Result<TcpListener, St
         if let Ok(l) = TcpListener::bind(("127.0.0.1", p)).await {
             return Ok(l);
         }
-        eprintln!("[p2p-tunnel] 记忆口 {p} 被占用，回落随机口（旧页面链接将失效）");
+        elog!("[p2p-tunnel] 记忆口 {p} 被占用，回落随机口（旧页面链接将失效）");
     }
     TcpListener::bind("127.0.0.1:0")
         .await
@@ -3597,7 +3715,7 @@ fn reuse_existing_if_ok(device: &str, port: u16) -> Option<u16> {
     let cur = tunnel_local_port(device, port)?;
     match preferred_local(device, port) {
         Some(want) if want != cur => {
-            eprintln!(
+            elog!(
                 "[p2p-tunnel] 固定口漂移修复：{device}:{port} 现监听 :{cur} ≠ 约定 :{want} → 关闭旧隧道（abort 接受循环）并按固定口重绑"
             );
             tunnel_close(device, port);
@@ -3618,7 +3736,7 @@ fn reuse_fixed_if_match(device: &str, port: u16) -> Option<u16> {
     if cur == want {
         return Some(cur);
     }
-    eprintln!(
+    elog!(
         "[p2p-tunnel] 固定口漂移修复：{device}:{port} 现监听 :{cur} ≠ 约定 :{want} → 关闭旧隧道（abort 接受循环）并按固定口重绑"
     );
     tunnel_close(device, port);
@@ -4262,7 +4380,7 @@ async fn tunnel_open_with_bases_locked(
     target_port: u16,
 ) -> Result<u16, String> {
     if !tunnel_port_allowed(target_port) {
-        eprintln!("[p2p-tunnel] tunnel_open_with_bases_locked 拒绝端口 {target_port} target={target_device_did} name={target_name} bases={bases:?}");
+        elog!("[p2p-tunnel] tunnel_open_with_bases_locked 拒绝端口 {target_port} target={target_device_did} name={target_name} bases={bases:?}");
         return Err(format!(
             "端口 {target_port} 不在 P2P 隧道白名单（防开放代理）"
         ));
@@ -4329,7 +4447,7 @@ async fn tunnel_open_with_bases_locked(
     if !active.starts_with("relay://") {
         cache_put(target_device_did, &ws_to_http(&active));
     }
-    eprintln!(
+    elog!(
         "[p2p-tunnel] 赛跑完成 {:.1}ms（{} 候选，胜出 {active}）",
         elapsed.as_secs_f64() * 1000.0,
         n_candidates
@@ -4372,7 +4490,7 @@ async fn tunnel_open_with_bases_locked(
             let (tcp, _peer) = match accepted {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[p2p-tunnel] accept 临时错误（{e}）——50ms 后继续监听（不退出）");
+                    elog!("[p2p-tunnel] accept 临时错误（{e}）——50ms 后继续监听（不退出）");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
@@ -4412,7 +4530,7 @@ async fn tunnel_open_with_bases_locked(
     // Modern Standby 真案（2026-10-28 00:22）：AC 3 分钟 idle 会断 Wi-Fi。
     // 只按 live 连接持 SYSTEM request；空挂/残留 listener 不阻止睡眠。
     refresh_power_guard();
-    eprintln!("[p2p-tunnel] 隧道就绪 127.0.0.1:{local_port} → {target_device_did}:{target_port}（{n_candidates} 个候选）");
+    elog!("[p2p-tunnel] 隧道就绪 127.0.0.1:{local_port} → {target_device_did}:{target_port}（{n_candidates} 个候选）");
     // 2026-10-11 提速：① 记录胜出模式（页面指示器经 dsh_share 读）② 启动预热池
     // （隧道虽好，浏览器每条 TCP 连接还要各付一场赛跑+握手——预热在 302 往返的
     // 空档里把首批连接先赛跑好）。③ 中继 TCP 预连（下一场中继腿省一个 RTT）。
@@ -4442,7 +4560,7 @@ pub(crate) fn debug_leg_drop(device_did: &str) -> usize {
         let _ = tx.send(());
     }
     if n > 0 {
-        eprintln!("[p2p-tunnel] debug 先发正常关闭 device={device_did} legs={n}（保留逻辑会话，**不再 abort 本地 TCP**）");
+        elog!("[p2p-tunnel] debug 先发正常关闭 device={device_did} legs={n}（保留逻辑会话，**不再 abort 本地 TCP**）");
     }
     // 不再 abort：让本地 TCP 保持活着，WS close 会触发 resume_pump_client_inner 的重拨/RESUME。
     // 之前 120ms 后 abort 会把本地连接一起杀掉，导致根本没有主动恢复的机会。
@@ -4463,7 +4581,7 @@ pub fn tunnel_close(target_device_did: &str, target_port: u16) -> bool {
     match entry {
         Some(e) => {
             e.task.abort();
-            eprintln!(
+            elog!(
                 "[p2p-tunnel] 隧道已关闭 127.0.0.1:{} → {}:{}",
                 e.local_port, e.device_did, e.target_port
             );
@@ -4588,7 +4706,7 @@ async fn tunnel_conn(
 ) {
     REDIAL_PLANS.lock().unwrap().insert(device_did.to_string(), (bases.clone(), active.clone()));
     let session_scope = next_nonce();
-    eprintln!("[p2p-tunnel] tunnel_conn start device={device_did} port={target_port}");
+    elog!("[p2p-tunnel] tunnel_conn start device={device_did} port={target_port}");
     // 2026-10-11 提速：预热池命中 → 零等待直通（赛跑+WS 升级在池里已做完，
     // 只剩使用时的 AEAD 握手——那是协议绑定 nonce 的必要往返，省不掉）。
     if let Some((base, ws, hs)) = warm_pop(device_did, target_port) {
@@ -4598,7 +4716,7 @@ async fn tunnel_conn(
             cache_put(device_did, &ws_to_http(&base));
         }
         if let Err(e) = pump_client_with(ws, hs, tcp, device_did, close_rx, &session_scope).await {
-            eprintln!("[p2p-tunnel] 预热连接 {base} 结束（{e}）");
+            elog!("[p2p-tunnel] 预热连接 {base} 结束（{e}）");
         }
         return;
     }
@@ -4656,7 +4774,7 @@ async fn tunnel_conn(
             // 冷重连：已知地址全不通（源设备重启/换网/p2p 端口变了）→ 重新问一次 presence。
             refreshed = true;
             if let Some(fresh) = refresh_candidates_throttled(device_did).await {
-                eprintln!(
+                elog!(
                     "[p2p-tunnel] {device_did}:{target_port} 已知候选全不通 → 刷新候选（{} 个）再赛",
                     fresh.len()
                 );
@@ -4667,7 +4785,7 @@ async fn tunnel_conn(
     };
     let Some((base, ws, hs_raw)) = picked else {
         let n = note_tunnel_fail(device_did, target_port);
-        eprintln!(
+        elog!(
             "[p2p-tunnel] {device_did}:{target_port} 全部候选失败（宽限 {}ms 用尽，连续失败 {n} 次）——本连接关闭",
             TUNNEL_CONN_GRACE_MS
         );
@@ -4681,7 +4799,7 @@ async fn tunnel_conn(
         cache_put(device_did, &ws_to_http(&base));
     }
     if let Err(e) = pump_client_with(ws, hs_raw, tcp, device_did, close_rx, &session_scope).await {
-        eprintln!("[p2p-tunnel] 隧道 {base} 结束（{e}）");
+        elog!("[p2p-tunnel] 隧道 {base} 结束（{e}）");
     }
 }
 
@@ -4741,7 +4859,7 @@ pub(crate) async fn race_tunnel_ex(
         }
         false
     }
-    eprintln!(
+    elog!(
         "[p2p-tunnel] 赛跑候选 {} 条：{:?}",
         ws_bases.len(),
         ws_bases
@@ -4752,18 +4870,18 @@ pub(crate) async fn race_tunnel_ex(
             return Box::pin(async move { None });
         }
         if candidate_bogus(&b) {
-            eprintln!("[p2p-tunnel] 跳过无效直连候选 {b}（无显式端口/身份服务域名）");
+            elog!("[p2p-tunnel] 跳过无效直连候选 {b}（无显式端口/身份服务域名）");
             return Box::pin(async move { None });
         }
         Box::pin(async move {
             match tokio::time::timeout(per_candidate, connect_tunnel(&b, target_port)).await {
                 Ok(Ok((ws, _resp, hs))) => Some((b, ws, hs)),
                 Ok(Err(e)) => {
-                    eprintln!("[p2p-tunnel] 候选不通 {b}: {e}");
+                    elog!("[p2p-tunnel] 候选不通 {b}: {e}");
                     None
                 }
                 Err(_) => {
-                    eprintln!("[p2p-tunnel] 候选超时 {}ms {b}", per_candidate.as_millis());
+                    elog!("[p2p-tunnel] 候选超时 {}ms {b}", per_candidate.as_millis());
                     None
                 }
             }
@@ -4794,7 +4912,7 @@ pub(crate) async fn race_tunnel_ex(
         // 第一个成功后，再给"几乎同时完成"的候选极短合流窗口，让真最快的胜出
         let budget_left = budget.saturating_sub(t0.elapsed());
         if budget_left.is_zero() {
-            eprintln!("[p2p-tunnel] 赛跑总预算 {}ms 用尽", budget.as_millis());
+            elog!("[p2p-tunnel] 赛跑总预算 {}ms 用尽", budget.as_millis());
             return winner;
         }
         let wait = if winner.is_some() {
@@ -4807,7 +4925,7 @@ pub(crate) async fn race_tunnel_ex(
                 if winner.is_some() {
                     return winner; // 合流窗口用尽 → 采用已胜出者
                 }
-                eprintln!("[p2p-tunnel] 赛跑总预算 {}ms 用尽", budget.as_millis());
+                elog!("[p2p-tunnel] 赛跑总预算 {}ms 用尽", budget.as_millis());
                 return None;
             }
             Ok(None) => return winner, // 全部候选都失败
@@ -4815,7 +4933,7 @@ pub(crate) async fn race_tunnel_ex(
                 if let Some((old_base, old_ws, _)) = winner.take() {
                     // 合流窗口内出现更快候选：**优雅关闭**先到者（Close 帧）——drop 会让
                     // 对端看到 RST 并记 enc-fail（本次事故噪声来源之一）。
-                    eprintln!(
+                    elog!(
                         "[p2p-tunnel] 合流窗口内换更快候选 {old_base} → {}（旧连接优雅关闭）",
                         v.0
                     );
@@ -4824,7 +4942,7 @@ pub(crate) async fn race_tunnel_ex(
                         let _ = ws.close(None).await;
                     });
                 } else {
-                    eprintln!(
+                    elog!(
                         "[p2p-tunnel] 首个成功候选 {}（{:.1}ms）",
                         v.0,
                         t0.elapsed().as_secs_f64() * 1000.0
@@ -5079,7 +5197,7 @@ static HP_PROBE_AUDIT: LazyLock<Mutex<Vec<HolePunchProbe>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn hp_probe_audit_push(rec: HolePunchProbe) {
-    eprintln!(
+    elog!(
         "[p2p-tunnel] 打洞探测 {} 自 :{}（期望 :{}）→ {}",
         rec.target, rec.src_port, rec.wanted_port, rec.result
     );
@@ -5188,7 +5306,7 @@ async fn dial_from_port(
     let sock = match mk_sock().and_then(|s| s.bind(bind_addr).map(|_| s)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
+            elog!(
                 "[p2p-tunnel] 源口 :{local_port} 绑定失败（{e}）——回退临时口（配对可能失效）"
             );
             // 回退：不 bind，connect 时内核分配临时源口
@@ -5205,11 +5323,11 @@ async fn dial_from_port(
             (Some(stream), actual)
         }
         Ok(Err(e)) => {
-            eprintln!("[p2p-tunnel] 探测/拨号 {target} 自 :{local_port} → {e}");
+            elog!("[p2p-tunnel] 探测/拨号 {target} 自 :{local_port} → {e}");
             (None, 0)
         }
         Err(_) => {
-            eprintln!(
+            elog!(
                 "[p2p-tunnel] 探测/拨号 {target} 自 :{local_port} → 超时（{}ms）",
                 per.as_millis()
             );
@@ -5249,11 +5367,11 @@ async fn connect_tunnel_from_stream(
     stream: TcpStream,
 ) -> Result<RacedWs, String> {
     if target_port == 0 {
-        eprintln!("[p2p-tunnel] connect_tunnel_from_stream 拒绝 port=0 base={ws_url}，调用栈：\n{}", std::backtrace::Backtrace::capture());
+        elog!("[p2p-tunnel] connect_tunnel_from_stream 拒绝 port=0 base={ws_url}，调用栈：\n{}", std::backtrace::Backtrace::capture());
         return Err("目标端口为 0，拒绝发起隧道握手".into());
     }
     if !tunnel_port_allowed(target_port) {
-        eprintln!("[p2p-tunnel] connect_tunnel_from_stream 拒绝非白名单端口 {target_port}");
+        elog!("[p2p-tunnel] connect_tunnel_from_stream 拒绝非白名单端口 {target_port}");
         return Err(format!("端口 {target_port} 不在隧道白名单"));
     }
     let (handshake, auth) = tunnel_credentials(target_port)?;
@@ -5273,7 +5391,7 @@ async fn connect_tunnel_from_stream(
         tokio_tungstenite::client_async(req, tokio_tungstenite::MaybeTlsStream::Plain(stream))
             .await
             .map_err(|e| format!("{e}"))?;
-    eprintln!("[p2p-tunnel] ws-upgrade-from-stream base={ws_url} ms={}", t_ws.elapsed().as_millis());
+    elog!("[p2p-tunnel] ws-upgrade-from-stream base={ws_url} ms={}", t_ws.elapsed().as_millis());
     Ok((ws_url.to_string(), ws, handshake))
 }
 
@@ -5406,7 +5524,7 @@ async fn hole_punch_leg(ws_bases: Vec<String>, target_port: u16, plan: HpPlan) -
         return None; // 对端账号不可知（离线/未上报）→ 没有信令地址，打洞无从谈起
     };
     let Ok(port_p) = pre_bind_port() else {
-        eprintln!("[p2p-tunnel] 打洞预绑端口失败——继续直连路径");
+        elog!("[p2p-tunnel] 打洞预绑端口失败——继续直连路径");
         return None;
     };
     // B 的候选地址（A 将探测的目标）：本机多路径候选 ∪ 反射地址，全部配预绑口 P
@@ -5431,11 +5549,11 @@ async fn hole_punch_leg(ws_bases: Vec<String>, target_port: u16, plan: HpPlan) -
     if let Err(e) =
         crate::chat_service::hp_signal_send(&account, HOLE_PUNCH_REQUEST_KIND, payload).await
     {
-        eprintln!("[p2p-tunnel] 打洞信令未送达（{e}）——继续直连路径");
+        elog!("[p2p-tunnel] 打洞信令未送达（{e}）——继续直连路径");
         return None;
     }
     hp_signal_sent(&plan.device);
-    eprintln!(
+    elog!(
         "[p2p-tunnel] 打洞信令已发（requestId={request_id}，{} 候选，预绑口 {port_p}，对端 {account}）——等 ack（{}ms）",
         candidates.len(),
         HOLE_PUNCH_ACK_TIMEOUT.as_millis()
@@ -5443,7 +5561,7 @@ async fn hole_punch_leg(ws_bases: Vec<String>, target_port: u16, plan: HpPlan) -
     match tokio::time::timeout(HOLE_PUNCH_ACK_TIMEOUT, rx).await {
         Ok(Ok(())) => {}
         _ => {
-            eprintln!(
+            elog!(
                 "[p2p-tunnel] 打洞 ack 超时（{}ms）——继续直连路径",
                 HOLE_PUNCH_ACK_TIMEOUT.as_millis()
             );
@@ -5463,21 +5581,21 @@ async fn hole_punch_leg(ws_bases: Vec<String>, target_port: u16, plan: HpPlan) -
             match dial_from_port(target, port_p, HOLE_PUNCH_CONNECT_TIMEOUT).await {
                 (Some(stream), actual) => {
                     let paired = actual == port_p;
-                    eprintln!(
+                    elog!(
                         "[p2p-tunnel] 打洞拨号第 {} 轮命中 {b}（源口 :{actual}，预绑 :{port_p}，配对{}）——就地升级隧道",
                         round + 1,
                         if paired { "成立" } else { "已回退临时口" }
                     );
                     match connect_tunnel_from_stream(b, target_port, stream).await {
                         Ok(w) => return Some(w),
-                        Err(e) => eprintln!("[p2p-tunnel] 打洞连接的隧道握手失败 {b}: {e}"),
+                        Err(e) => elog!("[p2p-tunnel] 打洞连接的隧道握手失败 {b}: {e}"),
                     }
                 }
                 _ => {}
             }
         }
     }
-    eprintln!("[p2p-tunnel] 打洞 {HOLE_PUNCH_CONNECT_ROUNDS} 轮拨号全部未通——继续直连路径");
+    elog!("[p2p-tunnel] 打洞 {HOLE_PUNCH_CONNECT_ROUNDS} 轮拨号全部未通——继续直连路径");
     None
 }
 
@@ -5508,11 +5626,11 @@ async fn connect_tunnel(
     String,
 > {
     if target_port == 0 {
-        eprintln!("[p2p-tunnel] connect_tunnel 拒绝 port=0 base={ws_url}，调用栈：\n{}", std::backtrace::Backtrace::capture());
+        elog!("[p2p-tunnel] connect_tunnel 拒绝 port=0 base={ws_url}，调用栈：\n{}", std::backtrace::Backtrace::capture());
         return Err("目标端口为 0，拒绝发起隧道握手".into());
     }
     if !tunnel_port_allowed(target_port) {
-        eprintln!("[p2p-tunnel] connect_tunnel 拒绝非白名单端口 {target_port}");
+        elog!("[p2p-tunnel] connect_tunnel 拒绝非白名单端口 {target_port}");
         return Err(format!("端口 {target_port} 不在隧道白名单"));
     }
     let (handshake, auth) = tunnel_credentials(target_port)?;
@@ -5562,7 +5680,7 @@ async fn connect_tunnel(
         .await
         .map(|(ws, resp)| (ws, resp, handshake))
         .map_err(|e| format!("{e}"));
-    eprintln!("[p2p-tunnel] ws-upgrade base={ws_url} ms={}", t_ws.elapsed().as_millis());
+    elog!("[p2p-tunnel] ws-upgrade base={ws_url} ms={}", t_ws.elapsed().as_millis());
     r
 }
 
@@ -5685,7 +5803,7 @@ async fn pump_client_with(
 
 async fn pump_client_with_inner(mut ws: WsStream, hs_raw: String, tcp: TcpStream, target_device_did: &str, close_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<()>>, session_scope: &str) -> Result<(), FrameError> {
     let diag_port = serde_json::from_str::<TunnelHandshake>(&hs_raw).map(|h| h.port).unwrap_or(0);
-    eprintln!("[p2p-tunnel] pump_client_with resume_enabled={} cap={} device={} port={}", resume_enabled(), resume_requested(&hs_raw), target_device_did, diag_port);
+    elog!("[p2p-tunnel] pump_client_with resume_enabled={} cap={} device={} port={}", resume_enabled(), resume_requested(&hs_raw), target_device_did, diag_port);
     if resume_requested(&hs_raw) {
         return resume_pump_client_with(ws, hs_raw, tcp, target_device_did, close_rx, session_scope).await;
     }
@@ -5709,11 +5827,11 @@ async fn pump_client_with_inner(mut ws: WsStream, hs_raw: String, tcp: TcpStream
 /// 客户端 resume 数据泵：首腿 SESSION_OPEN，后续腿 RESUME；RESUME_ACK 后重放未确认数据。
 async fn resume_pump_client_with(ws: WsStream, hs_raw: String, tcp: TcpStream, target_device_did: &str, mut close_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<()>>, session_scope: &str) -> Result<(), FrameError> {
     let port = serde_json::from_str::<TunnelHandshake>(&hs_raw).map(|h| h.port).unwrap_or(0);
-    eprintln!("[p2p-tunnel] session-resume start device={target_device_did} port={port}");
+    elog!("[p2p-tunnel] session-resume start device={target_device_did} port={port}");
     let r = resume_pump_client_inner(ws, hs_raw, tcp, target_device_did, close_rx.as_deref_mut(), session_scope).await;
     match &r {
-        Ok(()) => eprintln!("[p2p-tunnel] session-resume ok device={target_device_did} port={port}"),
-        Err(e) => eprintln!("[p2p-tunnel] session-resume fail device={target_device_did} port={port} {e}"),
+        Ok(()) => elog!("[p2p-tunnel] session-resume ok device={target_device_did} port={port}"),
+        Err(e) => elog!("[p2p-tunnel] session-resume fail device={target_device_did} port={port} {e}"),
     }
     r
 }
@@ -5769,7 +5887,7 @@ async fn resume_pump_client_inner(ws: WsStream, hs_raw: String, tcp: TcpStream, 
                 redial_backoff = (redial_backoff * 2).min(Duration::from_secs(2));
                 continue;
             };
-            eprintln!("[p2p-tunnel] 旧腿失败，已重拨新腿 {base}，准备 RESUME");
+            elog!("[p2p-tunnel] 旧腿失败，已重拨新腿 {base}，准备 RESUME");
             *active.lock().unwrap() = base;
             current_ws = Some(ws);
             current_hs = hs;
@@ -5778,7 +5896,7 @@ async fn resume_pump_client_inner(ws: WsStream, hs_raw: String, tcp: TcpStream, 
         match resume_pump_client_attempt(attempt_ws, current_hs.clone(), &mut tcp, target_device_did, close_rx.as_deref_mut(), send_seq.clone(), session.clone(), opened.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                eprintln!("[p2p-tunnel] session-resume fail device={target_device_did} {e}——尝试重拨新腿");
+                elog!("[p2p-tunnel] session-resume fail device={target_device_did} {e}——尝试重拨新腿");
                 if std::time::Instant::now() >= deadline {
                     return Err(e);
                 }
@@ -5815,7 +5933,7 @@ async fn resume_pump_client_attempt(
             .seal_control(tunnel_resume_frames::T_SESSION_OPEN, &tunnel_resume_frames::encode_session_open(&sid, 0)?)
             .map_err(|e| FrameError::Io(format!("session-open: {e}")))?;
         ws.send(TMessage::Binary(open)).await.map_err(|e| FrameError::Io(e.to_string()))?;
-        eprintln!("[p2p-tunnel] session-open-sent device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
+        elog!("[p2p-tunnel] session-open-sent device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
         let ack = match ws.next().await {
             Some(Ok(TMessage::Binary(d))) => d,
             Some(Ok(TMessage::Close(_))) => return Err(FrameError::Io("session-ack closed".into())),
@@ -5831,7 +5949,7 @@ async fn resume_pump_client_attempt(
             }
             _ => return Err(FrameError::PlaintextOrUnknownFrame),
         }
-        eprintln!("[p2p-tunnel] session-ack-recv device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
+        elog!("[p2p-tunnel] session-ack-recv device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
         session.lock().unwrap().on_leg_open();
         opened.store(true, std::sync::atomic::Ordering::SeqCst);
     } else {
@@ -5843,7 +5961,7 @@ async fn resume_pump_client_attempt(
             .seal_control(tunnel_resume_frames::T_RESUME, &tunnel_resume_frames::encode_resume(&sid, recv_offset, send_next)?)
             .map_err(|e| FrameError::Io(format!("resume: {e}")))?;
         ws.send(TMessage::Binary(resume)).await.map_err(|e| FrameError::Io(e.to_string()))?;
-        eprintln!("[p2p-tunnel] resume-sent device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
+        elog!("[p2p-tunnel] resume-sent device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
         let ack = match ws.next().await {
             Some(Ok(TMessage::Binary(d))) => d,
             Some(Ok(TMessage::Close(_))) => return Err(FrameError::Io("resume-ack closed".into())),
@@ -5864,12 +5982,12 @@ async fn resume_pump_client_attempt(
                     *s = tunnel_resume_frames::ResumeSession::new(sid);
                     s.on_leg_open();
                 }
-                eprintln!("[p2p-tunnel] session-resume fallback-open device={target_device_did} port={}", hs.port);
+                elog!("[p2p-tunnel] session-resume fallback-open device={target_device_did} port={}", hs.port);
                 None
             }
             _ => return Err(FrameError::PlaintextOrUnknownFrame),
         };
-        eprintln!("[p2p-tunnel] resume-ack-recv device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
+        elog!("[p2p-tunnel] resume-ack-recv device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
         if let Some(acked) = acked {
             let replay = session.lock().unwrap().on_resume(acked)?;
             let replay_len = replay.len();
@@ -5877,7 +5995,7 @@ async fn resume_pump_client_attempt(
                 let frame = resume_io.seal_data(acked, &replay);
                 ws.send(TMessage::Binary(frame)).await.map_err(|e| FrameError::Io(e.to_string()))?;
             }
-            eprintln!("[p2p-tunnel] leg-switch device={target_device_did} port={} replay_bytes={replay_len}", hs.port);
+            elog!("[p2p-tunnel] leg-switch device={target_device_did} port={} replay_bytes={replay_len}", hs.port);
         }
     }
 
@@ -5886,7 +6004,7 @@ async fn resume_pump_client_attempt(
     let _leg_guard = ResumeLegGuard::new(session.clone());
 
     let layer = ResumePumpLayer::new(resume_io, session.clone());
-    eprintln!("[p2p-tunnel] resume-pump-start device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
+    elog!("[p2p-tunnel] resume-pump-start device={target_device_did} port={} ms={}", hs.port, t0.elapsed().as_millis());
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (tcp_rx, tcp_tx) = tcp.split();
     let upload = resume_pump_up(tcp_rx, &mut ws_tx, &layer, close_rx);
@@ -5913,7 +6031,7 @@ where
         match m {
             Ok(TMessage::Binary(d)) => {
                 if first_frame {
-                    eprintln!("[p2p-tunnel] pump-down-first-frame ms={}", t0.elapsed().as_millis());
+                    elog!("[p2p-tunnel] pump-down-first-frame ms={}", t0.elapsed().as_millis());
                     first_frame = false;
                 }
                 if d.len() > FRAME_MAX_PAYLOAD {
@@ -6024,7 +6142,7 @@ async fn reverse_connect_slot(bases: Vec<String>, target_port: u16, device_did: 
     )
     .await
     else {
-        eprintln!(
+        elog!(
             "[p2p-tunnel] 反向连接：{} 个候选全部未通（对端可能已换网/IPv6 前缀轮换）——下一拍（≤1s）重查 presence 拿新地址再拨",
             bases.len()
         );
@@ -6039,7 +6157,7 @@ async fn reverse_connect_slot(bases: Vec<String>, target_port: u16, device_did: 
     {
         Ok(Ok(t)) => t,
         other => {
-            eprintln!(
+            elog!(
                 "[p2p-tunnel] 反向隧道：本机上游 {target} 不可达（{:?}）——关连接",
                 other.err().map(|e| e.to_string())
             );
@@ -6050,10 +6168,10 @@ async fn reverse_connect_slot(bases: Vec<String>, target_port: u16, device_did: 
     let _ = tcp.set_nodelay(true);
     // 反向腿不进 TUNNELS；用 Drop guard 保证 abort/成功/错误都同步电源口径。
     let _power = ReverseLiveGuard::new();
-    eprintln!("[p2p-tunnel] 反向隧道就绪：本机 {target} ⇄ {base}（我们=发起方）");
+    elog!("[p2p-tunnel] 反向隧道就绪：本机 {target} ⇄ {base}（我们=发起方）");
     let session_scope = next_nonce();
     if let Err(e) = pump_client_with(ws, hs, tcp, device_did, None, &session_scope).await {
-        eprintln!("[p2p-tunnel] 反向隧道 {base} 结束（{e}）");
+        elog!("[p2p-tunnel] 反向隧道 {base} 结束（{e}）");
     }
 }
 
@@ -6096,7 +6214,7 @@ pub async fn tunnel_open_reverse(
     }
     let n = count.max(1);
     reverse_pool_topup(target_device_did, &bases, target_port, n);
-    eprintln!(
+    elog!(
         "[p2p-tunnel] 反向模式：向 {target_device_did} 拨 {} 条（暴露本机 :{target_port}，{} 个候选）",
         n.min(REVERSE_POOL_DEPTH),
         bases.len()
@@ -6142,7 +6260,7 @@ async fn reverse_dialer_tick() {
     };
     for dev in gone {
         tunnel_reverse_stop(&dev);
-        eprintln!("[p2p-tunnel] 反向意愿消失：停拨 {dev}");
+        elog!("[p2p-tunnel] 反向意愿消失：停拨 {dev}");
     }
     for w in &wants {
         let bases = crate::p2p_server::urls_from_addrs(&w.addrs, w.port);
@@ -6396,7 +6514,7 @@ async fn relay_connect(target_device_did: &str, target_port: u16) -> Result<Race
         "UNAVAILABLE" => return Err("目标设备未接单（中继等待 provider 超时）".into()),
         other => return Err(format!("中继应答异常: {other}")),
     }
-    eprintln!("[p2p-tunnel] relay-pair-ready device={target_device_did} port={target_port} ms={}", t0.elapsed().as_millis());
+    elog!("[p2p-tunnel] relay-pair-ready device={target_device_did} port={target_port} ms={}", t0.elapsed().as_millis());
     // 2026-10-20：WS URL 必须带中继端口（Host 头/代理路由按 host:port 匹配；原来漏了 rport）。
     let ws_url = format!(
         "ws://{}:{}/p2p/tunnel?v={TUNNEL_PROTOCOL_VERSION}",
@@ -6415,15 +6533,15 @@ async fn relay_leg(device: String, target_port: u16, delay: Duration) -> Option<
     tokio::time::sleep(delay).await;
     match tokio::time::timeout(RELAY_LEG_TIMEOUT, relay_connect(&device, target_port)).await {
         Ok(Ok(w)) => {
-            eprintln!("[p2p-tunnel] 云端中继腿打通（{device} → :{target_port}）");
+            elog!("[p2p-tunnel] 云端中继腿打通（{device} → :{target_port}）");
             Some(w)
         }
         Ok(Err(e)) => {
-            eprintln!("[p2p-tunnel] 云端中继腿失败（{device}）: {e}");
+            elog!("[p2p-tunnel] 云端中继腿失败（{device}）: {e}");
             None
         }
         Err(_) => {
-            eprintln!("[p2p-tunnel] 云端中继腿超时（{device}）");
+            elog!("[p2p-tunnel] 云端中继腿超时（{device}）");
             None
         }
     }

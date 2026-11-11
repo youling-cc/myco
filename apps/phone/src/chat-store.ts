@@ -2469,8 +2469,10 @@ export async function createGroup(name: string, members: string[]): Promise<stri
   return gid
 }
 
-/** 分享任务卡（conv=好友 did 或群 id；群逐成员单发）。 */
-export async function shareTask(conv: string, card: { title: string; desc?: string; requirements?: string; reward?: string; expiresDays?: number }): Promise<void> {
+/** 分享任务卡（conv=好友 did 或群 id；群逐成员单发）。
+ *  2026-11-11：`env`（环境卡，如手机「ADB 调试」卡的 adb 环境）随卡下发——
+ *  与 PC `share_card_record` 的 env[] 同形状，接收端 envsOfCard 直接可读。 */
+export async function shareTask(conv: string, card: { title: string; desc?: string; requirements?: string; reward?: string; expiresDays?: number; env?: unknown[]; caps?: unknown }): Promise<void> {
   const my = requireMy()
   if (!card.title.trim()) throw new Error('任务标题不能为空')
   const taskId = `peer-task-${Date.now().toString(36)}`
@@ -2483,6 +2485,8 @@ export async function shareTask(conv: string, card: { title: string; desc?: stri
   if (card.requirements?.trim()) payload.requirements = card.requirements.trim().slice(0, 400)
   if (card.reward?.trim()) payload.reward = card.reward.trim().slice(0, 32)
   if (card.expiresDays && card.expiresDays > 0) payload.expiresAt = Date.now() + card.expiresDays * 86_400_000
+  if (Array.isArray(card.env) && card.env.length > 0) payload.env = card.env
+  if (card.caps !== undefined) payload.caps = card.caps
   const targets = conv.startsWith('grp-')
     ? (listGroups().find((g) => g.id === conv)?.members ?? []).filter((m) => !accountDidEq(m, my))
     : [conv]
@@ -2528,6 +2532,12 @@ export function registerSharedTask(conv: string, my: string, myNm: string, paylo
     createdAt: payload.createdAt as number, expiresAt: payload.expiresAt as number | undefined,
     participants: payload.participants as TaskParticipant[], source: 'peer',
     status: 'shared', convId: didSafe(conv) }
+  // 2026-11-11：环境卡字段透传（env/caps/action）——手机建的「ADB 调试」卡与
+  // PC 建的 RDP/DSH 环境卡同一条路径入库，列表行的 env 入口（declaredEnvsOfCard）
+  // 只认这三个字段。
+  if (Array.isArray(payload.env)) t.env = payload.env
+  if (payload.caps !== undefined) t.caps = payload.caps
+  if (payload.action && typeof payload.action === 'object') t.action = payload.action as PeerTask['action']
   tasks.push(t)
   writeArr(K.tasks(), tasks)
   return t

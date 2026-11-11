@@ -9809,6 +9809,148 @@ fn parse_upstream_json(bytes: &[u8]) -> Option<serde_json::Value> {
     serde_json::from_slice::<serde_json::Value>(&fixed).ok()
 }
 
+/// 解开 HTTP `content-encoding`（2026-11-11 P0 安全修复配套，纯函数，单测覆盖）。
+///
+/// 背景：`forward_request`（6651ec09，2026-11-09）起网关对上游主动要压缩
+/// （`accept-encoding: gzip, deflate, br`，client `no_gzip` → body 保持压缩字节
+/// 透传）。但网关的可见性裁剪（session/list 会话白名单 / 项目边界 / session/page
+/// 时间窗）都要先把 body 解析成 JSON——压缩字节解析必失败 → 裁剪被**静默跳过**
+/// = 越权泄漏（单会话可见性的分享把全机会话清单原样放出，2026-11-11 实测复现
+/// `session/list` 200 ok 1625 条 / 1624 条越权）。凡"必须被裁剪"的响应先走这里
+/// 解压成明文再裁。
+///
+/// · `gzip`/`x-gzip` → gunzip（多成员安全）；
+/// · `deflate` → 先按 RFC 的 zlib 包装试，失败再试裸 deflate（两种服务器实现都存在）；
+/// · `br` → brotli（reqwest 同款解码家族）；
+/// · 其余（`identity` 由 [`content_encoding_of`] 提前滤掉；zstd 本就不在请求编码
+///   白名单里）→ `None`。解压失败（坏字节）同样 `None`——**调用方必须 fail-closed**
+/// （拒绝透传），不得把未裁剪的原字节放出去。
+fn decode_content_encoding(enc: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    match enc.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => {
+            flate2::read::MultiGzDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .ok()?;
+        }
+        "deflate" => {
+            if flate2::read::ZlibDecoder::new(bytes)
+                .read_to_end(&mut out)
+                .is_err()
+            {
+                out.clear();
+                flate2::read::DeflateDecoder::new(bytes)
+                    .read_to_end(&mut out)
+                    .ok()?;
+            }
+        }
+        "br" => {
+            brotli_decompressor::Decompressor::new(bytes, 4096)
+                .read_to_end(&mut out)
+                .ok()?;
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// 响应头里的 `content-encoding`（去空白；无 / 空 / `identity` → `None` = 无需解压）。
+fn content_encoding_of(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("identity"))
+}
+
+/// 网关裁剪核心的三态结果（2026-11-11 P0）。**`Refuse` = 解析（或解压）不了**——
+/// 安全边界上禁止透传，调用方必须 fail-closed（502）：这正是"压缩字节解析失败 →
+/// 裁剪静默跳过"旧漏洞路径的兜底。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrimOutcome {
+    /// 字节原样透传（无可删内容 / 白名单内本就一条不差 / 判不了不裁）。
+    Passthrough,
+    /// 换用裁剪后的新 JSON 字节。
+    Rewritten(Vec<u8>),
+    /// 解析（或解压）失败：绝不透传未裁剪字节。
+    Refuse,
+}
+
+/// 「按 content-encoding 解压 → 解析 JSON」公共骨架：任一环失败 → `Err(())`
+/// （调用方 fail-closed）。外层 [`rebuild_proxy_response`] 已解压并剥头的响应走到
+/// 这里时 `enc=None`，直通不再解压。
+fn decode_and_parse(bytes: &[u8], enc: Option<&str>) -> Result<serde_json::Value, ()> {
+    let plain: std::borrow::Cow<[u8]> = match enc {
+        Some(e) => std::borrow::Cow::Owned(decode_content_encoding(e, bytes).ok_or(())?),
+        None => std::borrow::Cow::Borrowed(bytes),
+    };
+    parse_upstream_json(&plain).ok_or(())
+}
+
+/// session/list 会话白名单裁剪核心（解压→解析→裁剪→重序列化；纯函数，P0 回归
+/// 直击）。返回 `(结果, 裁剪前条数, 裁剪后条数)`；重序列化失败也 `Refuse`
+/// （不透传未裁剪字节）。白名单内一条不差 → `Passthrough`（保持原字节，含原格式）。
+fn trim_session_list_bytes(
+    bytes: &[u8],
+    enc: Option<&str>,
+    vis: &Vis,
+) -> (TrimOutcome, usize, usize) {
+    let mut v = match decode_and_parse(bytes, enc) {
+        Ok(v) => v,
+        Err(()) => return (TrimOutcome::Refuse, 0, 0),
+    };
+    let (before, after) = filter_session_list(&mut v, vis);
+    if before == after {
+        return (TrimOutcome::Passthrough, before, after);
+    }
+    match serde_json::to_vec(&v) {
+        Ok(b) => (TrimOutcome::Rewritten(b), before, after),
+        Err(_) => (TrimOutcome::Refuse, before, after),
+    }
+}
+
+/// session/list 项目边界裁剪核心（同上；空项目清单 = 判不了 → 不裁，沿用既有
+/// fail-open 语义，与编码无关）。
+fn trim_session_list_project_bytes(
+    bytes: &[u8],
+    enc: Option<&str>,
+    vis: &Vis,
+    project_paths: &[&str],
+) -> (TrimOutcome, usize, usize) {
+    if !vis.project_bound || project_paths.is_empty() {
+        return (TrimOutcome::Passthrough, 0, 0);
+    }
+    let mut v = match decode_and_parse(bytes, enc) {
+        Ok(v) => v,
+        Err(()) => return (TrimOutcome::Refuse, 0, 0),
+    };
+    let (before, after) = filter_session_list_project(&mut v, vis, project_paths);
+    if before == after {
+        return (TrimOutcome::Passthrough, before, after);
+    }
+    match serde_json::to_vec(&v) {
+        Ok(b) => (TrimOutcome::Rewritten(b), before, after),
+        Err(_) => (TrimOutcome::Refuse, before, after),
+    }
+}
+
+/// session/page 时间窗裁剪核心（同上）。返回 `(结果, 删掉的记录条数)`。
+fn trim_page_window_bytes(bytes: &[u8], enc: Option<&str>, window_ms: u64) -> (TrimOutcome, usize) {
+    let mut v = match decode_and_parse(bytes, enc) {
+        Ok(v) => v,
+        Err(()) => return (TrimOutcome::Refuse, 0),
+    };
+    let dropped = filter_page_window(&mut v, window_ms);
+    if dropped == 0 {
+        return (TrimOutcome::Passthrough, 0);
+    }
+    match serde_json::to_vec(&v) {
+        Ok(b) => (TrimOutcome::Rewritten(b), dropped),
+        Err(_) => (TrimOutcome::Refuse, dropped),
+    }
+}
+
 /// 写路径的会话可见范围校验（纯函数，单测覆盖）。
 ///
 /// 读路径（`session/page`）此前有白名单门，写路径（`session/prompt`）**没有**：
@@ -18102,6 +18244,9 @@ async fn forward_request(
             // 2026-11-09 TTI：动态 API 也吃压缩（静态资源已压缩）。安全前提：
             // 走本函数 = **未命中缓存** = 响应不会被 rpcId patch 改写（compress 与
             // patch 互斥；session/list 已移出缓存白名单，故它在此路径可安全压缩）。
+            // 2026-11-11 P0 补注：可见性裁剪面的安全前提 = **裁剪前先解压**（见
+            // `rebuild_proxy_response` 的 resp-decode 与 `trim_session_list_bytes`），
+            // 否则压缩字节解析失败会让裁剪被静默跳过（越权泄漏，已修）。
             // HTML 文档例外（入口注入要 identity）。
             // **编码白名单**：浏览器发 `gzip, deflate, br, zstd`，但 zstd 在该链路上
             // 不可用（实测 AE=br,zstd / AE=zstd 全 502）——只透传 gzip/deflate/br。
@@ -18198,6 +18343,34 @@ fn rebuild_event_stream_response(resp: reqwest::Response) -> Response {
     })
 }
 
+/// 会话清单裁剪用的**生效可见范围**（2026-11-11 从 `rebuild_proxy_response_parts`
+/// 拆出，供「要不要为裁剪而解压」与「裁剪本身」共用同一把尺，避免两处口径漂移）：
+/// 查看者被逐人收窄 → 逐人的；否则回落**任务级** stateVisibility
+/// （owner/同账号设备打开"单会话分享"也只看该会话，2026-10-20 手机 R7 真案）。
+fn effective_trim_vis(share: &Share, authz: &Authz) -> Vis {
+    if authz.vis.restricts_sessions() {
+        authz.vis.clone()
+    } else {
+        vis_of(&share.state_visibility)
+    }
+}
+
+/// 这个响应是否**必须**被网关解析裁剪（2026-11-11 P0 安全修复）：是 → 上游压缩
+/// 字节必须先解压（见 `rebuild_proxy_response` 的 resp-decode），否则
+/// `parse_upstream_json` 失败 → 裁剪静默跳过 = 越权泄漏。只把**安全边界**算进来：
+/// · session/list：会话白名单收窄（逐人或任务级）**或**项目边界；
+/// · session/page：生效时间窗。
+/// 纯尺寸优化（归档过滤 / 空会话过滤 / 瘦身缓存）不在此列——它们失败只费带宽
+/// 不越权，未收窄的响应继续压缩透传（6651ec09 的 TTI 收益不受影响）。
+fn response_needs_gateway_trim(share: &Share, authz: &Authz, rest: &str, method: &Method) -> bool {
+    if is_session_list_read(rest, method)
+        && (effective_trim_vis(share, authz).restricts_sessions() || authz.vis.project_bound)
+    {
+        return true;
+    }
+    is_page_read(rest, method) && authz.eff_window_ms().is_some()
+}
+
 async fn rebuild_proxy_response(
     share: &Share,
     resp: reqwest::Response,
@@ -18210,14 +18383,14 @@ async fn rebuild_proxy_response(
 ) -> Response {
     // upstream 状态/头在 body 消费前捕获（缓存写入/字节级重建要它们）
     let status = resp.status().as_u16();
-    let up_headers = resp.headers().clone();
+    let mut up_headers = resp.headers().clone();
     // 2026-11-11 诊断（空列表定位）：session/list 的 body 读取计时
     let t_body = std::time::Instant::now();
     let is_list = is_session_list_read(rest, method);
     // 2026-10-18（子代理取证 P2）：上游 body 读失败此前 `unwrap_or_default()` 会变成
     // **200 + 空 body** → 客户端 JSON.parse 抛错（表现"请求失败/丢消息"但审计里没有
     // 401/503，极难归因）。现在读失败明确返 502 并留痕。
-    let bytes = match resp.bytes().await {
+    let mut bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
             if is_list {
@@ -18240,6 +18413,51 @@ async fn rebuild_proxy_response(
             ("bytes", &bytes.len().to_string()),
             ("ms", &t_body.elapsed().as_millis().to_string()),
         ]);
+    }
+    // ══ 2026-11-11 P0 安全修复：压缩响应的可见性裁剪旁路 ══
+    // 6651ec09（2026-11-09）起网关对上游主动要压缩（gzip/deflate/br，client
+    // no_gzip → 压缩字节透传），但可见性裁剪靠 `parse_upstream_json` 解析 JSON：
+    // 压缩字节解析必失败 → 裁剪被**静默跳过** → 单会话可见性的分享把全机会话
+    // 清单原样放出（实测复现 `session/list` 200 ok 1625 条 / 1624 条越权）。
+    // 修法＝**解压优先于裁剪**：凡「必须被网关裁剪」的响应（`response_needs_gateway_trim`
+    // ：会话白名单 / 项目边界 / 时间窗）先按 content-encoding 解压成明文，头剥掉
+    // content-encoding（identity 回给浏览器），再走 parts 里的裁剪。解不开（坏包/
+    // 未知编码）保持原字节，由 parts 的 `TrimOutcome::Refuse` 分支 **fail-closed 502**
+    // 兜底——绝不透传未裁剪字节。
+    // 未收窄（默认全可见）的响应不经此处：压缩透传原样保留（TTI 收益不受影响）。
+    // 附带收益：解压后的明文能进 raw_list_cache（瘦身缓存自 6651ec09 起对压缩包
+    // 恒 miss，此刻恢复），且缓存头与冷路径一致（不再出现"明文字节谎报编码头"）。
+    if response_needs_gateway_trim(share, authz, rest, method) {
+        if let Some(enc) = content_encoding_of(&up_headers) {
+            match decode_content_encoding(enc, &bytes) {
+                Some(plain) => {
+                    audit(
+                        "resp-decode",
+                        &[
+                            ("share", &share.id),
+                            ("who", &authz.label),
+                            ("enc", enc),
+                            ("in", &bytes.len().to_string()),
+                            ("out", &plain.len().to_string()),
+                        ],
+                    );
+                    up_headers.remove(header::CONTENT_ENCODING);
+                    bytes = axum::body::Bytes::from(plain);
+                }
+                None => {
+                    // 解不开≠放行：parts 的 Refuse 分支会拒绝（fail-closed）
+                    audit(
+                        "resp-decode-fail",
+                        &[
+                            ("share", &share.id),
+                            ("who", &authz.label),
+                            ("enc", enc),
+                            ("bytes", &bytes.len().to_string()),
+                        ],
+                    );
+                }
+            }
+        }
     }
     // 2026-10-29：上游冷包先瘦身再进缓存（只存跨查看者安全的“原始减重”快照）。
     // 可见性白名单/项目/归档过滤仍在 `rebuild_proxy_response_parts` 里逐查看者执行；
@@ -18348,26 +18566,47 @@ fn rebuild_proxy_response_parts(
     // 历史可见时间窗：session/page 响应在网关层过滤更早的记录。
     // 生效窗 = 既有逐人 windowMs 与 §3.20 visibility.windowMs 的**更严者**（`eff_window_ms`）；
     // 两者皆无 → None → 与不做可见性过滤时逐字节一致。
+    // 2026-11-11 P0：压缩/坏包解析不了 → Refuse → **fail-closed 502**——未过窗的
+    // 历史一条也不许因"解不开"而原样放出（同款旁路：裁剪核心会先解压，见
+    // `trim_page_window_bytes`）。
     if let Some(window) = authz.eff_window_ms() {
         if is_page_read(rest, method) {
-            if let Some(mut v) = parse_upstream_json(&bytes) {
-                let dropped = filter_page_window(&mut v, window);
-                if let Ok(filt) = serde_json::to_vec(&v) {
+            let enc = content_encoding_of(up_headers);
+            let (outcome, dropped) = trim_page_window_bytes(&bytes, enc, window);
+            match outcome {
+                TrimOutcome::Rewritten(filt) => {
                     bytes = axum::body::Bytes::from(filt);
+                    // §3.20 审计：这条时间裁剪由**可见范围**驱动（visibility.windowMs）时留痕
+                    if dropped > 0 && authz.vis.window_ms.is_some() {
+                        audit(
+                            "visibility-filter",
+                            &[
+                                ("share", &share.id),
+                                ("who", &authz.label),
+                                ("kind", "window"),
+                                ("dropped", &dropped.to_string()),
+                                ("windowMs", &window.to_string()),
+                            ],
+                        );
+                    }
                 }
-                // §3.20 审计：这条时间裁剪由**可见范围**驱动（visibility.windowMs）时留痕
-                if dropped > 0 && authz.vis.window_ms.is_some() {
+                TrimOutcome::Refuse => {
                     audit(
-                        "visibility-filter",
+                        "visibility-filter-failclosed",
                         &[
                             ("share", &share.id),
                             ("who", &authz.label),
                             ("kind", "window"),
-                            ("dropped", &dropped.to_string()),
-                            ("windowMs", &window.to_string()),
+                            ("enc", enc.unwrap_or("-")),
                         ],
                     );
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        "{\"error\":\"session/page body unparseable; refuse unfiltered passthrough\"}",
+                    )
+                        .into_response();
                 }
+                TrimOutcome::Passthrough => {}
             }
         }
     }
@@ -18378,57 +18617,89 @@ fn rebuild_proxy_response_parts(
     // 全可见（owner 语义），于是 `session/list` 原样透传 —— 实测 6.2MB，手机经隧道要 3.3s，
     // 首屏 tFrame 被拖到 1.3-1.7s。分享本身已声明 stateVisibility=session，说明它就是一个
     // "一个会话的分享"；对**任何查看者**（含同账号设备）都应只投影该会话（与朋友看到的一致）。
-    // 故：authz.vis 未收窄时，回落到**任务级** stateVisibility 做裁剪。
-    let share_vis = vis_of(&share.state_visibility);
-    let trim_vis = if authz.vis.restricts_sessions() {
-        authz.vis.clone()
-    } else {
-        share_vis
-    };
+    // 故：authz.vis 未收窄时，回落到**任务级** stateVisibility 做裁剪（`effective_trim_vis`）。
+    // 2026-11-11 P0 三项加固：
+    //   ① 压缩字节先解压（外层 resp-decode 已解并剥头；这里带 enc 再兜一层——
+    //      即使调用方忘了解压也裁得动）；
+    //   ② 解析不了（含解不开的压缩）→ fail-closed 502，绝不透传未裁剪清单；
+    //   ③ 裁剪执行了就**必留痕**（kept/dropped，含 dropped=0——静默旁路要能被发现）。
+    let trim_vis = effective_trim_vis(share, authz);
     if is_session_list_read(rest, method) && trim_vis.restricts_sessions() {
-        if let Some(mut v) = parse_upstream_json(&bytes) {
-            let (before, after) = filter_session_list(&mut v, &trim_vis);
-            if after != before {
-                if let Ok(filt) = serde_json::to_vec(&v) {
-                    bytes = axum::body::Bytes::from(filt);
-                }
-                // 排查"为什么对方看不到"就靠这条（§3.20 可审计）
+        let enc = content_encoding_of(up_headers);
+        let (outcome, before, after) = trim_session_list_bytes(&bytes, enc, &trim_vis);
+        match outcome {
+            TrimOutcome::Rewritten(filt) => bytes = axum::body::Bytes::from(filt),
+            TrimOutcome::Refuse => {
                 audit(
-                    "visibility-filter",
+                    "visibility-filter-failclosed",
                     &[
                         ("share", &share.id),
                         ("who", &authz.label),
                         ("kind", "session-list"),
-                        ("kept", &after.to_string()),
-                        ("dropped", &(before - after).to_string()),
+                        ("enc", enc.unwrap_or("-")),
                     ],
                 );
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "{\"error\":\"session/list body unparseable; refuse unfiltered passthrough\"}",
+                )
+                    .into_response();
             }
+            TrimOutcome::Passthrough => {}
         }
+        // 排查"为什么对方看不到/有没有被裁过"就靠这条（§3.20 可审计）
+        audit(
+            "visibility-filter",
+            &[
+                ("share", &share.id),
+                ("who", &authz.label),
+                ("kind", "session-list"),
+                ("kept", &after.to_string()),
+                ("dropped", &(before - after).to_string()),
+            ],
+        );
     }
     // `space=project` 档的会话清单裁剪（2026-10-18 补缺口：此前 project 档只裁工作区、
     // 会话清单原样透传 → 好友仍能看到别的项目的会话，"只这个项目"名不副实）。
     // 默认档（machine）与 session 档不走这里（逐字节不变红线 / 上面已裁）。
+    // 2026-11-11 P0：项目边界同样是安全边界，压缩旁路同样不许——解析不了 fail-closed。
     if is_session_list_read(rest, method) && authz.vis.project_bound {
         let project_paths = effective_project_paths(share, &authz.vis);
-        if let Some(mut v) = parse_upstream_json(&bytes) {
-            let (before, after) = filter_session_list_project(&mut v, &authz.vis, &project_paths);
-            if after != before {
-                if let Ok(filt) = serde_json::to_vec(&v) {
-                    bytes = axum::body::Bytes::from(filt);
-                }
+        let enc = content_encoding_of(up_headers);
+        let (outcome, before, after) =
+            trim_session_list_project_bytes(&bytes, enc, &authz.vis, &project_paths);
+        match outcome {
+            TrimOutcome::Rewritten(filt) => bytes = axum::body::Bytes::from(filt),
+            TrimOutcome::Refuse => {
                 audit(
-                    "visibility-filter",
+                    "visibility-filter-failclosed",
                     &[
                         ("share", &share.id),
                         ("who", &authz.label),
                         ("kind", "session-list-project"),
-                        ("kept", &after.to_string()),
-                        ("dropped", &(before - after).to_string()),
-                        ("project", &project_paths.join(",")),
+                        ("enc", enc.unwrap_or("-")),
                     ],
                 );
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "{\"error\":\"session/list body unparseable; refuse unfiltered passthrough\"}",
+                )
+                    .into_response();
             }
+            TrimOutcome::Passthrough => {}
+        }
+        if after != before {
+            audit(
+                "visibility-filter",
+                &[
+                    ("share", &share.id),
+                    ("who", &authz.label),
+                    ("kind", "session-list-project"),
+                    ("kept", &after.to_string()),
+                    ("dropped", &(before - after).to_string()),
+                    ("project", &project_paths.join(",")),
+                ],
+            );
         }
     }
     // 2026-10-24 归档会话过滤（用户口径「列表不用加载归档后的会话」）：按
@@ -23049,6 +23320,14 @@ pub fn local_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
             "/api/dshShare/capabilityCatalog",
             get(handle_capability_catalog),
         );
+    // 2026-11-11 跨账号 DSH 会话消息（msg_route.rs）：**发**一条给别的账号的会话
+    // （好友/分享任务 owner 校验 → P2P 投递 kind=`dsh-session-msg`）+ **读** chat_state
+    // 薄包装（好友名册 + 在场灯）。与上面的 /api/msg/*（本地消息库、参数 convId）
+    // 语义无关，互不复用；实现依赖 chat_service → 仅 GUI 变体。
+    #[cfg(feature = "gui")]
+    let r = r
+        .route("/api/msg/route", post(crate::msg_route::handle_msg_route))
+        .route("/api/chat_state", get(crate::msg_route::handle_chat_state));
     // 任务群（§3.19）：聊天/群机制在 chat_service（依赖 tauri）→ 仅 GUI 变体
     #[cfg(feature = "gui")]
     let r = r
@@ -25752,8 +26031,12 @@ async fn handle_vnet_leg_drop(Json(body): Json<serde_json::Value>) -> Response {
 }
 
 /// `GET /api/vnet/forwards` —— 列出当前活跃的端口隧道。
+///
+/// 2026-11-11 事故 §2：额外给出 `backoffs[]`（离线设备重建退避），让"某个 DID 的
+/// 端口在反复重建"这件事从接口上一眼可辨，不必再去数日志行。
 #[cfg(feature = "gui")]
 async fn handle_vnet_forwards() -> Response {
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let mut list: Vec<serde_json::Value> = crate::p2p_tunnel::tunnel_list_snapshot()
         .into_iter()
         .map(|(dev, port, local)| json!({ "device": dev, "port": port, "localPort": local, "transport": "legacy" }))
@@ -25765,20 +26048,50 @@ async fn handle_vnet_forwards() -> Response {
             !(v.get("device").and_then(|d| d.as_str()) == Some(dev.as_str())
                 && v.get("port").and_then(|p| p.as_u64()) == Some(port as u64))
         });
-        list.push(json!({ "device": dev, "port": port, "localPort": local, "transport": "vnet" }));
+        let (backoff_ms, next_retry_at_ms, _) = crate::vnet_lease::rebuild_backoff_info(&dev, port, now);
+        list.push(json!({
+            "device": dev,
+            "port": port,
+            "localPort": local,
+            "transport": "vnet",
+            "backoffMs": backoff_ms,
+            "nextRetryAtMs": next_retry_at_ms,
+        }));
     }
-    Json(json!({ "ok": true, "forwards": list })).into_response()
+    // 退避中的条目（可能当前没有活隧道，所以单列而不是只挂在上面）
+    let backoffs: Vec<serde_json::Value> = crate::vnet_lease::rebuild_backoff_views(now)
+        .into_iter()
+        .map(|(device, port, backoff_ms, next_retry_at_ms, last_fail_ms, consecutive, reason)| {
+            json!({
+                "device": device,
+                "port": port,
+                "backoffMs": backoff_ms,
+                "nextRetryAtMs": next_retry_at_ms,
+                "lastFailMs": last_fail_ms,
+                "consecutiveFailures": consecutive,
+                "reason": reason,
+            })
+        })
+        .collect();
+    Json(json!({ "ok": true, "forwards": list, "backoffs": backoffs })).into_response()
 }
 
 /// `GET /api/vnet/leases` —— vnet 端点租约表（L4；task-vnet-endpoint-lease §4）。
 ///
 /// 只读快照：键五元组 + localPort + state/health + listener/recentConnections。
 /// 证据入口：`eval/vnet/r-lease-lifecycle.py`。
+///
+/// 2026-11-11 事故 §2：新增 `backoffMs` / `nextRetryAtMs` / `backoffLevel` /
+/// `consecutiveFailures` —— 离线设备的指数退避（1s→5s→30s→2min→10min）必须能从
+/// 接口看见，否则"为什么这条租约不重建了"又只能靠数日志猜。
 #[cfg(feature = "gui")]
 async fn handle_vnet_leases() -> Response {
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let leases: Vec<serde_json::Value> = crate::vnet_lease::leases_snapshot()
         .into_iter()
         .map(|l| {
+            let (backoff_ms, next_retry_at_ms, consecutive) =
+                crate::vnet_lease::rebuild_backoff_info(&l.key.device, l.key.port, now);
             json!({
                 "consumerDevice": l.key.consumer_device,
                 "kind": l.key.kind,
@@ -25794,6 +26107,10 @@ async fn handle_vnet_leases() -> Response {
                 "lastFailMs": l.last_fail_ms,
                 "failReason": l.fail_reason,
                 "releaseReason": l.release_reason,
+                "backoffMs": backoff_ms,
+                "nextRetryAtMs": next_retry_at_ms,
+                "backoffLevel": consecutive,
+                "consecutiveFailures": consecutive,
             })
         })
         .collect();
@@ -28883,6 +29200,256 @@ mod tests {
         assert!(parse_upstream_json(ok).is_some());
         // 坏透的体（不是 JSON）→ None（调用方保持原样透传）
         assert!(parse_upstream_json(b"not json at all").is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2026-11-11 P0 安全回归：压缩（gzip/deflate/br）响应不得绕过可见性裁剪
+    //
+    // 根因（实测复现：单会话可见性分享 `session/list` 200 ok 1625 条 / 1624 条
+    // 越权）：6651ec09（2026-11-09）起网关对上游要压缩，而裁剪靠
+    // `parse_upstream_json`——压缩字节解析必失败 → 裁剪被静默跳过 → 原样透传。
+    // 修法＝解压优先于裁剪（`rebuild_proxy_response` resp-decode + 裁剪核心内
+    // 兜底）+ 解析失败 fail-closed（`TrimOutcome::Refuse` → 502）。下列用例锁死：
+    //   ① 压缩与明文的裁剪语义完全一致（同白名单 → 同条数、同会话、同字节）；
+    //   ② 解不开的一律 Refuse，绝不退化为透传（旧漏洞路径）；
+    //   ③「要不要为裁剪而解压」只覆盖安全边界（未收窄响应继续压缩透传）。
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(bytes).unwrap();
+        e.finish().unwrap()
+    }
+
+    fn trimmed_session_count(body: &[u8]) -> usize {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .expect("裁剪输出应是可解析 JSON")
+            .pointer("/result/value/sessions")
+            .and_then(|x| x.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// 复现口径的函数级回归：单会话可见性 + gzip 上游响应 → 恰好 1 条（白名单那条），
+    /// 且与 identity 路径的裁剪输出**逐字节一致**。
+    #[test]
+    fn p0_gzip_session_list_trimmed_to_single_session() {
+        let vis = vis_of(&json!({"space":"session","sessions":["session-b"]}));
+        let plain = serde_json::to_vec(&session_list_envelope()).unwrap();
+        let gzipped = gz(&plain);
+        // gzip：解压 → 裁剪 → 重序列化，3 → 1
+        let (out, before, after) = trim_session_list_bytes(&gzipped, Some("gzip"), &vis);
+        assert_eq!((before, after), (3, 1), "gzip 响应也必须裁到白名单");
+        let TrimOutcome::Rewritten(body) = out else {
+            panic!("gzip 响应必须 Rewritten（裁剪生效），而不是透传/拒绝: {out:?}");
+        };
+        assert_eq!(trimmed_session_count(&body), 1, "单会话可见性 → 至多 1 条");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v.pointer("/result/value/sessions/0/sessionId"),
+            Some(&json!("session-b")),
+            "留下的必须是白名单那条"
+        );
+        // 信封不被裁剪破坏（SPA 靠 rpcId 配对）
+        assert_eq!(v["type"], json!("server-response"));
+        assert_eq!(v["rpcId"], json!("r1"));
+        // identity：同一份应答，裁剪结果与 gzip 路径逐字节一致（编码不改变语义）
+        let (out2, before2, after2) = trim_session_list_bytes(&plain, None, &vis);
+        assert_eq!((before2, after2), (3, 1));
+        let TrimOutcome::Rewritten(body2) = out2 else {
+            panic!("identity 响应应 Rewritten: {out2:?}");
+        };
+        assert_eq!(trimmed_session_count(&body2), 1);
+        assert_eq!(body, body2, "同一应答 gzip/identity 裁剪输出必须一致");
+        // 白名单内一条不差 → Passthrough（原字节原样，保持既有回归红线）
+        let vis_all3 = vis_of(&json!({"space":"session","sessions":["session-a","session-b","session-c"]}));
+        let (out3, b3, a3) = trim_session_list_bytes(&plain, None, &vis_all3);
+        assert_eq!((b3, a3), (3, 3));
+        assert_eq!(out3, TrimOutcome::Passthrough);
+    }
+
+    /// 解不开 / 不支持的编码 → Refuse（fail-closed），绝不退化成透传——这正是旧漏洞
+    /// （解析失败 → 原样放行全机清单）的路径，任何编码下都不许再出现。
+    #[test]
+    fn p0_unparseable_body_refuses_instead_of_passthrough() {
+        let vis = vis_of(&json!({"space":"session","sessions":["session-b"]}));
+        let plain = serde_json::to_vec(&session_list_envelope()).unwrap();
+        // ① 坏 gzip 字节 + gzip 头
+        let (out, _, _) = trim_session_list_bytes(b"not-gzip-at-all", Some("gzip"), &vis);
+        assert_eq!(out, TrimOutcome::Refuse, "坏 gzip 必须拒绝");
+        // ② 明文 JSON 谎报 gzip
+        let (out2, _, _) = trim_session_list_bytes(&plain, Some("gzip"), &vis);
+        assert_eq!(out2, TrimOutcome::Refuse, "明文字节谎报 gzip 必须拒绝");
+        // ③ 未在请求白名单里的编码（zstd）——同样不许透传
+        let (out3, _, _) = trim_session_list_bytes(&gz(&plain), Some("zstd"), &vis);
+        assert_eq!(out3, TrimOutcome::Refuse, "未知编码必须拒绝");
+        // ④ 根本不是 JSON 的明文
+        let (out4, _, _) = trim_session_list_bytes(b"<html>err</html>", None, &vis);
+        assert_eq!(out4, TrimOutcome::Refuse, "非 JSON 明文必须拒绝");
+        // 对照：全可见（未收窄）不会进裁剪核心（parts 只在 restricts_sessions 时进来）
+        assert!(!vis_all().restricts_sessions());
+    }
+
+    /// session/page 时间窗（P0 同款旁路）：gzip 的历史页也必须过窗，解不开必须拒绝。
+    #[test]
+    fn p0_gzip_page_window_filtered_and_failclosed() {
+        let now = now_ms();
+        let page = json!({"records": [
+            {"event": {"type": "old", "time": (now - 10 * 3600_000) as i64}},
+            {"event": {"type": "new", "time": now as i64}},
+        ]});
+        let plain = serde_json::to_vec(&page).unwrap();
+        // gzip：10h 前的记录被删（窗 6h）
+        let (out, dropped) = trim_page_window_bytes(&gz(&plain), Some("gzip"), 6 * 3600_000);
+        assert_eq!(dropped, 1, "gzip 的时间窗裁剪必须生效");
+        let TrimOutcome::Rewritten(body) = out else {
+            panic!("应 Rewritten: {out:?}");
+        };
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let left = v["records"].as_array().unwrap();
+        assert_eq!(left.len(), 1, "只留窗内记录");
+        assert_eq!(left[0]["event"]["type"], json!("new"));
+        // identity：一致
+        let (out2, dropped2) = trim_page_window_bytes(&plain, None, 6 * 3600_000);
+        assert_eq!(dropped2, 1);
+        assert!(matches!(out2, TrimOutcome::Rewritten(_)));
+        // 坏 gzip → Refuse（旧路径会整页透传 = 时间窗泄漏）
+        let (out3, _) = trim_page_window_bytes(b"junk", Some("gzip"), 6 * 3600_000);
+        assert_eq!(out3, TrimOutcome::Refuse);
+        // 谎报 gzip 的明文 → Refuse
+        let (out4, _) = trim_page_window_bytes(&plain, Some("gzip"), 6 * 3600_000);
+        assert_eq!(out4, TrimOutcome::Refuse);
+    }
+
+    /// 项目档同款：gzip 的清单按项目边界裁；空项目清单保持既有 fail-open（判不了
+    /// 不裁，与编码无关）；坏包 fail-closed。
+    #[test]
+    fn p0_gzip_project_list_trimmed() {
+        let vis = vis_of(&json!({"space":"project","projectCwd":"D:\\p"}));
+        let plain = serde_json::to_vec(&session_list_envelope()).unwrap();
+        let (out, before, after) =
+            trim_session_list_project_bytes(&gz(&plain), Some("gzip"), &vis, &["D:\\p"]);
+        assert_eq!((before, after), (3, 2), "gzip 的项目边界裁剪必须生效");
+        let TrimOutcome::Rewritten(body) = out else {
+            panic!("应 Rewritten: {out:?}");
+        };
+        assert_eq!(trimmed_session_count(&body), 2);
+        // 空项目清单（判不了）→ 不裁（既有 fail-open 语义不因本修复改变）
+        let (out2, _, _) = trim_session_list_project_bytes(&gz(&plain), Some("gzip"), &vis, &[]);
+        assert_eq!(out2, TrimOutcome::Passthrough);
+        // 坏包 → Refuse
+        let (out3, _, _) =
+            trim_session_list_project_bytes(b"junk", Some("gzip"), &vis, &["D:\\p"]);
+        assert_eq!(out3, TrimOutcome::Refuse);
+    }
+
+    /// 解压核心本身：gzip（含 x-gzip 别名）/ zlib 包装 deflate / 裸 deflate / brotli
+    /// 往返；identity / 未知编码 / 坏字节 → None（调用方 fail-closed）。
+    #[test]
+    fn p0_decode_content_encoding_roundtrips() {
+        use std::io::Write as _;
+        let data: &[u8] = br#"{"result":{"value":{"sessions":[{"sessionId":"s1"}]}}}"#;
+        // gzip + x-gzip 别名 + 头部空白容忍
+        assert_eq!(
+            decode_content_encoding("gzip", &gz(data)).as_deref(),
+            Some(data)
+        );
+        assert_eq!(
+            decode_content_encoding(" x-gzip ", &gz(data)).as_deref(),
+            Some(data)
+        );
+        // deflate：RFC 的 zlib 包装与裸 deflate 两种都要认
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(data).unwrap();
+        let zlibbed = z.finish().unwrap();
+        assert_eq!(
+            decode_content_encoding("deflate", &zlibbed).as_deref(),
+            Some(data)
+        );
+        let mut d = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        d.write_all(data).unwrap();
+        let raw = d.finish().unwrap();
+        assert_eq!(
+            decode_content_encoding("deflate", &raw).as_deref(),
+            Some(data)
+        );
+        // br：真 brotli 字节（与 reqwest 同族解码）
+        let mut br_out = Vec::new();
+        {
+            let mut enc = brotli::CompressorWriter::new(&mut br_out, 4096, 6, 22);
+            enc.write_all(data).unwrap();
+        }
+        assert_eq!(
+            decode_content_encoding("br", &br_out).as_deref(),
+            Some(data)
+        );
+        // identity / 未知编码 / 坏字节 → None（安全上等同"解不开"→ fail-closed）
+        assert_eq!(decode_content_encoding("identity", data), None::<Vec<u8>>);
+        assert_eq!(decode_content_encoding("zstd", data), None::<Vec<u8>>);
+        assert_eq!(decode_content_encoding("gzip", b"corrupt"), None::<Vec<u8>>);
+    }
+
+    /// 「要不要为裁剪而解压」的判定只覆盖安全边界：未收窄（默认全可见）的
+    /// session/list / session/page 继续压缩透传（6651ec09 的 TTI 收益不受影响）；
+    /// 会话白名单（任务级/逐人）、项目边界、时间窗一律触发。
+    #[test]
+    fn p0_response_needs_gateway_trim_scope() {
+        let post = Method::POST;
+        let mut session_share = test_share(Vec::new());
+        session_share.state_visibility = json!({"space":"session","sessions":["s1"]});
+        let machine_share = test_share(Vec::new()); // state_visibility = 默认全可见
+        // ① 任务级单会话可见性（owner 打开也算）→ list 必须解压裁剪
+        assert!(response_needs_gateway_trim(
+            &session_share,
+            &mux_authz(default_caps(), vis_all()),
+            "api/session/list",
+            &post
+        ));
+        // ② 逐人收窄同样触发
+        let authz_narrow = mux_authz(
+            default_caps(),
+            vis_of(&json!({"space":"session","sessions":["s1"]})),
+        );
+        assert!(response_needs_gateway_trim(
+            &machine_share,
+            &authz_narrow,
+            "session/list",
+            &post
+        ));
+        // ③ 项目边界 → list 触发
+        let authz_proj = mux_authz(
+            default_caps(),
+            vis_of(&json!({"space":"project","projectCwd":"D:\\p"})),
+        );
+        assert!(response_needs_gateway_trim(
+            &machine_share,
+            &authz_proj,
+            "session/list",
+            &post
+        ));
+        // ④ 时间窗 → page 触发（visibility.windowMs 与逐人 windowMs 同把尺）
+        let authz_win = mux_authz(default_caps(), vis_of(&json!({"windowMs": 3600_000})));
+        assert!(response_needs_gateway_trim(
+            &machine_share,
+            &authz_win,
+            "api/session/page",
+            &post
+        ));
+        // ⑤ 未收窄（默认全可见）：list/page/写路径一律不解压（压缩透传保持）
+        let authz_all = mux_authz(default_caps(), vis_all());
+        for rest in [
+            "api/session/list",
+            "session/list",
+            "api/session/page",
+            "session/page",
+            "api/session/prompt",
+        ] {
+            assert!(
+                !response_needs_gateway_trim(&machine_share, &authz_all, rest, &post),
+                "未收窄不得解压: {rest}"
+            );
+        }
     }
 
     /// 2026-10-18 真好友实测：写路径（`session/prompt`）此前没有会话白名单门，

@@ -5,7 +5,7 @@ import path from 'path'
 // Youling 身份/设备管理(2026-10-06 env 并入):IdentityPanel/MycoDevices/identityStore
 // 源码已 git mv 进本工程 src/(env/ui 退役删除),@wsui alias 指向自身 src。
 export default defineConfig({
-  cacheDir: 'D:/Projects/AOP/.vitecache/home',
+  cacheDir: 'D:/Projects/labs/.vitecache/home',
   plugins: [react()],
   base: './',
   // 第63轮 env 合并：identity command 已在 home 自身注册，走 invoke 不再强制 HTTP//   define: { 'import.meta.env.VITE_FORCE_HTTP': JSON.stringify('1') },
