@@ -2,7 +2,19 @@
 
 Thank you for your interest in contributing!
 
-## Getting Started
+## Current phase: Private beta
+
+The repository is **private** while it goes through an early test round, so the
+standard Fork→PR flow below does not apply yet. Use one of these instead:
+
+| Your access | How to contribute |
+|---|---|
+| **write** (invited collaborator) | Push a feature branch → open a PR against `main`. CI runs automatically. |
+| **read** (invited viewer) | You cannot push branches. Send a patch (`git diff` / `git format-patch`) in an Issue or to the maintainers — we'll apply it with your authorship and DCO sign-off preserved. |
+
+Once the repo goes public, the standard Fork→PR flow below takes over.
+
+## Getting Started (public phase)
 
 1. Fork the repository
 2. Clone your fork: `git clone https://github.com/YourName/myco.git`
