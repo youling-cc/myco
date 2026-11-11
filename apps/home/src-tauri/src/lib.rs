@@ -15,6 +15,8 @@ const ENV_API: &str = "http://127.0.0.1:3102";
 // watch_probe_at 产线路径（同 p2p_server/p2p_client 的可见性放开理由）。
 /// 委任状自动续约巡检（2026-10-11 分身静默过期缺口：本体巡签+分身续约请求）。
 pub mod delegation_renewal;
+#[cfg(all(feature = "gui", any(target_os = "macos", test)))]
+mod external_browser;
 #[cfg(feature = "gui")]
 pub mod identity_service;
 #[cfg(feature = "gui")]
@@ -1087,7 +1089,11 @@ fn open_external(url: String) -> Result<(), String> {
             .spawn()
             .map_err(|e| e.to_string())?;
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        external_browser::open(&url)?;
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         std::process::Command::new("xdg-open")
             .arg(&url)
