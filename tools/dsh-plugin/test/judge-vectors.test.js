@@ -15,7 +15,11 @@ import { readFile } from "node:fs/promises";
 
 import { effectiveCaps, judgeMethod } from "../src/judge-engine.js";
 
-const VECTOR_FILE = "D:/Projects/AOP/myco-thin-node/eval/vnet/judge-vectors.json";
+import { fileURLToPath } from "node:url";
+
+const VECTOR_FILE = fileURLToPath(
+  new URL("../../../eval/vnet/judge-vectors.json", import.meta.url),
+);
 
 /**
  * Map one vector grant onto the engine's grant shape (owner by label, as

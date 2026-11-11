@@ -2,6 +2,10 @@
 node_modules/
 target/
 dist/
+
+# identity-svc runtime data
+revocations.json
+msg-inbox.json
 build/
 *.apk
 *.idsig
@@ -21,7 +25,3 @@ Thumbs.db
 .notify-*
 .tmp*/
 *.tmp.md
-
-# identity-svc runtime data
-revocations.json
-msg-inbox.json
