@@ -47,25 +47,43 @@ the right to submit it under the project's open-source license.
 - **TypeScript/React**: Follow existing code patterns. Run `npx tsc --noEmit` to check.
 - **Java (Android)**: Follow existing patterns in `android-shell/`.
 
-## Testing
+## Testing — RED → GREEN is required
+
+Every change that touches behavior **must come with tests**. Bug fixes follow
+the RED → GREEN cycle:
+
+1. **RED** — write a test that reproduces the bug and *watch it fail* on the
+   current code. Paste the failing output in the PR description.
+2. **GREEN** — apply the fix and the same test now passes.
+3. **Refactor** (optional) — clean up while keeping the test green.
+
+A bug fix PR without a reproducing test (or RED evidence) will not be merged.
+Pure documentation / comment / CI-config PRs are exempt — state the exemption
+explicitly in the PR description.
+
+Where tests live:
+
+| Change area | Test location | Runner |
+|---|---|---|
+| Phone UI (`apps/phone/src`) | co-located `*.test.ts` | `npx vitest run` |
+| Home UI (`apps/home/ui/src`) | co-located `*.test.ts(x)` | `pnpm --dir apps/home/ui exec vitest run` |
+| Rust core (`apps/home/src-tauri/src`, `apps/vnet/src`, `core/*`) | `#[cfg(test)]` in-file | `cargo test --workspace` |
+| Identity service (`services/identity-svc`) | co-located `*.test.mjs` | `node --test` |
 
 ```bash
-# Phone UI tests
+# run the suites locally before pushing
 cd apps/phone && npx vitest run
-
-# Rust tests
-cd apps/home/src-tauri && cargo test
-
-# Identity service tests
+cd apps/home/src-tauri && cargo test --workspace
 cd services/identity-svc && node --test
 ```
 
 ## Pull Request Process
 
-1. Ensure tests pass
-2. Update documentation if needed
-3. Keep PRs focused — one feature/fix per PR
-4. Add `Signed-off-by` to every commit
+1. **Include tests per the RED → GREEN rule above** (bug fixes: paste RED output)
+2. Ensure all CI checks pass (four suites run automatically)
+3. Update documentation if needed
+4. Keep PRs focused — one feature/fix per PR
+5. Add `Signed-off-by` to every commit (DCO)
 
 ## Reporting Issues
 
