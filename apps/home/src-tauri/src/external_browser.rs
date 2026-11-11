@@ -1,5 +1,3 @@
-//! macOS 系统浏览器入口；命令构造与执行分开，以便测试时不打开网页。
-
 use std::process::Command;
 
 pub(super) fn open(url: &str) -> Result<(), String> {
