@@ -6,7 +6,7 @@ Decentralized identity & agent network client.
 
 > **Why "myco"?** Short for *mycelium* — the underground fungal network that connects trees, shares nutrients, and has no central controller. Nature's original peer-to-peer network. 🍄
 
-**[中文说明](#中文说明)**
+**[中文说明](#中文说明)** · **快速上手：[中文](docs/quickstart-zh.md)**
 
 ## What is myco?
 
