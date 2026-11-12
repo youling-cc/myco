@@ -1169,6 +1169,18 @@ fn share_env_json_mode(
         ) {
             item["entryUrl"] = json!(url);
         }
+        // 2026-11-12 干净坐标（用户定调回归原架构：三端同一个干净简单链接）：
+        // 接收端凭 deviceAlias/shareAlias + 自己的本地固定口拼
+        // `http://<deviceAlias>.localhost:<口>/<shareAlias>/`——笔记本用 24011
+        // Host 路由器，手机用固定隧道口直入（public_router 的 Host 分发）。
+        if use_device_origin {
+            if let Ok(da) = ensure_device_origin_alias(&e.device, 0, None) {
+                if let Ok(sa) = ensure_device_share_alias(&da, &share.id, None) {
+                    item["deviceAlias"] = json!(da);
+                    item["shareAlias"] = json!(sa);
+                }
+            }
+        }
     }
     arr
 }
@@ -21029,6 +21041,44 @@ pub(crate) fn ensure_device_origin_listener(port: u16) -> Result<u16, String> {
 
 /// SPA 根相对请求兜底（/、/api/*、/plugins/* 无 /gw 前缀）：按 cookie 归位分享
 /// 后代理——dsh SPA 的资源与 fetch 全是根相对（承主仓）。
+/// 干净 URL 归位（纯函数）：Host 的设备别名指向**本机**且路径首段是该设备下已注册
+/// 的分享别名 → (真实 shareId, 余下 tail)。不匹配返回 None（走原 cookie/断言链）。
+fn clean_url_share_resolve(host: &str, path: &str) -> Option<(String, String)> {
+    let alias = device_origin_host_alias(host)?;
+    // 只认指向本机的别名（查看端把 <alias>.localhost 解析到源设备的隧道/本地口）。
+    let my_did = myco_core::identity::device_identity()
+        .map(|(d, _)| d)
+        .ok()?;
+    let targets_me = DEVICE_ORIGINS
+        .lock()
+        .unwrap()
+        .get(&alias)
+        .map(|t| device_origin_same_did(&t.did, &my_did))
+        .unwrap_or(false)
+        || ensure_device_origin_alias(&my_did, 0, None)
+            .map(|mine| mine == alias)
+            .unwrap_or(false);
+    if !targets_me {
+        return None;
+    }
+    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    if first.is_empty() {
+        return None;
+    }
+    let real = DEVICE_SHARE_ALIASES
+        .lock()
+        .unwrap()
+        .get(&(alias.clone(), first.to_string()))?
+        .clone();
+    let tail = path
+        .trim_start_matches('/')
+        .strip_prefix(first)
+        .unwrap_or("")
+        .trim_start_matches('/')
+        .to_string();
+    Some((real, tail))
+}
+
 async fn handle_root_fallback(
     path_opt: Option<Path<String>>,
     method: Method,
@@ -21037,6 +21087,27 @@ async fn handle_root_fallback(
     ws: Option<WebSocketUpgrade>,
     body: axum::body::Bytes,
 ) -> Response {
+    // ── 2026-11-12 干净 URL 直入（用户定调回归原架构）──
+    // Host=<本机设备别名>.localhost 且路径首段=已注册分享别名 → 复用设备域别名表
+    // 归位为 /gw/<real>/<tail>，走标准 /gw 链（VNETP DID 鉴权 → 种 cookie → 302）。
+    // 手机等"裸隧道"查看端由此获得与笔记本同形的干净入口，无需在端上实现
+    // Host 路由器。鉴权不变：别名只决定"哪张卡"，准入仍由 handle_proxy 的
+    // authorize_request（VNETP 前导 DID / mt / cookie）判。
+    {
+        let host = headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let path_raw = path_opt.as_ref().map(|p| p.0.as_str()).unwrap_or("");
+        if let Some((real, tail)) = clean_url_share_resolve(host, path_raw) {
+            let inner = if tail.is_empty() {
+                format!("{real}/")
+            } else {
+                format!("{real}/{tail}")
+            };
+            return handle_proxy_timed(Path(inner), method, RawQuery(rq), headers, ws, body).await;
+        }
+    }
     let cookie_hdr = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -21561,6 +21632,81 @@ async fn handle_create(Json(body): Json<serde_json::Value>) -> Response {
     match create_share_impl(body).await {
         Ok(v) => Json(v).into_response(),
         Err((code, v)) => (code, Json(v)).into_response(),
+    }
+}
+
+/// 重发环境卡（2026-11-12）：**已存在的分享**按现行注册表重新出卡——卡面 env
+/// （entryUrl/干净坐标 deviceAlias+shareAlias/caps/owner）随最新授权表刷新，
+/// 接收端按 shareId 更新既有卡（不重复、不回退进度）。用途：源设备升级了入口
+/// 形态（如干净 URL 坐标）后让各查看端的卡拿到新坐标。
+async fn handle_announce_env_card(
+    axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
+) -> Response {
+    let sid = body
+        .get("shareId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if sid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "缺 shareId" })),
+        )
+            .into_response();
+    }
+    let share = {
+        let sh = shares();
+        let found = sh
+            .shares
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == sid)
+            .cloned();
+        drop(sh);
+        found
+    };
+    let Some(share) = share else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": format!("分享不存在：{sid}") })),
+        )
+            .into_response();
+    };
+    if share.env.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "该分享没有 env（不是环境卡）" })),
+        )
+            .into_response();
+    }
+    let title = if share.title.trim().is_empty() { sid.clone() } else { share.title.trim().to_string() };
+    let Some(conv) = crate::chat_service::ensure_device_group() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": "设备群未就绪（稍后再试）" })),
+        )
+            .into_response();
+    };
+    match crate::chat_service::chat_share_task(
+        conv.clone(),
+        title,
+        "myco 环境卡：点卡打开对应环境（入口坐标已刷新）。".into(),
+        String::new(),
+        None,
+        None,
+        None,
+        Some(sid.clone()),
+    )
+    .await
+    {
+        Ok(v) => Json(json!({ "ok": true, "share": sid, "conv": conv, "card": v })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -23375,6 +23521,7 @@ pub fn local_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
             post(crate::msg_api::handle_chat_tombstone_tasks),
         )
         .route("/api/dshShare/create", post(handle_create))
+        .route("/api/dshShare/announceEnvCard", post(handle_announce_env_card))
         .route("/api/dshShare/publish", post(handle_publish))
         .route("/api/dshShare/grant", post(handle_grant))
         // 逐人邀请的 HTTP 面（skill 通用入口；与 Tauri 命令 share_grant 同一实现）

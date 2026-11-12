@@ -31,9 +31,6 @@ public class TcpDialer {
     public TcpDialer(TunnelJs js) { this.js = js; }
 
     private static boolean allowed(int port) {
-        // 25910-25999 = P2pSyncTunnel 自家分配的设备转发回环口（ensureShareEntryForwardFor
-        // 探活用，2026-11-12 白屏实案）。是自己进程的 listener，放行探活无风险。
-        if (port >= 25910 && port <= 25999) return true;
         for (int p : ALLOWED) if (p == port) return true;
         return false;
     }

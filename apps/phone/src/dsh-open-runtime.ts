@@ -293,25 +293,15 @@ export const DEVICE_PORT_RDP = 3389
  */
 export const DEVICE_PORT_VNETP = 15200
 
-/** 回环口探活（tcpDial 同步桥 + 立即关）：listener 随 vnet 连接死亡而关闭，
- *  连不上 = 死口。只覆盖「连接销毁后映射残留」类（白屏实案的杀手）；
- *  桥不可用时保守放行（不阻塞主路径）。 */
-async function probeTunnelAlive(localPort: number): Promise<boolean> {
-  const shell = (window as unknown as {
-    MycoShell?: { tcpDial?: (p: number) => string; tcpClose?: (id: number) => string }
-  }).MycoShell
-  if (!shell || typeof shell.tcpDial !== 'function') return true
-  try {
-    const r = JSON.parse(shell.tcpDial(localPort) || '{}') as { ok?: boolean; connId?: number }
-    if (r && r.ok === true && typeof r.connId === 'number') {
-      try { shell.tcpClose?.(r.connId) } catch { /* ignore */ }
-      return true
-    }
-    return false
-  } catch {
-    return true // 桥异常≠口死——交由 Java 层 probeLocal 兜底
-  }
-}
+/**
+ * 设备域查看端固定本地口（2026-11-12 用户定调回归原架构：三端同一个干净链接）。
+ * 每个查看端给「对端设备的 15200」开一条**固定口**隧道；干净 URL
+ * `http://<deviceAlias>.localhost:<口>/<shareAlias>/` 骑在这条隧道上——
+ * 口永不变 ⇒ WebView 按 URL 缓存钉死死口的问题从根上消失（探活补丁随之删除）。
+ * 选 23912 而非 PC/笔记本的 23911：手机 app 自己把 23911 占了（MainActivity
+ * DSH_LOCAL_ORIGIN——应用内 DSH 浏览器的固定 origin），真机实测 bind 冲突。
+ */
+export const DEVICE_VIEWER_LOCAL_PORT = 23912
 
 /** 异步 ensure 的回调序号（window 临时回调名，用完即删）。 */
 let syncTunnelCbSeq = 0
@@ -324,18 +314,25 @@ const SYNC_TUNNEL_ENSURE_TIMEOUT_MS = 35_000
 /**
  * 确保「本机 → deviceDid:targetPort」有一个本地回环口，返回该口。
  *
- * 一条设备级 vnet 连接 + 每端口一条 add_forward（Java 侧 P2pSyncTunnel 管）；
- * 本地口由 Java 从 25910 起自动分配，这里不写死端口——写死会和"同时接 DSH 与
- * RDP"打架（2026-11-11 单隧道实现踩过：两端口抢同一口必失败）。
+ * 一条设备级 vnet 连接 + 每端口一条 add_forward（Java 侧 P2pSyncTunnel 管）。
+ * · 动态口模式（默认，聊天/对账 9100 等）：本地口由 Java 从 25910 起自动分配，
+ *   这里不写死端口——写死会和"同时接 DSH 与 RDP"打架（2026-11-11 单隧道实现
+ *   踩过：两端口抢同一口必失败）。
+ * · 固定口模式（opts.localPort，设备域查看端 15200→23911）：口永不变，URL 稳定
+ *   ⇒ 跳过 JS 缓存（省一层状态），幂等正确性由 Java probeLocal 保证（死口自动
+ *   evict+原口重建）。
  */
-async function ensureDeviceForward(deviceDid: string, targetPort: number): Promise<number | null> {
+async function ensureDeviceForward(
+  deviceDid: string,
+  targetPort: number,
+  opts?: { localPort?: number },
+): Promise<number | null> {
+  const fixed = opts?.localPort ?? 0
   const key = `${deviceDid}|${targetPort}`
-  const now = Date.now()
-  const hit = syncTunnelCache.get(key)
-  if (hit && now - hit.at < SYNC_TUNNEL_TTL_MS && (await probeTunnelAlive(hit.localPort))) {
-    return hit.localPort
+  if (fixed <= 0) {
+    const hit = syncTunnelCache.get(key)
+    if (hit && Date.now() - hit.at < SYNC_TUNNEL_TTL_MS) return hit.localPort
   }
-  if (hit) syncTunnelCache.delete(key) // 过期或探活失败——不吃死口（2026-11-12 白屏实案）
   const id = tunnelIdentity()
   if (!id) return null
   // 异步桥（p2pTunnelEnsureAsync）：同步版会冻住 JS 线程（libvnet 注册重试
@@ -375,7 +372,8 @@ async function ensureDeviceForward(deviceDid: string, targetPort: number): Promi
       shell.p2pTunnelEnsureAsync!(cbName, JSON.stringify({
         targetDevice: deviceDid,
         targetPort,
-        // localPort 不传 = Java 自动分配（25910 起）
+        // localPort>0 = 固定口（设备域查看端）；不传 = Java 自动分配（25910 起）
+        ...(fixed > 0 ? { localPort: fixed } : {}),
         device: id.device,
       }))
     } catch {
@@ -392,13 +390,12 @@ async function ensureSyncTunnelFor(deviceDid: string): Promise<number | null> {
 }
 
 /**
- * DSH 分享入口专用（2026-11-12）：本机 → 对端 **VNETP 身份口 15200**。
- * 经此口的 HTTP 请求由网关按隧道对端 DID 认证（免 mt / 免客户端断言）——
- * 手机点卡打开 `/gw/<shareId>/` 的前置，也是**唯一**路径。失败返回 null
- * （调用方如实报「连不上源设备」；mt 回落链已于 2026-11-12 整链删除）。
+ * DSH 分享入口专用（2026-11-12）：本机 → 对端 **VNETP 身份口 15200**，走
+ * 设备域查看端固定口 23911。经此口的 HTTP 请求由网关按隧道对端 DID 认证
+ * （免 mt / 免客户端断言）。失败返回 null（调用方如实报「连不上源设备」）。
  */
 export async function ensureShareEntryForwardFor(deviceDid: string): Promise<number | null> {
-  return ensureDeviceForward(deviceDid, DEVICE_PORT_VNETP)
+  return ensureDeviceForward(deviceDid, DEVICE_PORT_VNETP, { localPort: DEVICE_VIEWER_LOCAL_PORT })
 }
 
 /**
@@ -807,7 +804,20 @@ async function openTaskShareOnce(raw: Record<string, unknown>): Promise<OpenSumm
       reason: 'unreachable',
     }
   }
-  const vurl = `http://127.0.0.1:${vport}/gw/${card.shareId}/`
+  // 干净 URL 优先（2026-11-12 用户定调回归原架构：三端同一个干净简单链接）：
+  // 卡上 env 带源设备的 deviceAlias/shareAlias → `http://<alias>.localhost:23911/<share>/`
+  // （*.localhost 解析到回环，Host 随 URL 进隧道，网关按 Host+别名表归位并走标准
+  // /gw 鉴权链）。老卡没有坐标时回落 /gw/<id>/ 形态（功能等价，仅 URL 不够干净）。
+  // 注意从 raw（原始卡面）读 env——shareCardOf 归一化只保留坐标五字段，env 会丢。
+  const envSrc = (raw && ((raw as { card?: unknown }).card || raw)) as { env?: unknown[] }
+  const env0 = (Array.isArray(envSrc.env) ? (envSrc.env || [])[0] : undefined) as
+    | { deviceAlias?: unknown; shareAlias?: unknown }
+    | undefined
+  const da = String(env0?.deviceAlias ?? '').trim()
+  const sa = String(env0?.shareAlias ?? '').trim()
+  const vurl = da && sa
+    ? `http://${da}.localhost:${vport}/${sa}/`
+    : `http://127.0.0.1:${vport}/gw/${card.shareId}/`
   const vtitle = (card.title || card.shareId || '分享').toString()
   const opened = openShareInWebView(vurl, vtitle)
   if (opened !== true) {

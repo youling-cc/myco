@@ -124,10 +124,19 @@ public class ShareWebActivity extends Activity {
                 cm.registerNetworkCallback(new android.net.NetworkRequest.Builder().build(), netCb);
             }
         } catch (Exception ignored) { }
-        if (url0.startsWith("http://") && (url0.contains("mt=") || url0.contains("/gw/"))) {
-            // 带 mt（入门票）或 /gw/（网关路径）的 http URL 放行：
+        // 2026-11-12 设备域干净 URL：`http://<设备别名>.localhost:<口>/<分享别名>/`
+        // ——*.localhost 恒解析回环（本机隧道口），Host 只用于网关路由；与 mt//gw/
+        // 同一安全面（都是"只能打到自己机器的隧道口"），放行。
+        boolean deviceOrigin = false;
+        try {
+            java.net.URL u = new java.net.URL(url0);
+            deviceOrigin = u.getProtocol().equals("http")
+                && u.getHost() != null && u.getHost().endsWith(".localhost");
+        } catch (Exception ignored) { }
+        if (url0.startsWith("http://") && (url0.contains("mt=") || url0.contains("/gw/") || deviceOrigin)) {
+            // 带 mt（入门票）或 /gw/（网关路径）或设备域别名（.localhost）的 http URL 放行：
             // 覆盖 localhost 代理、LAN 直连、中继服务器三种场景。
-            // 不带 mt 的任意 URL 仍然拒绝（防被塞浏览器用）。
+            // 其它任意 URL 仍然拒绝（防被塞浏览器用）。
             web.loadUrl(url0);
         } else {
             bar.setText("打不开这个任务（地址不合法）");

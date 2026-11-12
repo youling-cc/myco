@@ -197,6 +197,26 @@ static PRESENCE_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(std::time:
 static PRESENCE_FETCH_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// 立即作废 presence 行缓存（下一次查询强制回源）。
+///
+/// 为什么需要（2026-11-12 delegation_notify_full_path 真案）：集成测试在同一进程里
+/// 切换 mock 场景（在线→死地址→离线），2.5s TTL 内场景②吃到①缓存的旧地址——
+/// POST 打到场景①仍在监听的 mock 上返回 2xx，「地址不可达应 false」被污染成 true
+/// （0.01s 完成、零网络日志即此特征）。生产语义不受影响（缓存仍按 TTL 滚动），
+/// 本函数只给测试/运维一个显式失效入口。
+pub fn presence_cache_invalidate() {
+    // try_lock 而非 blocking_lock：本函数会在 async 测试上下文被调（blocking_lock
+    // 在 tokio worker 线程上直接 panic「cannot block the current thread」）。
+    // 缓存写入持锁窗口极短（毫秒级回源），自旋重试必然抢到。
+    for _ in 0..200 {
+        if let Ok(mut c) = PRESENCE_CACHE.try_lock() {
+            *c = None;
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// 拉 presence 全量在线列表（发现层查询；失败=空——调用方按"无人在线"兜底）。
 async fn presence_list() -> Vec<Value> {
     presence_list_result().await.unwrap_or_default()
