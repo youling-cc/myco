@@ -14,7 +14,7 @@ installMycoCli()
 // 分享任务卡「点卡就进」（2026-10-09）：挂 window.MycoDshShare + 安装原生桥回调表
 // ——`window.__mycoTunnel` **必须早于**原生第一次回调（原生 onConn/onData 直接打它）。
 // 未在 APK 里跑时是安全 no-op。
-import { installTaskShare, wireChatRelayFallback, prefetchTaskEntry, tunnelNetworkChanged } from './dsh-open-runtime'
+import { installTaskShare, wireChatRelayFallback, tunnelNetworkChanged } from './dsh-open-runtime'
 import { bootVnetForwards, resetNetworkStreams } from './vnet-forward'
 installTaskShare()
 // 2026-10-22 手机端 vnet 固定端口转发（外网 RDP/SSH/DSH）：延迟 3s 启动，避免抢启动资源
@@ -26,24 +26,6 @@ setTimeout(() => {
   }
 }, 3000)
 
-// R10 冷启动预取票（2026-10-20）：app 一启动就为「可打开的远端任务卡」预取入口票，
-// 不必等任务列表区块渲染/用户点开。真案：19:39 用户启动 app 4 秒后点卡，因取票还没
-// 预取到 → 首帧 2.8s 且一次 degraded；预取提前后点卡直接用票（实测总 1.39s）。
-import { listTasks as __listTasks, taskShareCardOf as __taskShareCardOf } from './chat-store'
-function __prefetchRemoteCards(): void {
-  try {
-    for (const t of __listTasks()) {
-      const c = __taskShareCardOf(t)
-      if (c) prefetchTaskEntry(c as unknown as Record<string, unknown>)
-    }
-  } catch {
-    /* 预取是纯优化，失败静默 */
-  }
-}
-setTimeout(__prefetchRemoteCards, 4000)
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') __prefetchRemoteCards()
-})
 // 聊天投递的云中继兜底（2026-10-12"直连优先、不通走中转"，与分享链路同构）：
 // 手机异地（跨 v6 段）直推/对账全断时，经 8321 mux 的 WS 隧道投到对端 :9100。
 wireChatRelayFallback()

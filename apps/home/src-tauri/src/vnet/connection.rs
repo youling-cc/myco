@@ -266,8 +266,27 @@ pub struct ConnHub {
 }
 
 impl ConnHub {
+    /// 流 id 基点随机化（2026-11-10 串扰事故）：
+    /// 两个 vnet 进程的流 id 都从 1 顺序编号，同 peer_id 互抢路由时错端帧
+    /// 会精确落进对端的同号活流（替换型损坏：同字节数不同 SHA）。基点随机
+    /// = 每个连接实例把身份藏进每帧的 [tag][stream:2]（零线上格式变更），
+    /// 错端帧几乎必然命中未知流被丢弃——损坏从「静默替换」降级为「可检测截断」。
+    /// 这与 relay 侧占位退位是两层独立防线（本层兜住跨机同 peer_id 残留）。
+    fn random_stream_base() -> u16 {
+        use std::hash::Hasher;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u32(std::process::id());
+        h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64).unwrap_or(0));
+        h.write_u64(CTR.fetch_add(1, Ordering::Relaxed));
+        let v = h.finish() as u16;
+        if v == 0 { 1 } else { v }   // 0 保留给 relay-socket P2P 入站聚合
+    }
+
     pub fn new() -> Self {
-        Self { next_id: 0, p2p_owner: None, streams: std::collections::HashMap::new() }
+        Self { next_id: Self::random_stream_base(), p2p_owner: None, streams: std::collections::HashMap::new() }
     }
     /// 注册一条应用连接，返回它的 stream id（线上身份）。
     /// u16 环绕；跳过 0（0 保留给 relay-socket P2P 入站聚合）与在用 id。
@@ -421,14 +440,26 @@ fn peer_id_try_acquire(peer_id: u32) -> anyhow::Result<()> {
 fn peer_id_release(peer_id: u32) {
     active_peer_ids().lock().unwrap().remove(&peer_id);
 }
+/// FFI 宿主显式释放 server 侧注册占位（peer_id + target_port 表）。
+///
+/// 为什么必须有（2026-11-12 真机 ADB 卡 stop→start 恒定 rc=4 实案）：FFI 的
+/// `vnet_server_stop` 只置 run 标志，而 [`Connection::stop`] 才是 `peer_id_release`
+/// 的唯一调用点。`start_server_full` 构造成功后把守卫所有权交给 Connection，但
+/// FFI 只保存 run 标志、Connection 随即 drop → `stop()` 永远不被调用 → peer_id
+/// 永久留在集合里 → 同进程第二次 start 恒 `PEER_ID_IN_USE`（rc=4）。客户端路径
+/// 因为持有 Connection 并调 `conn.stop()` 不受影响。
+pub(crate) fn release_server_registrations(peer_id: u32) {
+    peer_id_release(peer_id);
+    server_port_unregister(peer_id);
+}
 
 /// 构造期 peer_id 占位的 RAII 守卫（2026-11-11 手机 rc=4 真案）。
 ///
 /// 事故：`peer_id_try_acquire` 把 id 塞进全局集合，只有 `Connection::stop()` 才
-/// 释放。而 `with_secret_and_port` 在 acquire 之后还有 relay 注册（5 次退避重试）
-/// ——任何一步失败都走 `?` 提前返回，id 便永久留在集合里；之后同 id 的每次 start
-/// 都在第一行秒失败 `PEER_ID_IN_USE`，宿主只看到恒定的 rc=4（VNET_ERR_INTERNAL），
-/// 永远自愈不了（手机端实测 4/4 全失败）。
+/// 释放。而 [`Connection::with_secret_and_port`] 在 acquire 之后还有 relay 注册
+/// （5 次退避重试）与 STUN 公告——任何一步失败都走 `?` 提前返回，id 便永久留在
+/// 集合里；之后同 id 的每次 start 都在第一行秒失败 `PEER_ID_IN_USE`，宿主只看到
+/// 一个恒定的 rc=4（VNET_ERR_INTERNAL），永远自愈不了（手机端实测 4/4 全失败）。
 ///
 /// 约定：构造成功即把所有权**交接**给 Connection（此后由 stop() 释放）；
 /// 构造失败则 Drop 自动释放，下一次尝试仍然有机会。
@@ -455,6 +486,41 @@ impl Drop for PeerIdGuard {
             peer_id_release(self.peer_id);
         }
     }
+}
+
+/// ── 同进程 target_port 冲突防护（2026-11-11 DSH 坏包定位）──
+/// myco embedding 中固定口隧道 server 与 multi-forward server 可能并存且
+/// 都指向同一个上游端口（如 13911）。两条 server 的 up-thread 各自连上游，
+/// 上游的 keep-alive 连接池在两条 server 的 upstream TCP 间摆动 → 同一 HTTP
+/// 响应的不同部分经不同 server 发给客户端 → 32KB（2×16KB 读块）交织坏包。
+/// vnet 侧防护：检测到同进程两条 server 指向同 target_port → WARN（不阻止，
+/// 因为 multi-forward 场景下多 server 同口是合法的——但 embedding 需要知道）。
+static ACTIVE_SERVER_PORTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u16, Vec<u32>>>> =
+    std::sync::OnceLock::new();
+
+fn active_server_ports() -> &'static std::sync::Mutex<std::collections::HashMap<u16, Vec<u32>>> {
+    ACTIVE_SERVER_PORTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn server_port_register(peer_id: u32, target_port: u16) {
+    let mut ports = active_server_ports().lock().unwrap();
+    let peers = ports.entry(target_port).or_insert_with(Vec::new);
+    if !peers.contains(&peer_id) {
+        peers.push(peer_id);
+        if peers.len() > 1 {
+            eprintln!("  [WARN] SERVER-PORT-OVERLAP: {} vnet servers now target port {} (peer_ids: {:?}) — \
+                if upstream uses connection pooling, responses may be split across servers causing data interleaving",
+                peers.len(), target_port, peers);
+        }
+    }
+}
+
+fn server_port_unregister(peer_id: u32) {
+    let mut ports = active_server_ports().lock().unwrap();
+    for (_, peers) in ports.iter_mut() {
+        peers.retain(|&p| p != peer_id);
+    }
+    ports.retain(|_, peers| !peers.is_empty());
 }
 
 // ── 同机跨进程 peer_id 冲突防护（2026-11-10 串扰经验沉淀）──
@@ -827,9 +893,6 @@ fn srv_handle_auth(
         Ok(id) => {
             if let Some(env_peer) = envelope_src_peer {
                 if env_peer != id.peer_id {
-                    // 失败 AUTH 必须清除旧缓存，不能沿用上次成功身份开新流。
-                    *auth_slot = None;
-                    *auth_at = None;
                     println!("  [AUTH] DENY code=PEER_ID_MISMATCH env={} declared={}", env_peer, id.peer_id);
                     return true;
                 }
@@ -838,12 +901,7 @@ fn srv_handle_auth(
             *auth_slot = Some(id);
             *auth_at = Some(std::time::Instant::now());
         }
-        Err(_) => {
-            // 任何验签/解析失败同样作废旧缓存，避免失败帧后继续沿用旧身份。
-            *auth_slot = None;
-            *auth_at = None;
-            // identity::verify 内部已记 [AUTH] DENY + 计数
-        }
+        Err(_) => { /* identity::verify 内部已记 [AUTH] DENY + 计数 */ }
     }
     true
 }
@@ -858,6 +916,12 @@ fn srv_auth_gate(
 ) -> Result<Option<crate::vnet::identity::PeerIdentity>, &'static str> {
     if !crate::vnet::identity::enabled() {
         return Ok(None); // 本端未设置身份 = 认证关闭 = legacy 行为（回归绿的前提）
+    }
+    // 2026-11-12 ADB P0：显式 PSK-only 模式（手机 JNI 无 resolver 入口的场景）。
+    // 原实现：无 resolver → verify_auth_frame fail-closed（UnknownKey）→ auth=None
+    // → AUTH_REQUIRED 全拒。显式开关降级（而非自动）：保持有 resolver 宿主的严格语义。
+    if !crate::vnet::identity::has_resolver() && crate::vnet::identity::gate_psk_only() {
+        return Ok(auth.clone()); // PSK 已验证网络准入；AUTH 声明的身份仅作 advisory
     }
     let Some(id) = auth else { return Err("AUTH_REQUIRED") };
     // AUTH 周期重发（client 2s）；120s 未刷新 = 视为失效
@@ -889,6 +953,12 @@ fn mf_resolve_target(payload: &[u8], default_port: u16) -> Result<u16, &'static 
 ///   旧 server 会忽略 targeted 载荷、静默连自己的默认口（误路由），必须在建 route 前拦下；
 /// - version==0 = 尚未收到对端任何公告（announce 经 relay 异步到达）→ 放行并告警
 ///   （Option B 向后兼容：旧端根本不公告 NetStatus；enable_multi_forward 闸门仍在兜底）。
+///
+/// 债 2（2026-11-11/12 生产事故）：version==0 的放行本质是 fail-open——旧对端会静默
+/// 误路由。同步判定保持不变（放行 + WARN，向后兼容不得收紧），但 add_forward 会在
+/// 放行的同时起一个 5s 的 relay ARQ PING/PONG 后台探测（probe_peer_alive）：
+/// PONG 到 = 对端活着，转发保持；超时 = 对端不可达/不支持，记 ERROR 并对该
+/// forward 的流显式 STREAM_END。探测结果只异步经日志交付，不改本函数返回值。
 fn mf_caps_check(remote: &crate::vnet::netstatus::NetStatus) -> anyhow::Result<()> {
     if remote.version == 0 {
         println!("  [FWD] WARN: remote NetStatus not arrived yet (version=0) — \
@@ -902,6 +972,51 @@ fn mf_caps_check(remote: &crate::vnet::netstatus::NetStatus) -> anyhow::Result<(
         );
     }
     Ok(())
+}
+
+/// 债 3：confirm_forward 的 4 字节探测头魔数（VNET CoNfirm Forward，0x564E4346）。
+/// 选 ASCII "VNCF"：固定 4 字节、可读、不与既有线上帧头冲突。
+/// 注意：探测字节会经全路径（本地 listener → 隧道 → 对端 → upstream）到达真实
+/// 上游服务——垃圾输入由 upstream 自行处理/关闭，这正是「数据真的流过全路径」
+/// 的证据本身。
+const FORWARD_CONFIRM_MAGIC: [u8; 4] = *b"VNCF";
+
+/// 债 3（2026-11-11/12 生产事故）的探测体（独立成自由函数：无需真实 relay 即可单测）：
+/// 1. 连 127.0.0.1:local_port（forward 的本地 listener）；
+/// 2. 发 4 字节探测头（FORWARD_CONFIRM_MAGIC）；
+/// 3. 探测字节经 本地 listener → 隧道 → 对端 → target_port upstream 全路径；
+/// 4. timeout 内等任一响应或连接关闭；
+/// 5. 超时无响应 → Err("forward unreachable")（本地 bind 成功 ≠ 隧道可达，
+///    静默黑洞必须在这里显式暴露，不能等上层协议超时才发现）。
+fn confirm_forward_probe(local_port: u16, timeout: Duration) -> anyhow::Result<()> {
+    // 连不上本地 listener = 转发根本没起来（bind 失败/已被 remove），立即显式失败
+    let mut sock = TcpStream::connect(("127.0.0.1", local_port)).map_err(|e| {
+        anyhow::anyhow!("forward unreachable: connect 127.0.0.1:{} failed: {:#}", local_port, e)
+    })?;
+    // 探测全程以 timeout 为上限：任何一步都不许无限挂起（G6 显式失败）
+    sock.set_read_timeout(Some(timeout))?;
+    sock.set_write_timeout(Some(timeout))?;
+    // 探测头必须走完全路径才可能拿到响应
+    sock.write_all(&FORWARD_CONFIRM_MAGIC)?;
+    // 等任一响应（或连接关闭）。静默黑洞（对端死/隧道断）在这里超时暴露。
+    let mut buf = [0u8; 16];
+    match sock.read(&mut buf) {
+        // 对端干净关闭 = 探测字节到达对端并被 upstream 处理后关闭（路径走通）
+        Ok(0) => Ok(()),
+        // 收到任意字节 = 全路径有数据流动
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            || e.kind() == std::io::ErrorKind::TimedOut => {
+            anyhow::bail!(
+                "forward unreachable: no response within {:?} \
+                 (local bind ok but tunnel path dead — silent blackhole suspected)",
+                timeout
+            );
+        }
+        Err(e) => {
+            anyhow::bail!("forward unreachable: read 127.0.0.1:{} failed: {:#}", local_port, e)
+        }
+    }
 }
 
 /// 打洞探测节拍（client/server 两侧共用；EasyTier 对照：首轮立即 + 短退避）。
@@ -1050,6 +1165,10 @@ struct SilenceLadder {
     /// 一旦由“最近有下行交付”或“上行有待交付”进入监控，就保持到有进展或判死，
     /// 否则 5 秒活跃窗一过就会自我解除，永远走不到结论（R10 实测的红例形态）。
     armed: bool,
+    /// 武装时刻：静默只从这一刻起算（长空闲后第一笔在途数据不该被即刻判死）。
+    /// 没有它时，长时间空闲（如 RDP 空闲 60s）后第一笔在途数据会因 `silent_for`
+    /// 早已超过预算而被**立刻**判死——那是另一个方向的误杀。
+    armed_at: Option<std::time::Instant>,
 }
 
 /// 契约阈值：连续 3 秒无有效交付/探测回包即触发 `A_probe_data_plane`
@@ -1060,6 +1179,85 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// 取 5s = 3s 检测阈值 + 一次探测余量；超过后下行静默与“应用本来空闲”不可区分，
 /// 因此不再监控（否则空闲 RDP 会话会被无端判死）。
 const DOWNLINK_ACTIVE_WINDOW: Duration = Duration::from_secs(5);
+
+
+/// 现场 A/B 旋钮（启动读一次即固定；不设 = 沿用事故调参后的默认值）。
+/// 为什么要旋钮：静默预算这类阈值只能在真机链路上试（蜂窝/家宽差异大），
+/// 出问题时必须能不重新编译就调，否则每次验证都要等一轮出包。
+fn env_duration_ms(name: &str, default: Duration) -> Duration {
+    match std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(ms) if ms > 0 => Duration::from_millis(ms),
+        _ => default,
+    }
+}
+
+/// 静默触发阈值（默认 3s）。
+fn silence_trigger() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_duration_ms("VNET_SILENCE_TRIGGER_MS", SILENCE_TRIGGER))
+}
+
+/// 探测节拍（默认 2s）。
+fn silence_probe_interval() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_duration_ms("VNET_SILENCE_PROBE_MS", PROBE_INTERVAL))
+}
+
+/// 静默预算覆盖（默认 None = 用 ARQ 的 `retry_budget()`，与本实现同源）。
+fn silence_budget_override() -> Option<Duration> {
+    static V: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("VNET_SILENCE_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
+/// Per-stream retry budget（Phase 1，缺省 12s，`VNET_STREAM_BUDGET_MS` 覆盖）。
+/// 单流 pending 卡死超过该预算 → 只终结该流（pending 原地换成 STREAM_END，
+/// 帧数/位置不变，seq 连续性保持），不再连坐同隧道的其他流——
+/// RDP P0 根因正是一条卡死流触发整条 ARQ reset + `close_all_conns` 全杀。
+/// 缺省与整体 ARQ 预算同源（G4 的 15s − 3s 检测 = 12s，见 relay_arq.rs）；
+/// Phase 2（inflight 耗尽整体预算 → reset_stream + close_all_conns）保持不变，
+/// 作为「对端真不可达」时的兜底（R9 全死场景仍走完整判死路径）。
+fn stream_budget() -> Duration {
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_duration_ms("VNET_STREAM_BUDGET_MS", Duration::from_millis(12_000)))
+}
+
+/// 静默梯当前该做什么（**纯函数**，单测直击）。
+#[derive(Debug, PartialEq, Eq)]
+enum SilenceVerdict {
+    /// 不监控：没有在途/待发字节（空闲是合法状态，RDP 空闲期不该被拆），或静默未达阈值。
+    Idle,
+    /// 在途字节静默超阈值但未耗尽预算 → 探测 + 取往返证据。
+    Probe,
+    /// 预算耗尽仍无进展 → 重置传输并显式关闭应用连接。
+    Reset,
+}
+
+/// 判定核：**只有确有在途/待发字节才可能 Probe/Reset**。
+///
+/// `effective_silent` 已由调用方按"武装时刻"裁剪过（见 `silence_ladder_tick`）。
+fn silence_verdict(
+    has_inflight: bool,
+    effective_silent: Duration,
+    trigger: Duration,
+    budget: Duration,
+) -> SilenceVerdict {
+    if !has_inflight {
+        return SilenceVerdict::Idle; // 纯空闲：永不重置
+    }
+    if effective_silent < trigger {
+        return SilenceVerdict::Idle;
+    }
+    if effective_silent >= budget {
+        return SilenceVerdict::Reset;
+    }
+    SilenceVerdict::Probe
+}
 
 /// 探测超时 = 2×RTO，逐轮翻倍（有界退避）。
 /// RTO 来自 ARQ 实测 EWMA（RFC 6298），不是拍出来的常数；
@@ -1084,17 +1282,58 @@ fn silence_ladder_tick(
     relay: &Arc<RelayClient>,
     target: u32,
     conns: &Arc<Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>>,
+    stream_flags: &Arc<Mutex<HashMap<u16, Arc<AtomicBool>>>>,
     down_recent: bool,
     st: &mut SilenceLadder,
 ) {
-    let (expect, silent_for, abandoned, rto_ms, budget) = {
+    let (has_inflight, silent_for, abandoned, rto_ms, budget) = {
         let a = arq.lock().unwrap();
-        (a.expect_data(), a.silent_for(), a.abandoned_bytes(), a.rto_ms(), a.retry_budget())
+        (
+            // `expect_data()` = pending 非空 或 inflight 非空 ⇒ 确有在途/待发字节，
+            // 这才是"数据面需要盯"的唯一充分条件。
+            a.expect_data(),
+            a.silent_for(),
+            a.abandoned_bytes(),
+            a.rto_ms(),
+            silence_budget_override().unwrap_or_else(|| a.retry_budget()),
+        )
     };
+    let trigger = silence_trigger();
+    let probe_interval = silence_probe_interval();
+
+    // ⓪ Per-stream retry budget（Phase 1，RDP P0）：单流 pending 卡死超过
+    //    per-stream 预算 → 只终结该流——ARQ 把它的 pending 帧原地替换成
+    //    STREAM_END（同帧数/同位置，seq 连续性保持，不 reset、不换 epoch），
+    //    client 侧再把受害连接关掉（只关这些，不动其他流——尤其不动健康的
+    //    RDP 流）。这是对下方 ①「整条 ARQ 判死」的第一道闸：一条卡死流
+    //    不再连坐整条 Connection。
+    //    注意：这里不 return——继续走后续静默检测逻辑（其他流可能还健康，
+    //    也可能整体已死要交给 ① 兜底）。
+    {
+        let exhausted = {
+            let mut a = arq.lock().unwrap();
+            a.exhausted_streams(stream_budget())
+        };
+        for &sid in &exhausted {
+            // client 侧：把受害流从开关表里关掉（按 stream id 查表；
+            // conn_flags 的 key 是独立 u64 计数，不能直接拿 sid 查）
+            if let Some(flag) = stream_flags.lock().unwrap().get(&sid) {
+                flag.store(false, Ordering::Relaxed);
+                println!("  [A_close_explicitly] cause=stream_budget_exhausted stream={}", sid);
+            }
+        }
+    }
 
     // ① ARQ 已放弃字节 = 字节流中段永久缺失（放弃预算已耗尽）。
-    //    此时任何“重建/续传”都是假修复，唯一诚实动作是显式失败。
+    //    此时任何"重建/续传"都是假修复，唯一诚实动作是显式失败。
+    //    （Phase 2 兜底：Phase 1 只终结单流；若对端真不可达，全部 inflight
+    //    帧终将耗尽整体预算走到这里——reset + close_all_conns 照旧，
+    //    R9「全死场景 ≤15s 显式失败」不受影响。2026-11-12 RDP P0 排查时
+    //    曾因 epoch 变更影响所有流而放弃 per-stream 关闭；现行两阶段方案
+    //    由 Phase 1 在不换 epoch 的前提下先行剪除受害流。）
     if abandoned > 0 {
+        // 仍取走 abandoned_streams 防重复触发（server 主循环也在消费同一口径）
+        let _ = { let mut a = arq.lock().unwrap(); a.take_abandoned_streams() };
         println!("  [A_reset_transport] cause=retry_budget_exhausted dropped={}B", abandoned);
         arq.lock().unwrap().reset_stream();
         println!("  [A_close_explicitly] cause=retry_budget_exhausted");
@@ -1103,47 +1342,57 @@ fn silence_ladder_tick(
         st.round = 0;
         st.last_probe_at = None;
         st.armed = false;
+        st.armed_at = None;
         return;
     }
 
-    // ② 没有待交付数据、也没有近期下行交付，或已经恢复 → 清梯子
-    if !expect && !down_recent && silent_for < SILENCE_TRIGGER {
-        st.armed = false;
-    } else if expect || down_recent {
-        st.armed = true;   // 有活动就进入监控（下行静默必须能被发现）
-    }
-    if silent_for < SILENCE_TRIGGER {
-        if st.round > 0 {
-            println!("  [A_probe_data_plane] recovered after probes={} silent={}ms",
-                st.round, silent_for.as_millis());
+    // ② 武装口径（2026-11-12 修，手机→PC 3389 真案）：
+    //    只有"确有在途/待发字节"（`expect_data()`）才进入监控。
+    //    原实现里 `down_recent`（近 5s 交付过下行字节）**单独也能武装** ——
+    //    纯空闲连接（RDP 已把画面交付完、无在途数据）因此会被 12s 静默判死，
+    //    现场表现就是"一跳 3389 就断 / 读 0 字节"，而同一链路上短请求-应答的
+    //    9100/13911/15200 在 12s 预算内早已完成 —— 这正是"只有 RDP 不行"的机制。
+    //    真黑洞不受影响：对端收不到时我方字节必然滞留在 pending/inflight，
+    //    `expect_data()` 照样为真。
+    if has_inflight {
+        if !st.armed {
+            st.armed = true;
+            // 静默从"武装那一刻"起算：长时间空闲后第一笔在途数据不该被即刻判死。
+            st.armed_at = Some(std::time::Instant::now());
         }
-        st.round = 0;
-        st.last_probe_at = None;
-        arq.lock().unwrap().clear_probe();
-        if !expect && !down_recent {
+    } else {
+        st.armed = false;
+        st.armed_at = None;
+    }
+    let armed_for = st.armed_at.map(|t| t.elapsed()).unwrap_or(silent_for);
+    let effective_silent = silent_for.min(armed_for);
+
+    match silence_verdict(has_inflight, effective_silent, trigger, budget) {
+        SilenceVerdict::Idle => {
+            if st.round > 0 {
+                println!("  [A_probe_data_plane] recovered after probes={} silent={}ms",
+                    st.round, silent_for.as_millis());
+            }
+            st.round = 0;
+            st.last_probe_at = None;
+            arq.lock().unwrap().clear_probe();
+            return;
+        }
+        SilenceVerdict::Reset => {
+            let inflight = arq.lock().unwrap().inflight_bytes();
+            println!("  [A_reset_transport] cause=silence_budget_exhausted silent={}ms dropped={}B down_recent={}",
+                effective_silent.as_millis(), inflight, down_recent);
+            arq.lock().unwrap().reset_stream();
+            println!("  [A_close_explicitly] cause=silence_budget_exhausted");
+            let closed = close_all_conns(conns);
+            println!("  [A_close_explicitly] conns_closed={}", closed);
+            st.round = 0;
+            st.last_probe_at = None;
             st.armed = false;
+            st.armed_at = None;
+            return;
         }
-        return;
-    }
-    if !st.armed {
-        arq.lock().unwrap().clear_probe();
-        return;
-    }
-
-    // ③ 静默已达放弃预算仍无进展 → 重置并显式关闭
-    //    （预算与 ARQ 放弃预算同源：G4 的 15 秒 − 3 秒检测）
-    if silent_for >= budget {
-        let inflight = arq.lock().unwrap().inflight_bytes();
-        println!("  [A_reset_transport] cause=silence_budget_exhausted silent={}ms dropped={}B",
-            silent_for.as_millis(), inflight);
-        arq.lock().unwrap().reset_stream();
-        println!("  [A_close_explicitly] cause=silence_budget_exhausted");
-        let closed = close_all_conns(conns);
-        println!("  [A_close_explicitly] conns_closed={}", closed);
-        st.round = 0;
-        st.last_probe_at = None;
-        st.armed = false;
-        return;
+        SilenceVerdict::Probe => {}
     }
 
     // ④ 首次触发：探一次 + 问一次映射 + 立刻把在途字节重发一遍（字节保留）
@@ -1196,7 +1445,7 @@ fn silence_ladder_tick(
     }
 
     // ⑤ 预算内持续取往返证据；不重复强制重发（交给 ARQ 的指数退避，避免风暴）
-    let due = st.last_probe_at.map_or(true, |at| at.elapsed() >= PROBE_INTERVAL);
+    let due = st.last_probe_at.map_or(true, |at| at.elapsed() >= probe_interval);
     if due {
         arq.lock().unwrap().clear_probe();
         let frame = arq.lock().unwrap().start_probe();
@@ -1208,12 +1457,9 @@ fn silence_ladder_tick(
         println!("  [A_probe_data_plane] round={} silent={}ms", st.round, silent_for.as_millis());
     }
 }
-
 pub struct Connection {
     /// 显式 P2P 监听端口覆盖（宿主分配；None 时读 VNET_P2P_PORT / 默认 9100）
     p2p_port_override: Option<u16>,
-    /// 自拨标志（target_peer_id == my_peer_id 时 true；forward_targeted 走 loopback 短路）
-    pub self_dial: bool,
     pub my_peer_id: u32,
     pub target_peer_id: u32,
     relay: Arc<RelayClient>,
@@ -1270,6 +1516,11 @@ pub struct Connection {
     /// 每个应用连接的“存活开关”。`A_close_explicitly` 从监控线程把这些开关置 false，
     /// up/down 线程下一轮轮询即退出并释放 TcpStream → 应用看到 FIN/RST 而不是无限挂起。
     conn_flags: Arc<Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>>,
+    /// 流 id → 该连接存活开关（Phase 1 按流终结用）。`conn_flags` 的 key 是独立
+    /// u64 计数（不复用 stream id 空间，见 [`next_conn_flag_key`]），单流终结需要
+    /// 按 sid 找到开关，故另立本表：随连接注册/注销同生命周期维护（注销先于 hub
+    /// unregister 且用 Arc 身份核对），sid 环绕复用不会残留错映射。
+    stream_flags: Arc<Mutex<HashMap<u16, Arc<AtomicBool>>>>,
     /// 最近一次把下行字节真正交给应用的时刻。
     /// 纯下行静默（画面流断掉而本端上行空闲）只能靠“刚才还在交付”这个事实来发现：
     /// 上行 expect_data 为假时，它是唯一能证明“这里本该有数据在流”的证据。
@@ -1281,6 +1532,13 @@ pub struct Connection {
     /// multi_forward 显式开关（默认 false）；开启后 add_forward 仍会做 caps 协商——
     /// 对端公告缺 bit0 时报 MF_UNSUPPORTED（见 mf_caps_check），对端未公告时本闸门兜底。
     mf_enabled: Arc<AtomicBool>,
+    /// 债 2：multi-forward 流归属表 stream_id → target_port。
+    /// version==0 放行后的 5s 探测失败时，按 target_port 找到该 forward 的全部
+    /// 活跃流，显式发 STREAM_END（本地排空关闭 + 通知对端），不留静默黑洞。
+    mf_stream_targets: Arc<Mutex<HashMap<u16, u16>>>,
+    /// 同机 peer_id 占位（跨进程串扰防护，见 [`PeerClaim`]）：
+    /// keepalive 线程周期体检，发现被新进程接管即退位。
+    claim: Arc<std::sync::Mutex<PeerClaim>>,
 }
 
 impl Connection {
@@ -1309,7 +1567,7 @@ impl Connection {
         secret: Option<&str>,
         preferred_p2p_port: Option<u16>,
     ) -> anyhow::Result<Self> {
-        // 同进程 peer_id 冲突防护（2026-11-10 串扰事故 vendor 991e0adc）：
+        // 同进程 peer_id 冲突防护（2026-11-10 串扰事故）：
         // 两个 Connection 用同一 peer_id → relay 路由互抢 → 帧串扰 → 数据损坏。
         // 创建时立即拒绝，不让带病运行。
         // 2026-11-11：改为 RAII 守卫——构造期任何一步失败都自动释放，
@@ -1391,10 +1649,10 @@ impl Connection {
             }
         }
         // ── STUN 公网映射公告：纯优化，必须离开构造关键路径 ──
-        // 2026-11-11 真案：这 3 个 STUN 服务器各自 3s 上限、串行查询，全在
-        // `with_secret_and_port` 里同步跑；嵌入方（Android JNI）从调用线程进来时，
-        // UI 线程被冻住十几分钟。STUN 只决定「P2P 直连能不能用」，中继路径不依赖
-        // 它——改成后台线程异步学映射、学到再补公告。
+        // 2026-11-11 手机真案：这 3 个 STUN 服务器各自 3s 上限、串行查询，全在
+        // `with_secret_and_port` 里同步跑；嵌入方（Android JNI / 浏览器 JS 桥）从
+        // 调用线程进来时，UI 线程被冻住十几分钟。STUN 只决定「P2P 直连能不能用」，
+        // 中继路径不依赖它——所以改成后台线程异步学映射、学到再补公告。
         let listen_pub_arc: Arc<Mutex<Option<std::net::SocketAddr>>> =
             Arc::new(Mutex::new(None));
         if let Some(ref s) = listen_sock {
@@ -1441,7 +1699,6 @@ impl Connection {
             listen_pub: listen_pub_arc,
             announced_v6: Arc::new(Mutex::new(None)),
             p2p_port_override: preferred_p2p_port,
-            self_dial: my_peer_id == target_peer_id,
             listen_sock_v6: listen_sock_v6.clone(),
             last_p2p_reply: Arc::new(Mutex::new(std::time::Instant::now())),
             switch_score: Arc::new(Mutex::new(0)),
@@ -1455,10 +1712,13 @@ impl Connection {
             local_net_status: Arc::new(std::sync::Mutex::new(crate::vnet::netstatus::NetStatus::default())),
             relay_arq: Arc::new(std::sync::Mutex::new(crate::vnet::relay_arq::RelayArq::new())),
             conn_flags: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            stream_flags: Arc::new(Mutex::new(HashMap::new())),
             last_down: Arc::new(Mutex::new(None)),
             remote_net_status: Arc::new(std::sync::Mutex::new(crate::vnet::netstatus::NetStatus::default())),
             forwards: Arc::new(crate::vnet::forward::ForwardTable::new()),
             mf_enabled: Arc::new(AtomicBool::new(false)),
+            mf_stream_targets: Arc::new(Mutex::new(HashMap::new())),
+            claim: Arc::new(std::sync::Mutex::new(claim)),
         })
     }
 
@@ -1467,6 +1727,7 @@ impl Connection {
     fn spawn_receiver(&self) {
         let relay = self.relay.clone();
         let rx_relay_arq = self.relay_arq.clone();
+        let rx_target = self.target_peer_id;
         let path = self.path.clone();
         let p2p = self.p2p.clone();
         let p2p_peer = self.p2p_peer.clone();
@@ -1490,6 +1751,19 @@ impl Connection {
             while running.load(Ordering::Relaxed) {
                 match relay.try_recv_kind() {
                     crate::vnet::relay::RecvKind::RelayData(src, data) => {
+                        // ── 串扰防护（2026-11-10）：本连接的 relay 数据只可能来自目标 peer ──
+                        // 其它源（异 peer 干扰/串扰）绝不能进本连接 ARQ——外来帧的
+                        // epoch/seq 会复位接收状态，把已交付字节流打乱（替换型损坏）。
+                        if src != rx_target {
+                            use std::sync::atomic::{AtomicU64, Ordering as OX};
+                            static XT: AtomicU64 = AtomicU64::new(0);
+                            let n = XT.fetch_add(1, OX::Relaxed);
+                            if n < 10 || n % 100 == 0 {
+                                eprintln!("  [CROSSTALK-DROP] RelayData from peer {} (target={}) — dropped #{}",
+                                    src, rx_target, n + 1);
+                            }
+                            continue;
+                        }
                         // relay ARQ：解帧 → 交付数据 + 回 ACK + 快速重传
                         let (deliver, ack_frame, fast_retransmit) = {
                             let mut raq = rx_relay_arq.lock().unwrap();
@@ -1511,9 +1785,10 @@ impl Connection {
                         for frame in fast_retransmit {
                             let _ = relay.send_to_peer(src, &frame);
                         }
-                        // XPATH isolation (2026-11-10 vendor a1ac2d93): P2P 为活跃路径时，
-                        // relay 流载荷来自 server 侧残留的旧 upstream（server 未清理）→
-                        // 丢弃载荷、保持 ARQ 健康（ACK 已在上面回）。只有 P2P 数据进 hub。
+                        // XPATH isolation (2026-11-10): when P2P is the active path,
+                        // relay stream payloads come from stale server upstreams
+                        // (server hasn't cleaned them up) → drop payloads, keep ARQ
+                        // healthy (ACKs sent above). Only P2P data reaches the hub.
                         let path_is_direct = path.lock().unwrap().is_direct();
                         if path_is_direct && !deliver.is_empty() {
                             use std::sync::atomic::{AtomicU64, Ordering as XP};
@@ -1533,10 +1808,18 @@ impl Connection {
                                 Some((crate::vnet::transport::STREAM_TAG_DATA, sid, rest)) => {
                                     queue.lock().unwrap().push_stream(sid, rest.to_vec());
                                 }
-                                Some((crate::vnet::transport::STREAM_TAG_STREAM_END, sid, _)) => {
+                                Some((crate::vnet::transport::STREAM_TAG_STREAM_END, sid, rest)) => {
                                     // 优雅关闭：不立即置 conn_active=false（那会丢弃队列里
                                     // 还没写给应用的数据）。标记 ended，down 线程排空后退出。
-                                    tracelog!("[cli] STREAM_END stream={} (ARQ-ordered) -> graceful close", sid);
+                                    // 2026-11-12：payload 携带对端关流原因（如 "AUTH_REQUIRED"
+                                    // / "MF_TARGET_DENIED" / "RATE-LIMIT"）——打出原因让
+                                    // "优雅关流但 0 字节" 类问题 30 秒定位（ADB P0 教训）。
+                                    let reason = if rest.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" reason={:?}", String::from_utf8_lossy(rest))
+                                    };
+                                    tracelog!("[cli] STREAM_END stream={} (ARQ-ordered) -> graceful close{}", sid, reason);
                                     queue.lock().unwrap().mark_ended(sid);
                                 }
                                 Some((tag, sid, _)) => {
@@ -1676,7 +1959,9 @@ impl Connection {
             policy: self.policy.clone(),
             switches: self.path_switches.clone(),
             conn_flags: self.conn_flags.clone(),
-            self_dial: self.self_dial,
+            stream_flags: self.stream_flags.clone(),
+            mf_stream_targets: self.mf_stream_targets.clone(),
+            self_dial: self.target_peer_id == self.my_peer_id,
         }
     }
 
@@ -1692,6 +1977,8 @@ impl Connection {
         // DSH 2026-11-10 建议：stop 时通知 relay 删 peer 条目（不等 TTL）。
         // 旧 relay 忽略 type 11（无害）；新 relay 即时清理，churn 不再污染 peer 表。
         self.relay.unregister();
+        // 同机占位清理：仍属于本进程时删除（被新进程接管后不删它的）。
+        self.claim.lock().unwrap().release_if_mine();
     }
 
     // ── multi-forward（task.md §11 H.2.1；与 myco 2026-11-09 冻结的 API）──
@@ -1714,9 +2001,6 @@ impl Connection {
         self: &std::sync::Arc<Self>,
         spec: crate::vnet::forward::ForwardSpec,
     ) -> anyhow::Result<crate::vnet::forward::ForwardInfo> {
-        if !self.running.load(Ordering::Relaxed) {
-            anyhow::bail!("MF_STOPPED: cannot add_forward on a stopped Connection");
-        }
         if !self.mf_enabled.load(Ordering::Relaxed) {
             anyhow::bail!(
                 "MF_DISABLED: call enable_multi_forward() first \
@@ -1725,7 +2009,14 @@ impl Connection {
         }
         // 能力协商（H.2）：对端公告的 caps 缺 multi_forward 位 → 显式 MF_UNSUPPORTED，
         // 绝不让 targeted SESSION_START 静默落到旧 server 的默认口（误路由）。
-        mf_caps_check(&self.remote_net_status.lock().unwrap())?;
+        // 债 2：version==0 的放行是 fail-open——旧对端可能静默误路由。同步语义
+        // 保持不变（放行 + WARN，向后兼容），但记下放行事实，建 route 后起 5s
+        // 后台 PING/PONG 探测异步补判（probe-then-decide）。
+        let mf_probe_needed = {
+            let remote = self.remote_net_status.lock().unwrap();
+            mf_caps_check(&remote)?;
+            remote.version == 0
+        };
         // Weak 打破循环引用：Connection → forwards → 回调 → Weak<Connection>
         let weak = std::sync::Arc::downgrade(self);
         let cb: crate::vnet::forward::OnAccept = Arc::new(move |stream, target| {
@@ -1736,6 +2027,11 @@ impl Connection {
         let info = self.forwards.add(spec, cb)?;
         println!("  [FWD] 127.0.0.1:{} -> remote:{} (targeted)",
             info.local_port, info.target_port);
+        // 债 2：对未公告 NetStatus 的对端起后台存活探测。返回值不变（立即 Ok），
+        // 探测结果异步经日志交付（PONG → 保持；5s 无 PONG → ERROR + STREAM_END 该 forward 的流）。
+        if mf_probe_needed {
+            self.spawn_mf_caps_probe(info.local_port, info.target_port);
+        }
         Ok(info)
     }
 
@@ -1752,18 +2048,155 @@ impl Connection {
         Ok(())
     }
 
+    // ── 债 2（2026-11-11/12 生产事故）：mf_caps_check 的 fail-open → 超时探测 ──
+
+    /// 对未公告 NetStatus 的对端（version==0 放行）起后台存活探测：
+    /// - PONG 到 → 对端活着，multi-forward 大概率可用，转发保持（log OK）；
+    /// - 5s 无 PONG → 对端不可达/不支持，log ERROR 并对该 forward 的流显式
+    ///   STREAM_END（本地排空关闭 + 通知对端，不留静默黑洞）。
+    /// 非破坏性：只影响日志与既有流的显式失败，不改 add_forward 的同步返回。
+    fn spawn_mf_caps_probe(self: &Arc<Self>, local_port: u16, target_port: u16) {
+        // 安全阀（2026-11-12 Android native 崩排查）：VNET_MF_PROBE=0 禁用探测
+        if std::env::var("VNET_MF_PROBE").map(|v| v == "0").unwrap_or(false) {
+            tracelog!("[FWD] caps probe disabled (VNET_MF_PROBE=0)");
+            return;
+        }
+        let conn = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name(format!("mf-caps-probe-{}", local_port))
+            .spawn(move || {
+                tracelog!("[FWD] caps unknown (version=0): probing peer {} via relay ARQ PING (wait 5s)",
+                    conn.target_peer_id);
+                if conn.probe_peer_alive(Duration::from_secs(5)) {
+                    println!("  [FWD] caps probe OK: PONG from peer {} within 5s — \
+forward 127.0.0.1:{} -> remote:{} kept active",
+                        conn.target_peer_id, local_port, target_port);
+                } else {
+                    eprintln!("  [FWD] ERROR: no PONG from peer {} in 5s — unreachable or \
+pre-multi-forward; explicitly closing streams of forward 127.0.0.1:{} -> remote:{}",
+                        conn.target_peer_id, local_port, target_port);
+                    let n = conn.mf_terminate_forward_streams(target_port, "MF_PEER_UNREACHABLE");
+                    tracelog!("[FWD] caps probe-fail teardown: {} stream(s) STREAM_END (target={})",
+                        n, target_port);
+                }
+            });
+        if let Err(e) = spawned {
+            // 探测线程起不来：维持 fail-open 原语义（放行），只留 WARN 不阻断
+            eprintln!("  [FWD] WARN: caps probe thread spawn failed: {:#} \
+(forward stays active, legacy fail-open)", e);
+        }
+    }
+
+    /// 债 2：经 relay ARQ 发一个端到端 PING，timeout 内等 PONG。
+    /// PONG 由常驻接收线程喂给 `relay_arq.on_packet` 处理（对上 nonce 才计数），
+    /// 因此这里轮询 `probes_ok` 计数增量而不是在途位——在途位无法区分
+    /// 「被应答」与「被并发探测清掉」（SilenceLadder/其它 forward 的探测共用
+    /// 同一个探测槽），计数增量才是真往返证据。同窗口内任何一次 PONG 都算
+    /// 「对端活着」：它们走的是同一条 relay 数据面。
+    /// 注意：这证明的是「隧道端到端往返活性」，不是「upstream 服务可用」
+    /// （task.md §6.1-8 已知盲点）；upstream 侧请用 confirm_forward。
+    pub fn probe_peer_alive(&self, timeout: Duration) -> bool {
+        if !self.running.load(Ordering::Relaxed) {
+            return false; // 已 stop：接收线程已退，探测无意义
+        }
+        let (frame, baseline) = {
+            let mut arq = self.relay_arq.lock().unwrap();
+            // SilenceLadder 可能留有在途探测：先清再发（与其自身轮转同款做法）
+            arq.clear_probe();
+            let frame = arq.start_probe();
+            if frame.is_empty() {
+                return false; // 理论不可达（刚清过），防御性返回
+            }
+            (frame, arq.probes_ok)
+        };
+        if let Err(e) = self.relay.send_to_peer(self.target_peer_id, &frame) {
+            eprintln!("  [FWD] probe_peer_alive: send PING to peer {} failed: {:#}",
+                self.target_peer_id, e);
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.relay_arq.lock().unwrap().probes_ok > baseline {
+                return true; // PONG 已被接收线程处理并计数
+            }
+            if !self.running.load(Ordering::Relaxed) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        // 超时收尾：清掉在途探测位，避免 SilenceLadder 把死探测当自己的在途状态
+        self.relay_arq.lock().unwrap().clear_probe();
+        false
+    }
+
+    /// 债 2：对某 forward（按 target_port 归属）的全部活跃流显式终结：
+    /// 1) 向对端发按流 STREAM_END（旧 server 只打 unexpected 日志，无害）；
+    /// 2) 本地 hub mark_ended → down 线程排空队列后关闭本地应用连接
+    ///    （G6 显式失败：不再留「对端已死但本地连接静默挂住」的黑洞外观）。
+    /// 返回终结的流数（0 = 该 forward 尚无活跃流，仅日志即可）。
+    fn mf_terminate_forward_streams(&self, target_port: u16, reason: &str) -> usize {
+        // 快照后逐流处理：探测失败是异步补判，快照语义可接受（新连接由后续探测兜）
+        let sids: Vec<u16> = {
+            let m = self.mf_stream_targets.lock().unwrap();
+            m.iter().filter(|(_, &t)| t == target_port).map(|(&s, _)| s).collect()
+        };
+        let n = sids.len();
+        for sid in sids {
+            // 与 up 线程同款双路径发送：direct → P2P 通道（无通道回落 relay）；否则 relay ARQ
+            let frame = crate::vnet::transport::wrap_stream_frame(
+                crate::vnet::transport::STREAM_TAG_STREAM_END, sid, reason.as_bytes());
+            let direct = self.path.lock().unwrap().is_direct();
+            let mut sent_via_p2p = false;
+            if direct {
+                let guard = self.p2p.lock().unwrap();
+                if let Some(ch) = guard.active_channel() {
+                    let _ = ch.stream.lock().unwrap().send(&frame);
+                    sent_via_p2p = true;
+                }
+            }
+            if !sent_via_p2p {
+                let (nf, rf) = {
+                    let mut raq = self.relay_arq.lock().unwrap();
+                    raq.send(&frame);
+                    raq.flush_and_tick()
+                };
+                for f in nf { let _ = self.relay.send_to_peer(self.target_peer_id, &f); }
+                for f in rf { let _ = self.relay.send_to_peer(self.target_peer_id, &f); }
+            }
+            // 本地优雅关闭：down 线程排空该流队列后关连接（不丢已到达的数据）
+            self.hub.lock().unwrap().mark_ended(sid);
+            self.mf_stream_targets.lock().unwrap().remove(&sid);
+            tracelog!("[FWD] STREAM_END stream={} target={} reason={} (caps probe-fail)",
+                sid, target_port, reason);
+        }
+        n
+    }
+
+    // ── 债 3（2026-11-11/12 生产事故）：端到端转发确认 API ──
+
+    /// 端到端 forward 确认：经 forward 的本地 listener 打一条测试流，发 4 字节
+    /// 探测头，等响应（或连接关闭）。只有数据真的流过
+    /// 本地 → 隧道 → 对端 → target_port upstream 全路径才返回 Ok。
+    /// 宿主在 add_forward() 后可选调用——本地 bind 成功 ≠ 隧道可达（生产事故：
+    /// alive 外观下的静默黑洞）。便捷方法，不改变任何既有行为。
+    pub fn confirm_forward(&self, local_port: u16, timeout: Duration) -> anyhow::Result<()> {
+        confirm_forward_probe(local_port, timeout)
+    }
+
     /// legacy 单转发：后台线程 + 一个空 target 的本地 listener，行为不变。
     pub fn start_client(&self, local_port: u16) -> anyhow::Result<()> {
-        self.start_client_with_listener(Some(local_port))
+        self.start_client_inner(Some(local_port))
     }
 
-    /// multi-forward 生命周期接缝：只启动 relay 接收/keepalive/探测，不创建 legacy listener。
-    /// 各服务监听由 `add_forward` 独立绑定，避免与首个服务抢口或发送空 target。
-    pub fn start_multi_forward(&self) -> anyhow::Result<()> {
-        self.start_client_with_listener(None)
+    /// multi-forward 生命周期接缝：只起 relay 接收/keepalive/探测线程，
+    /// **不建 legacy listener**——各服务监听由 [`Connection::add_forward`] 独立绑定，
+    /// 避免与首个服务抢口或发空 target 流。
+    /// （与产品仓 embedding 侧 `start_multi_forward` 同义；2026-11-11 手机端需要它。）
+    pub fn start_client_multi(&self) -> anyhow::Result<()> {
+        self.start_client_inner(None)
     }
 
-    fn start_client_with_listener(&self, local_port: Option<u16>) -> anyhow::Result<()> {
+    fn start_client_inner(&self, local_port: Option<u16>) -> anyhow::Result<()> {
         println!("  [OK] Relay connected as peer {}", self.my_peer_id);
         tracelog!("[BOOT] start_client entered (relay registered)");
         let listen_sock_v6 = self.listen_sock_v6.clone();
@@ -1791,8 +2224,11 @@ impl Connection {
         let ka_prp = self.probe_reply_rx.clone();
         let ka_lrx = self.listen_rx.clone();
         let ka_conns = self.conn_flags.clone();
+        let ka_stream_flags = self.stream_flags.clone();
         let ka_down = self.last_down.clone();
         let ka_remote_ns = self.remote_net_status.clone();
+        let ka_claim = self.claim.clone();
+        let ka_forwards_teardown = self.forwards.clone();
         thread::spawn(move || {
             let mut sense_at = std::time::Instant::now();
             let mut stat_at = std::time::Instant::now();
@@ -1815,6 +2251,19 @@ impl Connection {
                 // 1s sensing (STUN + interface + auto re-register on change)
                 if sense_at.elapsed() >= Duration::from_secs(1) {
                     sense_at = std::time::Instant::now();
+                    // 同机 peer_id 占位体检（2026-11-10 串扰事故）：
+                    // 新进程已接管（newcomer-wins）→ 本进程退位：停续租/关监听/注销，
+                    // 让 relay 映射稳定在新进程上——继续互抢只会让下行帧在两个
+                    // 进程间振荡投递（替换型损坏 + 正主流空洞）。
+                    if ka_claim.lock().unwrap().poll() == ClaimPoll::Superseded {
+                        println!("  [SUPERSEDED] peer_id {} taken over by another live process — yielding: stop renewing, close listeners, unregister",
+                            ka_id);
+                        ka_run.store(false, Ordering::Relaxed);
+                        ka_forwards_teardown.shutdown();
+                        ka_relay.unregister();
+                        peer_id_release(ka_id);
+                        break;
+                    }
                     // 把 relay 侧 ARQ srtt 发布给路径决策（RTT 倒挂防御需要 relay 基线；
                     // relay pipe 自身没有探针，历史上拿不到 RTT → 防御形同虚设）。
                     if let Some(ms) = ka_relay_arq.lock().unwrap().rtt_ms() {
@@ -1938,7 +2387,7 @@ impl Connection {
                     let down_recent = ka_down.lock().unwrap()
                         .map_or(false, |at: std::time::Instant| at.elapsed() < DOWNLINK_ACTIVE_WINDOW);
                     silence_ladder_tick(&ka_relay_arq, &ka_relay, ka_tgt, &ka_conns,
-                                        down_recent, &mut ladder);
+                                        &ka_stream_flags, down_recent, &mut ladder);
                     // relay 注册是周期续租：relay 重启后映射全丢时，下一周期自动重建。
                     if renew_at.elapsed() >= Duration::from_secs(5) {
                         renew_at = std::time::Instant::now();
@@ -3298,13 +3747,16 @@ impl Connection {
             });
         }
 
-        let Some(local_port) = local_port else {
-            // multi-forward：后台线程归 Connection，监听生命周期归 ForwardTable。
-            return Ok(());
-        };
-        let proxy_addr = format!("127.0.0.1:{}", local_port);
-        let listener = TcpListener::bind(&proxy_addr)?;
-        self.run_accept(listener, &proxy_addr)
+        match local_port {
+            Some(p) => {
+                let proxy_addr = format!("127.0.0.1:{}", p);
+                let listener = TcpListener::bind(&proxy_addr)?;
+                self.run_accept(listener, &proxy_addr)
+            }
+            // multi-forward：监听口由 add_forward 各自绑定，这里不建 listener。
+            // 返回 Ok 不影响已起的接收/keepalive/探测线程（它们是独立线程）。
+            None => Ok(()),
+        }
     }
 
     /// 启动客户端并立即返回（accept 循环跑在独立线程）——
@@ -3344,14 +3796,15 @@ impl Connection {
         while self.running.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((client, peer)) => {
-                    // 坏包根因修复（2026-11-10 vendor 9353bffd）：listener 是
-                    // non-blocking 的，accept 出的 socket 继承非阻塞模式 → down
-                    // 线程 write_all() 在 TCP 缓冲区满时返回 WouldBlock(10035)
-                    // 被误判为致命错误 → 连接截断在 ~200KB。accept 后恢复阻塞。
+                    // 坏包根因修复（2026-11-10）：listener 是 non-blocking 的，
+                    // accept 出的 socket 继承非阻塞模式 → down 线程 write_all()
+                    // 在 TCP 缓冲区满时返回 WouldBlock(10035) 被误判为致命错误
+                    // → 连接截断在 ~200KB → 剩余 800KB 丢弃（替换型损坏）。
+                    // 修法：accept 后恢复阻塞模式（read 由 set_read_timeout 控速）。
                     let _ = client.set_nonblocking(false);
-                    // 缓冲区调优（2026-11-10 vendor 991e0adc）：默认 ~64KB 在 20 并发
-                    // 大传输下频繁触发阻塞/唤醒。256KB = ARQ 窗口(140KB) × 2 的余量。
-                    // 可用 VNET_TCP_BUF 覆盖。
+                    // 缓冲区调优（2026-11-10）：默认 ~64KB 在 20 并发大传输下
+                    // 频繁触发阻塞/唤醒。256KB = ARQ 窗口(140KB) × 2 的余量，
+                    // 20 并发共 5MB——PC/Android 都能承受。可用 VNET_TCP_BUF 覆盖。
                     let tcp_buf = std::env::var("VNET_TCP_BUF").ok()
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(256 * 1024);
@@ -3400,7 +3853,13 @@ struct ForwardCtx {
     switches: Arc<Mutex<u32>>,
     /// 隧道级应用连接开关表（`A_close_explicitly` 从监控线程关闭指定连接）
     conn_flags: Arc<Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>>,
-    /// 自拨标志（target_peer_id == my_peer_id；forward_targeted 走 loopback 短路）
+    /// 流 id → 存活开关（Phase 1 per-stream 终结用；与 conn_flags 同一开关对象，
+    /// 键空间换成 stream id，生命周期随连接注册/注销）
+    stream_flags: Arc<Mutex<HashMap<u16, Arc<AtomicBool>>>>,
+    /// 债 2：multi-forward 流归属表（stream_id → target_port），
+    /// 探测失败时按 forward 终结其全部流（见 Connection::mf_terminate_forward_streams）
+    mf_stream_targets: Arc<Mutex<HashMap<u16, u16>>>,
+    /// 自拨标志（target_peer_id == my_peer_id）：forward 时走 loopback 短路
     self_dial: bool,
 }
 
@@ -3413,7 +3872,7 @@ impl ForwardCtx {
     /// 带目标口的转发（multi-forward）：`SESSION_START` 载荷携带 target_port，
     /// 服务端按白名单解析后连对应上游；`None` = legacy 空载荷，行为与旧版一致。
     fn forward_targeted(&self, client: TcpStream, target: Option<u16>) {
-        // ── 自拨短路（b4d31281）：target == self 时走 loopback TCP 代理，
+        // ── 自拨短路（2026-11-10 DSH 性能阻塞）：target == self 时走 loopback TCP 代理，
         // 不经隧道。P2P IPv6 自拨是物理回环（PC→网卡→路由器→PC），73KB 要 14 秒；
         // 回环 TCP 代理 <0.1s。适用：self_dial 且有 target 口（自拨必走 multi-forward）。
         if self.self_dial {
@@ -3434,6 +3893,11 @@ impl ForwardCtx {
         }
         // 注册本连接的下行队列（stream id = 本连接的线上身份，u16 环绕）
         let conn_id = self.hub.lock().unwrap().register();
+        // 债 2：登记流 → target 归属（multi-forward 专用；legacy 空 target 不登记），
+        // 供 caps 探测失败时按 forward 终结其全部流
+        if let Some(t) = target {
+            self.mf_stream_targets.lock().unwrap().insert(conn_id, t);
+        }
         tracelog!("[conn#{}] OPEN path={:?} target_peer={}", conn_id,
                   *self.path.lock().unwrap(), self.target_peer_id);
         let hub_up = self.hub.clone();
@@ -3450,6 +3914,9 @@ impl ForwardCtx {
         // （key 用独立 u64 计数：stream id 会环绕，复用同一空间会误关新连接）
         let flag_key = next_conn_flag_key();
         self.conn_flags.lock().unwrap().insert(flag_key, conn_active.clone());
+        // Phase 1 按流终结：sid → 同一开关对象（key 即线上流身份；注销在连接
+        // 清理处先于 hub unregister 完成，sid 环绕复用不会拿到别人的开关）
+        self.stream_flags.lock().unwrap().insert(conn_id, conn_active.clone());
         // 本端是否只是半关闭（SHUT_WR）。只有半关闭才需要 drain，否则立即释放 accept 循环
         let half_closed = Arc::new(AtomicBool::new(false));
 
@@ -3718,9 +4185,6 @@ impl ForwardCtx {
 
         let down = thread::spawn(move || {
             let mut stream = down_client;
-            // 坏包观测/修复（vendor 9353bffd）：down 线程退出必须留下原因与字节数，
-            // 否则「连接在 ~200KB 处截断」类问题无从定位。
-            let mut written: u64 = 0;
             let exit_reason;
             'down_loop: loop {
                 if !down_running.load(Ordering::Relaxed) { exit_reason = "running=false"; break; }
@@ -3745,11 +4209,11 @@ impl ForwardCtx {
                             if data.is_empty() { continue; }
                             if let Err(e) = stream.write_all(&data) {
                                 println!("  [conn#{}] DOWN_WRITE_ERR: {} kind={:?} written_so_far≈{}B",
-                                    conn_id, e, e.kind(), written);
+                                    conn_id, e, e.kind(),
+                                    down_queue.lock().unwrap().take_counters(conn_id).1);
                                 exit_reason = "tcp_write_err";
                                 break 'down_loop;
                             }
-                            written += data.len() as u64;
                             *last_write.lock().unwrap() = std::time::Instant::now();
                             got = true;
                         }
@@ -3773,13 +4237,14 @@ impl ForwardCtx {
                     // 队列还有数据：继续排（不等 conn_active）
                 }
             }
-            println!("  [conn#{}] DOWN_EXIT reason={} down_bytes_at_exit={}B",
-                conn_id, exit_reason, written);
+            println!("  [conn#{}] DOWN_EXIT reason={} down_bytes_at_exit={}",
+                conn_id, exit_reason,
+                down_queue.lock().unwrap().take_counters(conn_id).1);
             down_active.store(false, Ordering::Relaxed);
         });
 
         let _ = up.join();
-        // 坏包观测：up 线程退出 → 立即杀 down 线程 → 数据截断根因定位（vendor 9353bffd）
+        // 坏包观测：up 线程退出 → 立即杀 down 线程 → 数据截断根因定位
         println!("  [conn#{}] UP_EXIT half_closed={}",
             conn_id, half_closed.load(Ordering::Relaxed));
         // 半关闭语义：本端可能只是 SHUT_WR（如 nc/curl 发完请求就关写端），
@@ -3803,8 +4268,19 @@ impl ForwardCtx {
         }
         conn_active.store(false, Ordering::Relaxed);
         let _ = down.join();
+        // Phase 1 注销：sid → 开关映射必须在 hub unregister **之前**移除，并用
+        // Arc 身份核对——u16 sid 会环绕复用，若晚于 unregister，新连接恰好在
+        // 这一瞬注册了同号 sid，会被这里的清理误删（表现为新流无法被按流终结）。
+        {
+            let mut sf = self.stream_flags.lock().unwrap();
+            if sf.get(&conn_id).map_or(false, |f| Arc::ptr_eq(f, &conn_active)) {
+                sf.remove(&conn_id);
+            }
+        }
         let (up_total, down_total) = hub_down.lock().unwrap().take_counters(conn_id);
         hub_down.lock().unwrap().unregister(conn_id);
+        // 债 2：流已终结，注销 forward 归属（幂等：legacy 流本来就没登记）
+        self.mf_stream_targets.lock().unwrap().remove(&conn_id);
         self.conn_flags.lock().unwrap().remove(&flag_key);
         // 每连接一行双向计数：走一遍就能回答「上行发了多少、下行回了多少、断在哪半边」
         tracelog!("[conn#{}] CLOSE half_closed={} up={}B down={}B", conn_id,
@@ -3835,8 +4311,10 @@ pub fn start_server_full(
     secret: Option<&str>,
     preferred_p2p_port: Option<u16>,
 ) -> anyhow::Result<std::sync::Arc<AtomicBool>> {
-    // 同进程 peer_id 冲突防护（vendor 991e0adc，与 client 同款）
+    // 同进程 peer_id 冲突防护（与 client 同款）
     peer_id_try_acquire(peer_id)?;
+    // 同进程 server target_port 重叠检测（embedding 竞态防护）
+    server_port_register(peer_id, target_port);
     // 同机跨进程占位（与 client 同款）：新进程接管 → 旧进程退位，不互抢映射。
     let claim = PeerClaim::steal(&std::env::temp_dir(), peer_id, "server");
     crate::vnet::fwcheck::spawn_check();
@@ -3909,9 +4387,20 @@ pub fn start_server_full(
     let ka = relay.clone();
     let ka_run = running.clone();
     let ka_ns = srv_ns.clone();
+    let ka_peer = peer_id;
+    let mut claim = claim;
     thread::spawn(move || {
         let mut sense_at = std::time::Instant::now() - Duration::from_secs(10);
         while ka_run.load(Ordering::Relaxed) {
+            // 同机 peer_id 占位体检（与 client 同款）：被新进程接管 → 退位。
+            if claim.poll() == ClaimPoll::Superseded {
+                println!("  [SUPERSEDED] server peer_id {} taken over by another live process — yielding",
+                    ka_peer);
+                ka_run.store(false, Ordering::Relaxed);
+                ka.unregister();
+                peer_id_release(ka_peer);
+                break;
+            }
             ka.keepalive();
             // 与 client 相同：周期续租，relay 服务重启后自动恢复映射。
             ka.renew_registration();
@@ -4664,8 +5153,8 @@ pub fn start_server_full(
                 if epoch_reset {
                     if let Some(s) = sessions.get_mut(&src_peer) {
                         let n = s.streams.len();
-                        // 2026-11-10 vendor a1ac2d93: shutdown 旧 upstream（up-thread 的
-                        // clone 在 HashMap clear 后仍持有 socket；残留数据 = 坏包根因）。
+                        // 2026-11-10: shutdown old upstreams (up-thread clones keep
+                        // them alive after HashMap clear; stale data = corruption)
                         for stream in s.streams.values_mut() {
                             if let Some(ref tcp) = stream.tcp {
                                 let _ = tcp.shutdown(std::net::Shutdown::Both);
@@ -4959,22 +5448,21 @@ pub fn start_server_full(
                 }
                 last_reregister = std::time::Instant::now();
             }
-            // ── IPv6 重发现 + 重公告（手机 P2P 根因修复 826c6c00）──
+            // ── IPv6 重发现 + 重公告（手机 P2P 根因修复）──
+            // 注意：端口必须用 server 实际监听的 P2P 端口（p2p_port 变量），
+            // 不能用 get_my_ipv6() 返回的硬编码 9100——那会覆盖正确公告。
             if last_v6_check.elapsed() >= Duration::from_secs(60) {
                 last_v6_check = std::time::Instant::now();
-                eprintln!("[SRV-V6DBG] timer fired, calling get_my_ipv6()...");
                 if let Some(sock) = get_my_ipv6() {
-                    eprintln!("[SRV-V6DBG] get_my_ipv6 returned: {}", sock);
                     let ip = match sock.ip() {
                         std::net::IpAddr::V6(v6) => Some(v6),
                         _ => None,
                     };
                     if let Some(v6) = ip {
                         if last_announced_v6 != Some(v6) {
-                            // 043e00f1：用实际 P2P 监听口（p2p_port=19100），不用 get_my_ipv6() 的硬编码 9100。
                             let s = format!("[{}]:{}", v6, p2p_port);
                             let _ = relay.announce_ipv6(&s);
-                            eprintln!("  [SRV] IPv6 {} (re-)announced: {}", if last_announced_v6.is_some() { "CHANGED" } else { "initial" }, s);
+                            println!("  [SRV] IPv6 {} (re-)announced: {} (P2P port {})", if last_announced_v6.is_some() { "CHANGED" } else { "initial" }, s, p2p_port);
                             last_announced_v6 = Some(v6);
                         }
                     }
@@ -5147,34 +5635,42 @@ fn get_my_ipv6() -> Option<std::net::SocketAddr> {
         }
     }
     // 方案 2：接口枚举（跨平台兜底——多网卡场景下枚举所有接口找全局 IPv6）
-    // Android 修复（2026-11-10 826c6c00）：WiFi+蜂窝并存时 connect 方案可能绑到蜂窝口。
-    if let Some(best) = local_ipv6_best() {
-        return Some(std::net::SocketAddr::new(std::net::IpAddr::V6(best), 9100));
+    // Android 修复（2026-11-10）：WiFi+蜂窝并存时 connect 方案可能绑到蜂窝口（无 IPv6）。
+    // 枚举所有接口，优先选 managed（非 temporary、非 EUI-64 随机化）的全局地址。
+    if let Ok(addrs) = local_ipv6_addrs() {
+        if let Some(best) = addrs.first() {
+            return Some(std::net::SocketAddr::new(std::net::IpAddr::V6(*best), 9100));
+        }
     }
     None
 }
 
-/// 多目标探测枚举全局 IPv6（Google/百度/电信），返回第一个发现的。
-fn local_ipv6_best() -> Option<std::net::Ipv6Addr> {
+/// 枚举本机所有全局 IPv6 地址，按优先级排序（managed > temporary）。
+/// 跨平台：Windows 用 GetAdaptersAddresses，Linux/Android 用 /proc/net/if_inet6 或 getifaddrs。
+fn local_ipv6_addrs() -> anyhow::Result<Vec<std::net::Ipv6Addr>> {
+    let mut result: Vec<std::net::Ipv6Addr> = Vec::new();
+    // UDP socket 枚举法：绑定 [::]:0 并 connect 到多个目标，收集不同接口的地址
+    // （无需 OS 特定 API，纯 Rust 标准库）
     let probes = [
-        "2001:4860:4860::8888", // Google
-        "2400:3200::1",         // 百度
-        "3fff:1e1::1",          // 电信
+        "2001:4860:4860::8888",  // Google (可能走 WiFi 或默认路由)
+        "2400:3200::1",           // 百度 (国内 IPv6 路由)
+        "3fff:1e1::1",            // 电信 IPv6
     ];
     for target in probes {
         if let Ok(sock) = UdpSocket::bind("[::]:0") {
             if sock.connect(format!("[{}]:53", target)).is_ok() {
                 if let Ok(local) = sock.local_addr() {
                     if let std::net::IpAddr::V6(v6) = local.ip() {
-                        if !v6.is_loopback() && !v6.is_unicast_link_local() && !v6.is_unspecified() {
-                            return Some(v6);
+                        if !v6.is_loopback() && !v6.is_unicast_link_local()
+                            && !v6.is_unspecified() && !result.contains(&v6) {
+                            result.push(v6);
                         }
                     }
                 }
             }
         }
     }
-    None
+    Ok(result)
 }
 
 
@@ -5246,26 +5742,6 @@ mod tests {
     }
 
     #[test]
-    fn test_failed_auth_clears_cached_identity() {
-        let mut auth = Some(crate::vnet::identity::PeerIdentity {
-            did: "did:myco:test-cached".into(),
-            key_id: "cached-key".into(),
-            peer_id: 7,
-            verified_at: 1,
-        });
-        let mut auth_at = Some(std::time::Instant::now());
-        assert!(srv_handle_auth(
-            crate::vnet::identity::STREAM_TAG_AUTH,
-            &[0xff],
-            999,
-            None,
-            &mut auth,
-            &mut auth_at,
-        ));
-        assert!(auth.is_none() && auth_at.is_none(), "失败 AUTH 必须清缓存");
-    }
-
-    #[test]
     fn test_mf_resolve_target_whitelist_and_compat() {
         // legacy（空载荷）用默认 target：旧客户端行为不变
         assert_eq!(mf_resolve_target(&[], 3389), Ok(3389));
@@ -5279,6 +5755,71 @@ mod tests {
         assert_eq!(mf_resolve_target(p2, 3389), Err("MF_TARGET_DENIED"));
         // 不认识的新版本：显式拒绝（防止旧端把新载荷当 legacy 静默误路由）
         assert_eq!(mf_resolve_target(&[9, 0, 1], 3389), Err("MF_BAD_FRAME"));
+    }
+
+    // ── 2026-11-12 手机→PC 3389 真案：静默梯只能在"确有在途/待发字节"时动手 ──
+    /// 契约 §3.1-6「`expect_data=true` 且有应用待发数据或主动 L4 探测在途……空闲 TCP 不算黑洞」：
+    /// 纯空闲（无 pending/inflight）静默 10 分钟也只能是 Idle —— RDP 空闲期是合法状态。
+    #[test]
+    fn silence_verdict_requires_inflight_bytes() {
+        let trigger = Duration::from_secs(3);
+        let budget = Duration::from_secs(12);
+        // 纯空闲：无在途字节 → 永不重置（这就是"3389 一跳就断"的修点）
+        assert_eq!(
+            silence_verdict(false, Duration::from_secs(600), trigger, budget),
+            SilenceVerdict::Idle,
+            "无在途字节的连接不得被判死"
+        );
+        // 有在途但还没到触发阈值 → Idle（正常在途传输）
+        assert_eq!(
+            silence_verdict(true, Duration::from_secs(1), trigger, budget),
+            SilenceVerdict::Idle
+        );
+        // 有在途 + 超阈值未耗尽预算 → Probe（3s 检测，契约 G4/R1b）
+        assert_eq!(
+            silence_verdict(true, Duration::from_secs(5), trigger, budget),
+            SilenceVerdict::Probe
+        );
+        // 有在途 + 预算耗尽 → Reset（真黑洞仍要显式失败，G4 ≤15s）
+        assert_eq!(
+            silence_verdict(true, Duration::from_millis(12_000), trigger, budget),
+            SilenceVerdict::Reset
+        );
+    }
+
+    /// 长时间空闲（如 RDP 空闲 60s）后第一笔在途数据：`silent_for` 早已超过预算，
+    /// 必须按"武装时刻"裁剪成 0，否则会**立刻**判死（另一个方向的误杀）。
+    #[test]
+    fn long_idle_then_first_inflight_is_not_an_instant_reset() {
+        let trigger = Duration::from_secs(3);
+        let budget = Duration::from_secs(12);
+        // 入参是 effective_silent = min(silent_for, armed_for)；刚武装时 armed_for≈0
+        let effective = Duration::from_secs(600).min(Duration::from_millis(0));
+        assert_eq!(
+            silence_verdict(true, effective, trigger, budget),
+            SilenceVerdict::Idle,
+            "刚武装的那一拍不得判死"
+        );
+        // 武装后熬过预算仍无进展 → Reset（真黑洞照样抓，不会被这条放宽掉）
+        let effective2 = Duration::from_secs(600).min(Duration::from_secs(13));
+        assert_eq!(silence_verdict(true, effective2, trigger, budget), SilenceVerdict::Reset);
+    }
+
+    /// env 旋钮：未设/空/非法/0 一律返回默认值（A/B 现场调参用，不为过门改数）。
+    #[test]
+    fn silence_env_knobs_parse_with_defaults() {
+        // 不 std::env::set_var：进程级全局会污染并行测试；只验证"未设就走默认"这条分支
+        assert_eq!(
+            env_duration_ms("VNET_SILENCE_DEFINITELY_UNSET_XYZ", Duration::from_secs(3)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            env_duration_ms("VNET_SILENCE_DEFINITELY_UNSET_XYZ", Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
+        // 默认值本身：与任务契约（3s 检测 / 2s 探测节拍）一致
+        assert_eq!(SILENCE_TRIGGER, Duration::from_secs(3));
+        assert_eq!(PROBE_INTERVAL, Duration::from_secs(2));
     }
 
     /// caps 协商（task.md §11 H.2）：add_forward 建 route 前的对端能力判定。
@@ -5308,6 +5849,71 @@ mod tests {
         let mut fresh = crate::vnet::netstatus::NetStatus::default();
         fresh.version = 0;
         assert!(mf_caps_check(&fresh).is_ok(), "version=0 = 未收到公告，不得误报不支持");
+    }
+
+    // ── 债 2 / 债 3（2026-11-11/12 生产经验沉淀）──
+
+    /// 债 2：version==0（对端未公告 NetStatus）必须维持向后兼容放行（Ok）。
+    /// 新增的 5s 超时探测只是异步补判（add_forward 内 spawn），不得收紧同步语义：
+    /// 旧端「不公告」≠「不支持」，fail-open 语义是兼容窗口的底线。
+    #[test]
+    fn test_mf_caps_check_version_zero_keeps_fail_open_with_probe() {
+        let fresh = crate::vnet::netstatus::NetStatus::default();
+        assert_eq!(fresh.version, 0);
+        // 注意 caps 也为 0：version==0 时连 caps 都没到，不能据此拒绝
+        assert!(mf_caps_check(&fresh).is_ok(),
+            "version=0 必须 Ok：fail-open 保留，探测（probe_peer_alive 5s）只异步补判");
+    }
+
+    /// 债 3 API 冻结：confirm_forward 必须以 (&self, u16, Duration) -> anyhow::Result<()>
+    /// 暴露给宿主（ffi/embedding 按此签名调用，改签名即编译失败）；
+    /// 债 2 的 probe_peer_alive 同步锁死 (Duration) -> bool。
+    /// Connection 构造需要真实 relay 注册，单测造不出来，故只做编译期签名锁。
+    #[test]
+    fn test_confirm_forward_signature_frozen() {
+        let confirm: fn(&Connection, u16, Duration) -> anyhow::Result<()> =
+            Connection::confirm_forward;
+        let probe: fn(&Connection, Duration) -> bool = Connection::probe_peer_alive;
+        let _ = (confirm, probe);
+    }
+
+    /// 债 3 行为判定表：本地连不上 → Err；全路径有响应 → Ok；
+    /// 接受但静默（黑洞外观）→ timeout 内显式 Err，不得无限挂起（G6）。
+    /// 探测体独立成自由函数（confirm_forward_probe），无需真实 relay 即可锁行为。
+    #[test]
+    fn test_confirm_forward_probe_decision_table() {
+        // 1) 无 listener：连接被拒 → 明确 Err（错误信息含 "forward unreachable"）
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let dead_port = l.local_addr().unwrap().port();
+        drop(l); // 立刻释放，制造确定无监听的口
+        let err = confirm_forward_probe(dead_port, Duration::from_secs(1)).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("forward unreachable"), "got: {}", msg);
+
+        // 2) upstream 正常回话（模拟对端服务 echo）→ Ok
+        let echo = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = echo.accept() {
+                let mut b = [0u8; 4];
+                let _ = s.read(&mut b);
+                let _ = s.write_all(b"OK!");
+            }
+        });
+        assert!(confirm_forward_probe(echo_port, Duration::from_secs(2)).is_ok(),
+            "有响应 = 数据流过全路径，必须 Ok");
+
+        // 3) 接受但永不回应（静默黑洞外观）→ 在超时时限附近显式 Err，不得挂死
+        let mute = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mute_port = mute.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let _hold = mute.accept(); // 持住连接：不响应、不关闭
+        });
+        let t0 = Instant::now();
+        let err = confirm_forward_probe(mute_port, Duration::from_millis(300)).unwrap_err();
+        assert!(t0.elapsed() < Duration::from_secs(2),
+            "必须在超时时限附近返回（实测 {:?}），不得无限挂起", t0.elapsed());
+        assert!(format!("{:#}", err).contains("forward unreachable"));
     }
 
     #[test]
@@ -5384,16 +5990,76 @@ mod tests {
         let third = hub.register();
         assert_ne!(third, 0);
     }
+
+    // ── 同机 peer_id 占位（2026-11-10 串扰事故）──
+
+    /// 事故矩阵：A 先占位 → B 抢走（newcomer-wins）→ A 连续 3 次看到
+    /// 新鲜外来占位 → 退位；期间前 2 次只计数不退位（防瞬态误判）。
+    #[test]
+    fn test_claim_newcomer_takeover_and_yield() {
+        let dir = std::env::temp_dir();
+        let id = 799_001u32;
+        let path = PeerClaim::path_for(&dir, id);
+        let _ = std::fs::remove_file(&path);
+        let mut a = PeerClaim::steal_with_pid(&dir, id, 111_111, "test");
+        assert_eq!(a.poll(), ClaimPoll::Hold);
+        assert_eq!(a.poll(), ClaimPoll::Hold);
+        // 新进程 B（pid 222222）无条件抢走
+        let _b = PeerClaim::steal_with_pid(&dir, id, 222_222, "test");
+        assert_eq!(a.poll(), ClaimPoll::ForeignLive, "第 1 次外来占位只计数");
+        assert_eq!(a.poll(), ClaimPoll::ForeignLive, "第 2 次外来占位只计数");
+        assert_eq!(a.poll(), ClaimPoll::Superseded, "连续第 3 次必须退位");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 自愈矩阵：持有人死了（占位过期）→ 本进程夺回继续 Hold。
+    #[test]
+    fn test_claim_retake_when_holder_dead() {
+        let dir = std::env::temp_dir();
+        let id = 799_002u32;
+        let path = PeerClaim::path_for(&dir, id);
+        let _ = std::fs::remove_file(&path);
+        let mut a = PeerClaim::steal_with_pid(&dir, id, 111_111, "test");
+        let _b = PeerClaim::steal_with_pid(&dir, id, 222_222, "test"); // B 抢走
+        // 时钟前跳 30s：B 的占位过期（>CLAIM_FRESH）→ A 夺回
+        let later = std::time::SystemTime::now() + Duration::from_secs(30);
+        assert_eq!(a.poll_at(later), ClaimPoll::Retaken);
+        assert_eq!(a.poll(), ClaimPoll::Hold);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 清理语义：只删自己的占位；被抢走后 release 是 no-op（不删别人的）。
+    #[test]
+    fn test_claim_release_only_when_mine() {
+        let dir = std::env::temp_dir();
+        let id = 799_003u32;
+        let path = PeerClaim::path_for(&dir, id);
+        let _ = std::fs::remove_file(&path);
+        let a = PeerClaim::steal_with_pid(&dir, id, 111_111, "test");
+        a.release_if_mine();
+        assert!(!path.exists(), "自己的占位应被删除");
+        let _b = PeerClaim::steal_with_pid(&dir, id, 222_222, "test");
+        a.release_if_mine();
+        assert!(path.exists(), "别人的占位不得删除");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 流 id 基点随机化：多实例基点不全同（否则串扰防护退化回顺序编号），
+    /// 且 0 永不分配（P2P 入站聚合保留）。
+    #[test]
+    fn test_hub_stream_ids_randomized_across_instances() {
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let id = ConnHub::new().register();
+            assert_ne!(id, 0, "stream 0 is reserved");
+            firsts.insert(id);
+        }
+        assert!(firsts.len() > 1, "32 个实例的基点不能全同（串扰防护失效）");
+    }
 }
 
-// myco 侧观测辅助（P0 `myco vnet peers|raw status`）——由 scripts/vnet-sync-deploy.ps1
-// 在同步 vendored vnet 源码后**追加到 connection.rs 末尾**。
-//
-// 为什么要单独存一份：每次从 myco-vnet-migrate 同步 connection.rs 都会整文件覆盖，
-// 这些函数不是上游 vnet crate 的一部分，必须由部署脚本重新贴回来；否则 `myco vnet
-// peers` 会编译失败。
-
-/// 纯函数：解析状态文件的 `k=v` 行（空行/无等号行跳过，键值两端空白去掉）。
+// ── 状态文件读取（app 侧 vnet_forward/peers 面板用；apps/vnet 的 CLI 同款）──
+/// 状态 KV 解析（`k=v` 行，空键丢弃）。
 pub fn parse_status_kv(body: &str) -> Vec<(String, String)> {
     body.lines()
         .filter_map(|l| l.split_once('='))

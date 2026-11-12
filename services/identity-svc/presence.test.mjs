@@ -40,7 +40,7 @@ async function signedPost(path, payload) {
 let server
 test.before(async () => {
   server = spawn(process.execPath, [resolve(__dirname, 'identity-server.mjs')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DB_PATH: join(tmp, 'test.db'), WEB_ROOT: join(tmp, 'web') },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', DB_PATH: join(tmp, 'test.db'), WEB_ROOT: join(tmp, 'web'), ACCESS_DB_PATH: join(tmp, 'access.db'), FEEDBACK_DB_PATH: join(tmp, 'feedback.db') },
     stdio: 'ignore',
   })
   // 等端口就绪（最多 10s）

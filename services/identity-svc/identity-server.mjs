@@ -54,8 +54,10 @@ const MIME = {
 }
 
 const store = new IdentityStore({ path: DB_PATH })
-const feedbackStore = new FeedbackStore({ path: resolve(__dirname, 'feedback.db') })
-const accessStore = new AccessLogStore({ path: resolve(__dirname, 'access.db') })
+// 2026-11-12 开源整改：反馈库/访问日志库支持环境变量覆盖，单测指临时目录，
+// 运行时数据不再写仓内工作树。默认路径不变（生产行为零变化）。
+const feedbackStore = new FeedbackStore({ path: process.env.FEEDBACK_DB_PATH || resolve(__dirname, 'feedback.db') })
+const accessStore = new AccessLogStore({ path: process.env.ACCESS_DB_PATH || resolve(__dirname, 'access.db') })
 // admin root：环境变量显式指定哪个 rootDid 是 super-admin；未设则回退到"最早注册的 root"。
 // （生产库若混入测试数据导致最早 root 非真实 owner，用此变量锁定。）
 const ADMIN_ROOT_DID = process.env.ADMIN_ROOT_DID || ''

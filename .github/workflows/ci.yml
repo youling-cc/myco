@@ -15,8 +15,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: cd apps/phone && npm ci
-      - run: cd apps/phone && npx vitest run
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - run: cd apps/phone && pnpm install --frozen-lockfile --ignore-workspace
+      - run: cd apps/phone && pnpm exec vitest run
 
   identity-svc-tests:
     name: Identity Service Tests (node:test)

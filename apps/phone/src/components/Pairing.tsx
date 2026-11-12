@@ -46,6 +46,7 @@ function openTools() {
 import { type Transport, DirectHttpTransport, NotAuthorizedError, connectWebRtc } from '../transport'
 import { QrCamera } from './QrCamera'
 import { FriendsPanel, PeerTasksSection } from './FriendsPanel'
+import { AdbShareCard } from './AdbShareCard'
 import { ensureBackgroundPoll } from '../chat-store'
 import { QrImage } from './QrImage'
 import { YoulingLogin } from './YoulingLogin'
@@ -1693,7 +1694,14 @@ export function Pairing({ identity, onConnect, onUnlocked }: {
             TaskList 里——未连接时接受的任务在任务 Tab 无处可看，"接了任务没看到"根因）。
             连接态与配对态互斥，不会与 TaskList 内的同名区双渲染。── */}
         {tab === 'connect' && identity && !busy && !bk.open && role !== 'unlinked' && (
-          <PeerTasksSection />
+          <>
+            <PeerTasksSection />
+            {/* 2026-11-12：「ADB 调试」卡（用户口径：任务收敛 DSH/RDP/ADB 三张）。
+                位置在「好友分享的任务」卡之下——三张卡连成一片，不再是漂浮在列表
+                之外的孤立块（04:4x 用户报"游离在列表外"）。独立模式（Pairing）真
+                主页——agents/TaskList 两处挂点在配对态不可达（真机两轮实测）。 */}
+            <AdbShareCard />
+          </>
         )}
 
         {/* ── 任务（Tab）：主设备列表——点主设备进入它的任务卡片列表 ── */}

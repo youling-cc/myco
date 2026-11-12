@@ -126,6 +126,13 @@ pub struct RelayArq {
     /// 上层取走后应对每个流显式发 STREAM_END——client 不知道缺口存在，
     /// 只能等上层超时（task.md §6.1-8 契约：放弃必须显式终结受影响流）。
     abandoned_streams: Vec<u16>,
+    /// Per-stream retry budget（Phase 1，2026-11-12 RDP P0）：每个流「最老 pending
+    /// 帧首次入队」的时刻。单流卡死不再连坐整条隧道——超预算的流只把**自己**
+    /// 的 pending 帧原地替换成 STREAM_END（帧数/位置不变，seq 连续性保持），
+    /// 其他流照常；inflight 帧不动（继续按整体预算重传 = Phase 2 兜底）。
+    /// 在 `send()` 首帧入队时建立，`on_ack()`（handle_ack_v3）确认有进展且该流
+    /// 已无 pending 帧时清除——预算只度量「本轮积压」，不跨健康回合累计。
+    stream_pending_since: HashMap<u16, Instant>,
     /// 在途探测：nonce + 发出时刻。None = 当前没有探测在等回包。
     probe_nonce: u32,
     probe_at: Option<Instant>,
@@ -191,6 +198,7 @@ impl RelayArq {
             last_progress: Instant::now(),
             abandoned_bytes: 0,
             abandoned_streams: Vec::new(),
+            stream_pending_since: HashMap::new(),
             probe_nonce: 0,
             probe_at: None,
             pace_override: std::env::var("VNET_PACE").ok().and_then(|v| v.parse::<f64>().ok()),
@@ -212,6 +220,12 @@ impl RelayArq {
     pub fn send(&mut self, payload: &[u8]) {
         for chunk in payload.chunks(chunk_size()) {
             self.pending.push_back(chunk.to_vec());
+        }
+        // per-stream 预算锚点：该流首个未清空 pending 帧的入队时刻。
+        // 已有锚点不刷新——预算从「最老 pending」起算，后续新帧不重置计时。
+        // 非流帧（AUTH/裸字节）解析不出 sid 就不记，只跟踪能确定归属的流。
+        if let Some((_, sid, _)) = transport::parse_stream_frame(payload) {
+            self.stream_pending_since.entry(sid).or_insert_with(Instant::now);
         }
     }
 
@@ -551,6 +565,15 @@ impl RelayArq {
         if self.inflight.len() < inflight_before {
             self.acked += (inflight_before - self.inflight.len()) as u64;
             self.last_progress = Instant::now();
+            // per-stream 预算收尾（Phase 1）：有进展时清掉已无 pending 帧的流锚点——
+            // 该流本轮积压已全部离队，预算计时不跨健康回合（否则健康流会带着
+            // 陈旧锚点在下一轮静默中被误判「卡了 12s」）。
+            if !self.stream_pending_since.is_empty() {
+                let live: std::collections::HashSet<u16> = self.pending.iter()
+                    .filter_map(|item| transport::parse_stream_frame(item).map(|(_, sid, _)| sid))
+                    .collect();
+                self.stream_pending_since.retain(|sid, _| live.contains(sid));
+            }
         }
 
         fast_retransmit
@@ -584,6 +607,45 @@ impl RelayArq {
     /// 清零放弃字节计数（按流终结路径用；防止下一轮静默检测重复触发）
     pub fn clear_abandoned_bytes(&mut self) {
         self.abandoned_bytes = 0;
+    }
+
+    /// Per-stream retry budget（Phase 1，RDP P0 修复）：找出「最老 pending 帧入队
+    /// 超过 `budget`」的流，并把这些流的 pending 载荷**原地**替换成 STREAM_END。
+    ///
+    /// 不变量：
+    /// - 同帧数、同位置替换——pending 尚未分配 seq，替换不动发送序号，
+    ///   seq 连续性保持（这是两阶段方案的核心：不 reset、不换 epoch）；
+    /// - 只动 pending，不动 inflight（在途帧继续按整体预算重传以维持有序性）；
+    /// - 不碰 `abandoned_bytes`（那是 Phase 2 整条 ARQ 判死的口径，必须原样保留）；
+    /// - 受害流记入 `abandoned_streams` 供上层显式终结；
+    /// - 锚点移除后不重复触发；同流若有新数据再入队，`send()` 会重新计时。
+    pub fn exhausted_streams(&mut self, budget: Duration) -> Vec<u16> {
+        let now = Instant::now();
+        let stuck: Vec<(u16, Instant)> = self.stream_pending_since.iter()
+            .filter(|(_, since)| now.duration_since(**since) > budget)
+            .map(|(sid, since)| (*sid, *since))
+            .collect();
+        if stuck.is_empty() { return Vec::new(); }
+        for (sid, since) in &stuck {
+            self.stream_pending_since.remove(sid);
+            let mut replaced = 0usize;
+            let mut bytes = 0usize;
+            for item in self.pending.iter_mut() {
+                if let Some((_, s, _)) = transport::parse_stream_frame(item) {
+                    if s == *sid {
+                        bytes += item.len();
+                        *item = transport::wrap_stream_frame(
+                            transport::STREAM_TAG_STREAM_END, *sid, b"STREAM_BUDGET_EXHAUSTED");
+                        replaced += 1;
+                    }
+                }
+            }
+            // 上层（server 主循环 / client 静默梯）取走后对该流显式 STREAM_END
+            self.abandoned_streams.push(*sid);
+            println!("  [ARQ] stream {} budget exhausted ({}ms): pending frames replaced with STREAM_END, {}B abandoned",
+                sid, now.duration_since(*since).as_millis(), bytes);
+        }
+        stuck.into_iter().map(|(sid, _)| sid).collect()
     }
 
     pub fn inflight_bytes(&self) -> usize {
@@ -672,6 +734,9 @@ impl RelayArq {
         self.dup_ack_count = 0;
         self.abandoned_bytes = 0;
         self.abandoned_streams.clear();
+        // per-stream 预算锚点随整条流状态一并作废：reset 后 pending 已清空，
+        // 残留锚点会让同号新流（u16 环绕复用）继承陈旧计时而被提前误判耗尽。
+        self.stream_pending_since.clear();
         self.probe_at = None;
         self.last_progress = Instant::now();
     }
@@ -1123,6 +1188,123 @@ mod tests {
         assert_eq!(sids, vec![0x1234u16], "放弃帧的 stream id 没有上报（client 无从得知流已残缺）");
         // 取走即清空：同一放弃事件不得重复触发 STREAM_END
         assert!(arq.take_abandoned_streams().is_empty(), "take 后未清空");
+    }
+
+    // ─── per-stream retry budget（Phase 1，RDP P0：单流卡死不连坐）───
+
+    /// 预算内：没有流超预算 → 返回空，pending 不被替换。
+    #[test]
+    fn test_exhausted_streams_empty_when_no_stream_exceeds_budget() {
+        let mut arq = RelayArq::new();
+        arq.send(&transport::wrap_stream_frame(transport::STREAM_TAG_DATA, 0x1111, b"stuck-or-not"));
+        arq.send(&transport::wrap_stream_frame(transport::STREAM_TAG_DATA, 0x2222, b"healthy"));
+        assert!(arq.exhausted_streams(Duration::from_secs(12)).is_empty(),
+            "预算内就有流被误判耗尽");
+        assert_eq!(arq.pending_count(), 2, "预算内的 pending 帧被动过");
+        // 载荷原样保留（未被替换成 STREAM_END）
+        for item in arq.pending.iter() {
+            let (tag, _, _) = transport::parse_stream_frame(item).unwrap();
+            assert_eq!(tag, transport::STREAM_TAG_DATA);
+        }
+        assert!(arq.take_abandoned_streams().is_empty(), "未耗尽就有流被上报");
+    }
+
+    /// 预算后：只有卡死流被上报（锚点移除不重复触发），健康流的 pending 不被替换。
+    #[test]
+    fn test_exhausted_streams_returns_stuck_sid_after_budget() {
+        let mut arq = RelayArq::new();
+        arq.send(&transport::wrap_stream_frame(transport::STREAM_TAG_DATA, 0x1111, b"stuck"));
+        arq.send(&transport::wrap_stream_frame(transport::STREAM_TAG_DATA, 0x2222, b"healthy"));
+        // 把 0x1111 的锚点拨回 13s 前，模拟该流 pending 已卡满 12s 预算
+        // （0x2222 保持刚入队，未超预算）
+        arq.stream_pending_since.insert(0x1111, Instant::now() - Duration::from_secs(13));
+        let sids = arq.exhausted_streams(Duration::from_secs(12));
+        assert_eq!(sids, vec![0x1111u16], "卡死流没有被上报（会连坐整条隧道）");
+        // 锚点已移除：不重复触发
+        assert!(arq.exhausted_streams(Duration::from_secs(12)).is_empty(),
+            "同一次卡死被重复上报");
+        // 健康流的 pending 载荷原样保留
+        let healthy = arq.pending.iter()
+            .find(|item| matches!(transport::parse_stream_frame(item),
+                Some((_, 0x2222, _))))
+            .expect("健康流的 pending 帧丢失");
+        let (tag, sid, rest) = transport::parse_stream_frame(healthy).unwrap();
+        assert_eq!((tag, sid, rest),
+            (transport::STREAM_TAG_DATA, 0x2222, &b"healthy"[..]));
+        // 受害流已记入 abandoned_streams（上层显式终结的口径）
+        assert!(arq.take_abandoned_streams().contains(&0x1111),
+            "耗尽流没有记入 abandoned_streams");
+    }
+
+    /// 替换语义：耗尽流的 pending 帧原地换成 STREAM_END（同帧数、同位置），
+    /// 其他流的 pending 帧与全部 inflight 帧不动——seq 连续性由此保持。
+    #[test]
+    fn test_exhausted_streams_replaces_pending_with_stream_end_in_place() {
+        let mut arq = RelayArq::new();
+        // 制造超过窗口的 backlog：A 流 130 帧先进（占满 inflight 窗口后溢出到
+        // pending），B 流 2 帧最后入队（必在 pending）。chunk=1000B，A 每帧 900B 载荷。
+        for i in 0..130u16 {
+            let payload = vec![i as u8; 900];
+            arq.send(&transport::wrap_stream_frame(transport::STREAM_TAG_DATA, 0xAAAA, &payload));
+        }
+        arq.send(&transport::wrap_stream_frame(transport::STREAM_TAG_DATA, 0xBBBB, b"healthy-1"));
+        arq.send(&transport::wrap_stream_frame(transport::STREAM_TAG_DATA, 0xBBBB, b"healthy-2"));
+        let (frames, _) = arq.flush_and_tick();
+        assert_eq!(frames.len(), window_size(), "前 128 帧应进 inflight");
+        let pending_before = arq.pending_count();
+        assert!(pending_before >= 3, "pending 应留有 A 溢出帧与 B 帧（测试前提）");
+        let inflight_before = arq.inflight_count();
+
+        // A 流卡满预算 → 只有 A 的 pending 被替换
+        arq.stream_pending_since.insert(0xAAAA, Instant::now() - Duration::from_secs(13));
+        let sids = arq.exhausted_streams(Duration::from_secs(12));
+        assert_eq!(sids, vec![0xAAAAu16]);
+
+        // 帧数不变（seq 连续性）：替换不增删 pending/inflight
+        assert_eq!(arq.pending_count(), pending_before, "替换改变了 pending 帧数");
+        assert_eq!(arq.inflight_count(), inflight_before, "替换动了 inflight");
+
+        // 逐帧解析验证：A 的 pending 帧 → STREAM_END + 约定载荷；B 的 → 原 DATA
+        let mut a_end = 0usize;
+        for item in arq.pending.iter() {
+            match transport::parse_stream_frame(item) {
+                Some((tag, 0xAAAA, rest)) => {
+                    assert_eq!(tag, transport::STREAM_TAG_STREAM_END, "A 的 pending 未换成 STREAM_END");
+                    assert_eq!(rest, &b"STREAM_BUDGET_EXHAUSTED"[..]);
+                    a_end += 1;
+                }
+                Some((tag, 0xBBBB, rest)) => {
+                    assert_eq!(tag, transport::STREAM_TAG_DATA, "B 的 pending 被误改");
+                    assert!(rest.starts_with(b"healthy-"), "B 的载荷被误改");
+                }
+                other => panic!("pending 出现非 A/B 流帧: {:?}", other.map(|(t, s, _)| (t, s))),
+            }
+        }
+        assert!(a_end > 0, "A 在 pending 的溢出帧一帧都没换到（测试前提失效）");
+        // inflight 全部保持 DATA（在途帧继续重传，维持 seq 连续性）
+        for f in frames.iter() {
+            let inner = &f[transport::HEADER_SIZE..];
+            let (tag, sid, _) = transport::parse_stream_frame(inner).unwrap();
+            assert_eq!(tag, transport::STREAM_TAG_DATA, "inflight 帧被替换（破坏 seq 连续性）");
+            assert_eq!(sid, 0xAAAA);
+        }
+    }
+
+    /// ACK 清锚点：健康回合结束后（有进展且该流无 pending 帧），锚点必须清除，
+    /// 否则健康流带着陈旧计时在下一轮静默中被误判「卡了 12s」。
+    #[test]
+    fn test_stream_pending_since_cleared_after_ack_drains_pending() {
+        let mut sender = RelayArq::new();
+        let mut receiver = RelayArq::new();
+        sender.send(&transport::wrap_stream_frame(transport::STREAM_TAG_DATA, 0x1234, b"payload"));
+        let (frames, _) = sender.flush_and_tick();
+        assert!(sender.stream_pending_since.contains_key(&0x1234), "send 未建立锚点");
+        let (_, ack, _) = receiver.on_packet(&frames[0]);
+        let _ = sender.on_packet(&ack.unwrap()); // ACK 清掉在途帧 = 有进展
+        assert!(!sender.stream_pending_since.contains_key(&0x1234),
+            "ACK 后锚点未清除（健康流会被陈旧计时误判）");
+        // 全部确认后的 exhausted_streams 永远为空（无 pending 可替换）
+        assert!(sender.exhausted_streams(Duration::from_millis(0)).is_empty());
     }
 
     /// R9b 的单元级回归：2 秒无 ACK 只是瞬断，绝不允许放弃字节。

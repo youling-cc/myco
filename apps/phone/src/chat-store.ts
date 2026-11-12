@@ -230,7 +230,7 @@ export interface PeerTask {
   titleTs?: number
   /** 关联的 myco 分享（`sh-…`）——有它才有"随时点开"的入口 */
   shareId?: string
-  /** **源设备** did（隧道目标）与展示名：点开 = 向它取票、经隧道把那一页拉过来 */
+  /** **源设备** did（隧道目标）与展示名：点开 = 经设备隧道 VNETP 直入把那一页拉过来 */
   sourceDevice?: string; sourceDeviceName?: string
   /** 源账号 did（grant 名单按它比对；转授申请要投给它） */
   sourceAccount?: string
@@ -604,26 +604,6 @@ function markTaskTombstoned(taskId: string, shareId: string): void {
     if (!exact) list.push({ ...(tid ? { taskId: tid } : {}), ...(sid ? { shareId: sid } : {}), revokedAt: now })
   }
   writeArr(K.taskTombstones(), list)
-}
-
-/** 2026-10-20：按 shareId 删任务卡（僵尸卡自愈用：分享已停止时手机端自动清理）。
- *  返回删掉的条数。 */
-export function removeTasksByShareId(shareId: string): number {
-  if (!shareId) return 0
-  const list = readArr<PeerTask>(K.tasks())
-  const kept = list.filter((t) => {
-    const c = taskShareCardOf(t)
-    if (c && c.shareId === shareId) return false
-    // 兜底：卡形状不标准（缺 device/account）时 taskShareCardOf 返回 null，
-    // 直接看 action.url 里是否带这个 shareId（老卡/僵尸卡形态）。
-    const url = typeof (t as { action?: { url?: string } }).action?.url === 'string'
-      ? String((t as { action?: { url?: string } }).action?.url)
-      : ''
-    return !url.includes(shareId)
-  })
-  const removed = list.length - kept.length
-  if (removed > 0) writeArr(K.tasks(), kept)
-  return removed
 }
 
 export function upsertFriend(did: string, name: string, status: Friend['status']): void {

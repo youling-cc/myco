@@ -107,7 +107,7 @@ import { accountDidEq, convKey } from '../didUtil'
 // 而不是落到本机任务详情页（本机没有那张分享的注册表）。
 // 2026-10-09 第二程：设备群广播的卡**嵌在 payload.card**——UI 一律先摊平
 // （`flattenTaskSharePayload`），否则卡上没标题、也没有「打开」入口。
-import { prefetchTaskEntry, isShareCard, openTaskShare, ensureRdpForwardFor } from '../dsh-open-runtime'
+import { isShareCard, openTaskShare, ensureRdpForwardFor } from '../dsh-open-runtime'
 import { flattenTaskSharePayload, taskDispTitle } from '../chat-store'
 
 /** 三态灯。 */
@@ -852,8 +852,8 @@ function ChatScreen({ convId, title, isGroup, myName, onBack, onChanged, presenc
                   <TaskEnvList card={flatCard as Record<string, unknown>} enabled={m.dir !== 'out'} />
                   {shareOpenNote && shareOpenNote.msgId === m.msgId && shareOpenNote.text && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4, maxWidth: 238 }}>
-                      {/* 2026-10-11 用户报「连接过程中也不显示连接中」：取票→起本地口→
-                          race 候选腿的这几秒就是"连接过程"，把连接中徽标显式摆出来。 */}
+                      {/* 2026-10-11 用户报「连接过程中也不显示连接中」：起设备隧道→
+                          开页的这几秒就是"连接过程"，把连接中徽标显式摆出来。 */}
                       {shareOpenNote.text === '正在打开…' && <ConnBadge mode="connecting" />}
                       <span style={{ fontSize: 11.5, color: shareOpenNote.text === '正在打开…' ? '#7ea8d4' : '#b45309', lineHeight: 1.5 }}>{shareOpenNote.text}</span>
                     </div>
@@ -1642,7 +1642,7 @@ function chatPreviewOf(m: ChatMsg): string {
 export function PeerTasksSection() {
   const [, setTick] = useState(0)
   const [err, setErr] = useState<string | null>(null)
-  // §3.23：点列表里的分享卡 → 走 dsh-open-runtime 取票 + 隧道（点它 = 走 remoteOpen 那条链）
+  // §3.23：点列表里的分享卡 → 走 dsh-open-runtime 的 VNETP 直入 + 隧道（点它 = 打开分享页）
   const [openNote, setOpenNote] = useState<{ id: string; text: string; state?: EnvRowState } | null>(null)
   // 2026-10-11 任务卡改名：长按任务卡 → ActionSheet（仅 owner 可见「改名」）→ 改名弹层
   const [taskMenu, setTaskMenu] = useState<PeerTask | null>(null)
@@ -1656,18 +1656,6 @@ export function PeerTasksSection() {
     const t = setInterval(refresh, 5000) // 接受/完成后他端回执与本地变化都靠 tick 重读
     return () => clearInterval(t)
   }, [refresh])
-  // R10 预取票：本区块出现可打开的远端任务卡时，后台先取票（点卡时省一次往返）。
-  // 依赖 tasks.length 而非 tasks：内容变化靠 tick 刷新，长度变化才需要重新评估。
-  const taskCountForPrefetch = getBoardTasks().length
-  useEffect(() => {
-    for (const task of listTasks()) {
-      // env 卡不走取票/隧道（入口是固定口直连）——别为它预取分享票
-      if (declaredEnvsOfCard(task as unknown as Record<string, unknown>, task.action).length) continue
-      const card = taskShareCardOf(task)
-      if (card) prefetchTaskEntry(card as unknown as Record<string, unknown>)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskCountForPrefetch])
   // 批五（2026-09-29 用户实测）：shared（我分享出去的）也入列——此前整体过滤导致
   // 自己发的任务卡在「我的任务」看不到。自己的卡走 peerTaskView 创建者视角
   // （「我发起的 · 待接受/进行中」），不接受者视角的 一起做/开始/完成 按钮。
@@ -1684,15 +1672,14 @@ export function PeerTasksSection() {
   /** 列表行「打开」：**env 卡优先按环境直开**（2026-10-23 真机 bug）——
    *  有 env 时入口是环境本身（固定口 → RDP 复制地址/DSH 浏览器），**不走分享入口**
    *  （`/gw/<id>/app/` 会报 `no valid share cookie (open the share entry first)`）；
-   *  没有 env 的老卡保持原 `openTaskShare`（取票 → 本地端口 → 原生 WebView）。
+   *  没有 env 的老卡保持原 `openTaskShare`（VNETP 直入 → 原生 WebView）。
    *
    *  2026-11-11 两条新路由：
    *  · **adb 卡（目标是本机设备）→ 开/关本机 vnet server（5555）**——手机是 server，
    *    `__mycoVnet.add` 是"我去连别人"的方向，用反了；server 生命周期见 adb-share.ts。
-   *  · **DSH 卡带分享坐标 → 取票链（openTaskShare）**——PC 网关入口 `/gw/<id>/` 必须
-   *    带新鲜 mt 票，而新卡的 entryUrl 已是设备域形态（`<device>.localhost:24011/dsh/`，
-   *    手机上 `entryUrlOf` 判非法 → 落根路径 `127.0.0.1:23911/` 无 cookie 必 401）。
-   *    取票链（share-entry-request → 中继兜底）每次点卡现签新票，不依赖卡上快照。
+   *  · **DSH 卡带分享坐标 → openTaskShare（VNETP 直入）**——PC 网关入口 `/gw/<id>/`
+   *    经设备隧道 15200（VNETP/1 DID 认证口）免 mt 直入（2026-11-12 起唯一路径，
+   *    取票/mt 链已删；隧道不可用时如实报「连不上源设备」）。
    *    RDP 是裸 TCP（3389 无票据概念），保持 env 直开不变。 */
   const openShare = (t: PeerTask) => {
     const envs = declaredEnvsOfCard(t as unknown as Record<string, unknown>, t.action)

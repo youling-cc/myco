@@ -70,6 +70,19 @@ public final class AdbShareServer {
             if (!VnetClient.ensureInit()) {
                 return err("vnet 初始化失败（libvnet.so 加载异常）");
             }
+            // 2026-11-12 vnet e99e2158：手机 JNI 宿主没有 set_peer_resolver，身份闸门
+            // fail-closed 会把所有带 AUTH 的对端流按 UnknownKey 拒掉（AUTH_REQUIRED
+            // 优雅关流——真机 03:5x ADB 黑洞根因）。本 server 显式降级为 PSK-only
+            // 网络准入（AUTH 变 advisory 不验签）；PSK 是账号设备群共享密钥，网络层
+            // 仍非公开。默认严格模式不变，仅本 server opt-in。
+            try {
+                int grc = VnetClient.vnet_set_gate_psk_only();
+                if (grc != VnetClient.VNET_OK) {
+                    return err("vnet PSK-only 闸门设置失败 rc=" + grc);
+                }
+            } catch (Throwable tr) {
+                return err("vnet_set_gate_psk_only 异常: " + tr);
+            }
             final int peerId = VnetTransport.serverPeerId(did, port);
 
             // 灭屏死亡后的僵尸对象防御（2026-11-06 VnetTransport.arm 同款真案）：

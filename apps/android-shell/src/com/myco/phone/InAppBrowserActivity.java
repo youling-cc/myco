@@ -145,6 +145,9 @@ public class InAppBrowserActivity extends Activity {
             s.setDomStorageEnabled(true);
             s.setMediaPlaybackRequiresUserGesture(false);
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+            // 2026-11-12 白屏终修同款：分享面走隧道动态口，Chromium 按 URL 缓存会把
+            // 旧隧道的 404 钉死（系统浏览器正常/应用内 46 条模块错误，对照实证）。
+            s.setCacheMode(WebSettings.LOAD_NO_CACHE);
             // 分享入口要用 cookie（302 Set-Cookie）；主壳已放开，这里保持一致
             try {
                 CookieManager cm = CookieManager.getInstance();

@@ -56,6 +56,40 @@ public final class P2pSyncTunnel {
         return device + "|" + targetPort;
     }
 
+    /** 本地回环口探活（250ms×v4/v6）：转发 listener 随 vnet 连接死亡而关闭，
+     *  connect 被拒 = 连接已死。只证本地 listener，不证对端业务——但覆盖
+     *  「连接销毁/进程重启后映射残留」这一类（2026-11-12 白屏实案的杀手）。 */
+    private static boolean probeLocal(int port) {
+        for (String host : new String[] { "127.0.0.1", "::1" }) {
+            java.net.Socket s = new java.net.Socket();
+            try {
+                s.connect(new java.net.InetSocketAddress(host, port), 250);
+                s.close();
+                return true;
+            } catch (Throwable ignored) {
+                try { s.close(); } catch (Throwable ignored2) { }
+            }
+        }
+        return false;
+    }
+
+    /** 清掉该设备的全部转发映射与客户端连接（探活失败时用；其他端口的转发
+     *  挂在同一条客户端连接上——连接死则全死，各自在下次 ensure 时懒重建）。 */
+    private static void evictDevice(String device) {
+        Integer cp = DEVICE_CLIENT.remove(device);
+        if (cp != null) {
+            try { VnetClient.stopClientPeer(cp); } catch (Throwable ignored) { }
+        }
+        java.util.Iterator<Map.Entry<String, Integer>> it = FORWARDS.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Integer> e = it.next();
+            if (e.getKey().startsWith(device + "|")) {
+                PORT_OWNER.remove(e.getValue());
+                it.remove();
+            }
+        }
+    }
+
     /** 分配一个没被占用的本地口（从 PORT_BASE 起顺序找）。 */
     private static int allocPort() {
         for (int p = PORT_BASE; p <= PORT_MAX; p++) {
@@ -97,16 +131,25 @@ public final class P2pSyncTunnel {
             String secret = o.optString("secret", "");
             if (secret.isEmpty()) secret = VnetTransport.DEFAULT_SECRET;
 
-            // 已 armed 且端口仍在占用表里 → 幂等返回
+            // 已 armed 且端口仍在占用表里 → **先验活**再幂等返回（2026-11-12 白屏实案：
+            // vnet 客户端连接死亡后 FORWARDS/PORT_OWNER 仍留旧口，上层拿到死口开分享页
+            // = WebView 白屏。探活失败 → 清掉该设备全部映射并走重建，绝不返回死口。）
             Integer hit = FORWARDS.get(key(targetDevice, targetPort));
             if (hit != null && PORT_OWNER.containsKey(hit)) {
-                lastDevice = targetDevice;
-                lastTargetPort = targetPort;
-                lastLocalPort = hit;
-                return new JSONObject()
-                        .put("ok", true).put("localPort", hit)
-                        .put("targetPort", targetPort).put("multi", true)
-                        .put("created", false).toString();
+                if (probeLocal(hit)) {
+                    lastDevice = targetDevice;
+                    lastTargetPort = targetPort;
+                    lastLocalPort = hit;
+                    return new JSONObject()
+                            .put("ok", true).put("localPort", hit)
+                            .put("targetPort", targetPort).put("multi", true)
+                            .put("created", false).toString();
+                }
+                android.util.Log.w("P2pDeviceTunnel",
+                        "stale forward :" + hit + " -> " + targetDevice + ":" + targetPort
+                                + " (listener dead) — evicting device maps, re-arming");
+                evictDevice(targetDevice);
+                // 不 return：落到下方重建路径
             }
 
             if (!VnetClient.ensureInit()) {

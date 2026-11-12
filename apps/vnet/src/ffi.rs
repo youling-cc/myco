@@ -26,7 +26,9 @@ struct ClientHandle {
 
 /// 多实例客户端注册表：peer_id → ClientHandle（同一进程可跑多条隧道）
 static CLIENTS: OnceLock<Mutex<std::collections::HashMap<u32, ClientHandle>>> = OnceLock::new();
-static SERVER: OnceLock<Mutex<Option<Arc<AtomicBool>>>> = OnceLock::new();
+/// server 槽：(run 标志, peer_id)。peer_id 必须随槽保存——stop 时要显式释放
+/// 注册占位，否则同进程再 start 恒 PEER_ID_IN_USE（rc=4，2026-11-12 ADB 卡实案）。
+static SERVER: OnceLock<Mutex<Option<(Arc<AtomicBool>, u32)>>> = OnceLock::new();
 
 /// 最近一次 start 失败的人读原因（2026-11-11 手机 rc=4 真案）。
 /// 嵌入方（Android）拿不到进程 stderr——eprintln 在 Android 默认进 /dev/null，
@@ -68,7 +70,7 @@ pub extern "C" fn vnet_last_error(buf: *mut c_char, buflen: c_int) -> c_int {
 fn clients_map() -> &'static Mutex<std::collections::HashMap<u32, ClientHandle>> {
     CLIENTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
-fn server_slot() -> &'static Mutex<Option<Arc<AtomicBool>>> {
+fn server_slot() -> &'static Mutex<Option<(Arc<AtomicBool>, u32)>> {
     SERVER.get_or_init(|| Mutex::new(None))
 }
 
@@ -343,10 +345,16 @@ pub extern "C" fn vnet_server_start(
         _ => return VNET_ERR_ARG,
     };
     let sec = if secret_s.is_empty() { None } else { Some(secret_s.as_str()) };
+    // 单 server 槽：已有实例在跑 → 明确拒绝（不静默替换，避免两条 server 抢同一 relay 映射）。
+    if server_slot().lock().unwrap().is_some() {
+        return VNET_ERR_RUNNING;
+    }
+    // 自愈：槽空但本 peer_id 仍被占位 = 上一个实例异常退出留下的泄漏，先释放再起。
+    crate::connection::release_server_registrations(peer_id);
     match crate::connection::start_server_with_secret(&relay_s, peer_id, target_port, sec) {
         Ok(run) => {
             let mut slot = server_slot().lock().unwrap();
-            *slot = Some(run);
+            *slot = Some((run, peer_id));
             VNET_OK
         }
         Err(e) => {
@@ -361,8 +369,11 @@ pub extern "C" fn vnet_server_start(
 pub extern "C" fn vnet_server_stop() -> c_int {
     let mut slot = server_slot().lock().unwrap();
     match slot.take() {
-        Some(run) => {
+        Some((run, peer_id)) => {
             run.store(false, Ordering::Relaxed);
+            // 显式释放注册占位（peer_id + target_port 表）——stop 不释放会让同进程
+            // 第二次 start 恒 rc=4（2026-11-12 真机 ADB 卡 stop→start 实案）。
+            crate::connection::release_server_registrations(peer_id);
             VNET_OK
         }
         None => VNET_ERR_NOT_RUNNING,
@@ -420,6 +431,18 @@ pub extern "C" fn vnet_has_local_identity() -> c_int {
     } else {
         0
     }
+}
+
+/// 显式 PSK-only 闸门模式（2026-11-12 ADB P0）。
+/// 手机 JNI 单口 server 没有 set_peer_resolver 入口——原实现 fail-closed 全拒
+/// （AUTH 验签需要 resolver 取公钥，无 resolver → UnknownKey → AUTH_REQUIRED）。
+/// 调此函数后：闸门降级为「PSK 网络准入 + AUTH 身份仅作 advisory（不验签）」。
+/// 安全语义：与身份功能加入前一致；有 resolver 的宿主不应调此函数。
+/// 返回 VNET_OK。
+#[no_mangle]
+pub extern "C" fn vnet_set_gate_psk_only() -> c_int {
+    crate::identity::set_gate_psk_only();
+    VNET_OK
 }
 
 /// 注入单个对端候选地址（presence 数据，逐个调用累积）。

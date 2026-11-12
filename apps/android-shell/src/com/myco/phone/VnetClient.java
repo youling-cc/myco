@@ -12,6 +12,16 @@ package com.myco.phone;
  */
 public final class VnetClient {
     static {
+        // 2026-11-12 RDP 缓解（vnet 域定案）：ARQ 重传预算耗尽会连坐关整条
+        // Connection（per-stream 预算是架构级 follow-up）。手机侧是 client 端——
+        // 发数据收不到 ACK 的正是我们，所以预算必须在本进程上调。libvnet 在
+        // 首次取预算时读 env，这里必须在任何 vnet_* 调用前设好（static 块即最早点）。
+        // 60s：瞬时抖动（<60s）不再杀流，真断连仍会显式失败（诚实）。
+        try {
+            if (System.getenv("VNET_RETRY_BUDGET_MS") == null) {
+                android.system.Os.setenv("VNET_RETRY_BUDGET_MS", "60000", false);
+            }
+        } catch (Throwable ignored) { }
         // 两个库都要装（APK 的 lib/arm64-v8a/ 下）：
         //  · libvnet.so     —— vnet 出的纯 C FFI（只导出 vnet_* C 符号）
         //  · libvnetjni.so  —— 宿主侧 JNI 垫片（导出 Java_com_myco_phone_VnetClient_*）
@@ -52,6 +62,10 @@ public final class VnetClient {
         String relay, int peerId, int targetPeerId, String secret);
     /** 给 multi 客户端追加转发（本地口 → 对端 target 口）。 */
     public static native int vnet_client_add_forward(int peerId, short localPort, short targetPort);
+    /** 2026-11-12（vnet e99e2158）：server 闸门降级为 PSK-only 网络准入（AUTH 变
+     * advisory 不验签）。给无 set_peer_resolver 的 JNI 宿主（AdbShareServer）用；
+     * 默认严格模式不变，仅显式 opt-in。 */
+    public static native int vnet_set_gate_psk_only();
 
     // ── 便捷方法 ──
 

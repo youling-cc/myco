@@ -17,7 +17,10 @@ import { fileURLToPath } from 'node:url'
 import { parseCryptoDid, didFromPublicKey } from './identity/did.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const INBOX_STORE = join(HERE, 'msg-inbox.json')
+/** 信箱落盘路径。2026-11-12 开源整改：支持 MSG_INBOX_PATH 覆盖——
+ *  单测指向临时目录，不再污染仓内工作树（运行时数据不入库）。默认仍为模块同目录。 */
+const INBOX_STORE =
+  process.env.MSG_INBOX_PATH || join(HERE, 'msg-inbox.json')
 
 /** kind 白名单（2026-10-07 好友去服务端化：好友握手三 kind 加回信箱——
  *  好友关系=双方本地档案+签名握手，服务器只中转不再裁决（friends.mjs 已删，

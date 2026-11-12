@@ -6,20 +6,19 @@
  *   · 手机：`window.__mycoVnet.add` 起本机固定口 → 壳桥拉客户端：
  *       RDP  → `MycoShell.openRdp`（没有桥就**复制 `127.0.0.1:<localPort>`** 并提示
  *              "请在你的远程桌面 App 里连接"——手机没有 mstsc）；
- *       DSH  → `MycoShell.openInBrowser(env.entryUrl || http://127.0.0.1:<localPort>/)`：
- *              **入口优先**（根路径只有已有分享 cookie 时才给内容，否则 401/空列表，
- *              见 `task-env.ts` 的 `entryUrlOf`）；非法 entryUrl 回落根路径。
+ *       DSH  → 分享入口（/gw/… 或 env.shareId）**只走设备隧道 VNETP 直入**
+ *              （15200 DID 认证口，免 mt；2026-11-12 取票/mt 链已删）；无 shareId
+ *              的普通 http env 照旧 `entryUrlOf` 白名单 → 根路径直开。
  *
  * 为什么列表行也要走这里（真机 bug）：任务列表行原来只认「分享卡坐标」
- * （shareId + sourceDevice + sourceAccount）→ `openTaskShare`（取票 → 隧道 → 分享页）。
- * 带 env 的卡走那条路会落到 `/gw/<id>/app/`，页面报
- * `no valid share cookie (open the share entry first)`。**有 env 的卡，入口就是环境本身**。
+ * （shareId + sourceDevice + sourceAccount）→ `openTaskShare`。带 env 的卡
+ * 走那条路会落到 `/gw/<id>/app/`，页面报 `no valid share cookie (open the
+ * share entry first)`。**有 env 的卡，入口就是环境本身**。
  *
  * 入口纪律（R28）：只认卡上**显式** `env[]`（动作里的 env 优先）；
  * 不按 `sourceDevice` 派生（老卡的行为保持不变）。
  */
-import { shareIdFromGw, withClientAssertFor } from './client-assert'
-import { currentIdentity, ensurePlainIdentity, type PhoneIdentity } from './identity'
+import { shareIdFromGw } from './client-assert'
 import { INAPP_FOCUS_GUARD_JS } from './inapp-focus-guard'
 
 import {
@@ -112,7 +111,7 @@ export function actionLabelOf(action: TaskCardAction | null | undefined, envs: T
   return env ? envOpenLabel(env) : '打开'
 }
 
-/** 打开路由：env 卡走环境；其它仍交给原来的 `openTaskShare`（分享入口/取票）。 */
+/** 打开路由：env 卡走环境；其它仍交给原来的 `openTaskShare`（分享入口/VNETP 直入）。 */
 export type PhoneOpenRoute =
   | { via: 'env'; env: TaskEnv; envs: TaskEnv[]; label: string }
   | { via: 'share'; label: string }
@@ -138,10 +137,12 @@ export interface EnvOpenDeps {
   hasRdp?: () => boolean
   openRdp?: (addr: string, device?: string) => boolean
   openUrl?: (url: string) => boolean
-  /** 测试注入：当前身份（生产用 identity.ts 的内存缓存）。 */
-  identity?: () => PhoneIdentity | null
-  /** 测试注入：身份未缓存时的异步加载（生产 ensurePlainIdentity）。 */
-  ensureIdentity?: () => Promise<PhoneIdentity | null>
+  /**
+   * 2026-11-12：设备隧道 VNETP 入口口（15200）的 ensure（生产 =
+   * dsh-open-runtime.ensureShareEntryForwardFor）。返回本地口 >0 = 免 mt 的
+   * 隧道直入；null/未提供 = 分享入口不可用（如实 blocked，不回落 mt）。
+   */
+  ensureEntryForward?: (device: string) => Promise<number | null>
 }
 
 export interface EnvOpenOutcome {
@@ -171,47 +172,85 @@ interface EnvEntryResolution {
 /**
  * 解析 DSH/HTTP 的入口 URL（**主路径与「↗ 浏览器」唯一的一份**）。
  *
- * 规则与 `openTaskEnv` 原实现逐条一致：
- *   · 卡上合法 `entryUrl` 优先（带 mt 的 `/gw/<id>/`，网关 302 种 cookie 再进应用），
- *     非法入口绝不打开，回落根路径并如实说明；
- *   · 分享入口（`/gw/…`）必须带**本机客户端设备断言**；身份没就绪 → 阻断并给人话，
- *     绝不裸开 owner 入口（否则网关把手机发言署名成源 PC，2026-10-28 真案）。
+ * 2026-11-12 起（取票/mt 链整链删除）只有两种合法形态：
+ *   · **分享入口（`/gw/…` 或 env.shareId）→ VNETP 直入是唯一路径**：ensure 设备
+ *     隧道 15200（VNETP/1 DID 认证口，DID 随隧道流带上，免 mt/免客户端断言）；
+ *     拿不到口 → 如实 blockedNote（连不上源设备），**绝不回落卡上的 mt entryUrl**
+ *     （mt 会过期、13911 裸网关无凭证必拒——真机 0.3.315 定案）。
+ *   · **无 shareId 的普通 http env → 照旧**：`entryUrlOf` 白名单校验卡上入口
+ *     （只认 `http://127.0.0.1:<localPort>/…`），否则 `browserUrlOf` 根路径直开。
  *
  * 抽出来的目的：同一张卡点「打开」和点「↗ 浏览器」必须拿到**逐字相同**的 URL
- * （单测钉住），不能一边签名一边不签、一边带入口一边落根路径。
+ * （单测钉住），不能一边走隧道一边落根路径。
  */
+/**
+ * 设备隧道 VNETP 入口的 ensure（2026-11-12）：
+ * deps 注入优先（单测）；真机 WebView 惰性加载装配层；node/无壳 → null（如实 blocked）。
+ */
+function resolveEntryEnsure(d: EnvOpenDeps): ((device: string) => Promise<number | null>) | null {
+  if (d.ensureEntryForward) return d.ensureEntryForward
+  const shellLike = (globalThis as unknown as { window?: { MycoShell?: unknown } }).window?.MycoShell
+  if (!shellLike) return null
+  return async (device: string): Promise<number | null> => {
+    try {
+      const m = await import('./dsh-open-runtime')
+      return await m.ensureShareEntryForwardFor(device)
+    } catch {
+      return null
+    }
+  }
+}
+
+/** dsh/http 是否具备 VNETP 直入条件（有分享入口 + 目标设备）。 */
+function vnetpEligible(env: TaskEnv): string {
+  const envAny = env as unknown as { shareId?: string }
+  return shareIdFromGw((env.entryUrl || '').trim()) || (envAny.shareId || '').trim()
+}
+
 async function resolveEnvEntryUrl(env: TaskEnv, d: EnvOpenDeps): Promise<EnvEntryResolution> {
+  return resolveEnvEntryUrlWith(env, d, 0)
+}
+
+/**
+ * `vnetpPort > 0`（openTaskEnv 已确保的 15200 本地口）时免 ensure 直接用；
+ * =0 时自行 ensure（「↗ 浏览器」等旁路调用形态）。
+ */
+async function resolveEnvEntryUrlWith(env: TaskEnv, d: EnvOpenDeps, vnetpPort: number): Promise<EnvEntryResolution> {
+  // ★ 分享入口（/gw/… 或 env.shareId）：VNETP 直入是**唯一**路径（2026-11-12 起）。
+  //   拿不到口 → 如实 blocked，绝不回落卡上带 mt 的 entryUrl。
+  const sid = vnetpEligible(env)
+  if (sid) {
+    if (!env.device) {
+      return { url: '', fallbackNote: '', blockedNote: '卡上缺少目标设备信息，请让对方重新分享' }
+    }
+    let port: number | null = null
+    if (vnetpPort > 0) {
+      port = vnetpPort
+    } else {
+      const ensure = resolveEntryEnsure(d)
+      if (ensure) {
+        try {
+          port = await ensure(env.device)
+        } catch {
+          port = null
+        }
+      }
+    }
+    if (port && port > 0) {
+      return { url: `http://127.0.0.1:${port}/gw/${sid}/`, fallbackNote: '', blockedNote: '' }
+    }
+    return { url: '', fallbackNote: '', blockedNote: '连不上源设备（设备隧道不可用），请稍后再试' }
+  }
+  // 无 shareId 的普通 http env：照旧（entryUrl 白名单校验 → 根路径直开）。
   const declared = (env.entryUrl || '').trim()
   const entry = entryUrlOf(env)
   const fallbackNote = declared && !entry ? '（卡上的入口不可用，已改用备用入口）' : ''
-  const unsignedUrl = entry || browserUrlOf(env)
-  if (!unsignedUrl) {
+  const url = entry || browserUrlOf(env)
+  if (!url) {
     // 防御分支：未知 kind / 端口非法时没有可交给浏览器的地址——绝不打开/复制空串。
     return { url: '', fallbackNote: '', blockedNote: '这张卡没有可用的入口地址，请让对方重新分享' }
   }
-  if (!shareIdFromGw(unsignedUrl)) {
-    return { url: unsignedUrl, fallbackNote, blockedNote: '' }
-  }
-  // 2026-10-23：分享入口带客户端设备断言 → 网关署名显示「实际打字设备」（手机·DD9F）
-  const readIdentity = d.identity ?? currentIdentity
-  let id: PhoneIdentity | null = readIdentity()
-  if (!id) {
-    const loadIdentity = d.ensureIdentity ?? ensurePlainIdentity
-    try {
-      id = await loadIdentity()
-    } catch {
-      id = null
-    }
-  }
-  const signedUrl = withClientAssertFor(unsignedUrl, id)
-  if (!id || signedUrl === unsignedUrl) {
-    return {
-      url: '',
-      fallbackNote,
-      blockedNote: '本机身份还没就绪，请先解锁或登录后重试（已避免署名成源设备）',
-    }
-  }
-  return { url: signedUrl, fallbackNote, blockedNote: '' }
+  return { url, fallbackNote, blockedNote: '' }
 }
 
 /**
@@ -295,23 +334,51 @@ export async function openTaskEnv(
 
   const localPort = phonePort > 0 ? phonePort : localPortOf(env)
   const port = targetPortOf(env)
-  let added: { ok?: boolean; err?: string } | undefined
-  try {
-    added = vnet.add({ localPort, device: env.device, port, label: env.label || KIND_LABEL[env.kind] })
-  } catch (e) {
-    return {
-      state: 'idle',
-      note: `连接通道建立失败：${cleanTechText(e instanceof Error ? e.message : String(e))}`,
-      address,
-      started: false,
+
+  // ★ 2026-11-12 VNETP 直入（真机 03:00 真案）：dsh/http 有分享入口时**只走**
+  // 15200（VNETP/1 DID 认证口）。拿不到口 → 如实报「连不上源设备」提前返回，
+  // 不再建 13911 通道（这条路径上它从头到尾用不到），**绝不回落卡上 mt entryUrl**。
+  let vnetpPort = 0
+  const gwSid = (env.kind === 'dsh' || env.kind === 'http') && env.device ? vnetpEligible(env) : ''
+  if (gwSid) {
+    const ensureEntry = resolveEntryEnsure(d)
+    if (ensureEntry) {
+      try {
+        const p = await ensureEntry(env.device)
+        if (p && p > 0) vnetpPort = p
+      } catch {
+        /* 拿不到口 → 下面的如实 blocked */
+      }
+    }
+    if (vnetpPort === 0) {
+      return {
+        state: 'idle',
+        note: '连不上源设备（设备隧道不可用），请稍后再试',
+        address,
+        started: false,
+      }
     }
   }
-  if (added && added.ok === false) {
-    return {
-      state: 'idle',
-      note: `连接通道建立失败：${cleanTechText(added.err || '请稍后再试')}`,
-      address,
-      started: false,
+
+  let added: { ok?: boolean; err?: string } | undefined
+  if (vnetpPort === 0) {
+    try {
+      added = vnet.add({ localPort, device: env.device, port, label: env.label || KIND_LABEL[env.kind] })
+    } catch (e) {
+      return {
+        state: 'idle',
+        note: `连接通道建立失败：${cleanTechText(e instanceof Error ? e.message : String(e))}`,
+        address,
+        started: false,
+      }
+    }
+    if (added && added.ok === false) {
+      return {
+        state: 'idle',
+        note: `连接通道建立失败：${cleanTechText(added.err || '请稍后再试')}`,
+        address,
+        started: false,
+      }
     }
   }
 
@@ -321,7 +388,8 @@ export async function openTaskEnv(
   // 修法：起客户端**之前**对本地口做一次 HTTP 探测；不通就 remove→re-add 重建隧道，
   // 重建后再探一次；两次都不通才报错——消灭"打开一个空页给用户"。
   // 前提：桥有 remove 才探测（无 remove = 无法重建，探测了也白探；也兼容旧测试）。
-  if ((env.kind === 'dsh' || env.kind === 'http') && typeof vnet.remove === 'function') {
+  // 2026-11-12：VNETP 直入已就绪（vnetpPort>0）时跳过——探测的是用不到的 13911 口。
+  if ((env.kind === 'dsh' || env.kind === 'http') && vnetpPort === 0 && typeof vnet.remove === 'function') {
     opts.onBuilding?.('正在检查连接…')
     let alive = await probeHttpPort(localPort, 3500)
     if (!alive) {
@@ -411,13 +479,10 @@ export async function openTaskEnv(
     }
   }
   if (env.kind === 'dsh' || env.kind === 'http') {
-    // 入口优先（2026-10-23 现场修复）：根路径无 cookie 必 401、会话列表空白；
-    // 卡上的 entryUrl 是带 mt 的 `/gw/<id>/`（网关 302 种 cookie 再进应用）。
-    // 非法 entryUrl **绝不打开**（卡可来自别处），回落根路径并如实说明。
-    //
-    // 2026-10-31：URL 解析/设备断言抽到 resolveEnvEntryUrl（与「↗ 浏览器」共用，
-    // 两条路径对同一张卡必须拿到逐字相同的 URL）。
-    const resolved = await resolveEnvEntryUrl(env, d)
+    // 入口 URL 解析（2026-11-12 起与「↗ 浏览器」共用这一份）：分享入口走 VNETP
+    // 直入（免 mt），普通 http env 照旧 entryUrl 白名单 → 根路径。两条路径对
+    // 同一张卡必须拿到逐字相同的 URL。
+    const resolved = await resolveEnvEntryUrlWith(env, d, vnetpPort)
     if (!resolved.url) {
       return { state: 'idle', note: resolved.blockedNote, address, started: false }
     }
@@ -526,7 +591,9 @@ export async function openTaskEnvExternal(
   opts.onBuilding?.('正在准备浏览器打开…')
 
   // 固定口（隧道）：系统浏览器不经应用内壳，必须自己保证地址活着。
-  if (vnet?.add) {
+  // 分享入口（gw）除外——URL 在设备隧道 15200 的本地口上，ensure 时已建好，
+  // 13911 固定口在这条路径上用不到（2026-11-12 起不白建）。
+  if (vnet?.add && !vnetpEligible(env)) {
     try {
       vnet.add({
         localPort: localPortOf(env),

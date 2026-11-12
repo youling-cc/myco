@@ -78,7 +78,7 @@ export function noteRelayFail(f: RelayFail): void {
   if (!last) last = f
 }
 
-/** 一趟取票开始时清空（`openTaskShareOnce` 调）。 */
+/** 清空留痕（测试/取证用；生产由 relay-fail.test 锁行为）。 */
 export function clearRelayFail(): void {
   last = null
 }

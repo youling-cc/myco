@@ -65,6 +65,65 @@ fn multi_server_peer_id_for(device_did: &str) -> u32 {
     hash32(&format!("vnet-peer{device_did}:server:multi-forward-v1"))
 }
 
+// ── 客户端拨号口径：multi 还是 per-port（2026-11-12 手机 5555 真案）──────────────
+//
+// 事故：PC 对手机 `POST /api/vnet/forward {port:5555}` 返回 ok，日志
+// `[vnet-mf] …:5555 → :15556（sharedConnection=true）`，但 adb connect 15556 恒 offline；
+// 同时 `[A_lookup_peer] peer=2270166732 no_answer`，而 2270166732 =
+// `hash32("vnet-peer{did}:server:multi-forward-v1")` —— PC 拨了**手机从未注册**的 multi peer。
+//
+// 根因三层（缺一不会发生）：
+// ① `start_vnet_forward_selected` 只看**进程级** `MYCO_VNET_MULTI_FORWARD`，
+//    `target_port` 仅进 ForwardSpec，**不参与 peer 选择**；
+// ② 本该兜底的 `mf_caps_check(remote_net_status)` 在 `version==0`（还没收到对端 NetStatus
+//    公告）时直接放行（legacy compat），而手机 JNI 是单口 server、**从不公告** ⇒ 检查恒跳过；
+// ③ peer id 必须在建 Connection 之前决定 ⇒ "先连上再问 caps"这条路走不通，只能靠设备类判。
+//
+// 修法（最小、确定性、零额外延迟）：**multi 只给能跑 multi 的设备类**。
+// 手机/平板（JNI 单口 server；契约 ADB-SHARE-TASK.md「PC 按 `:server:<port>` 找手机」）
+// 恒走 per-port；其余维持现行为（未知/拿不到 kind 也维持 multi，不扩大改动面）。
+
+/// 设备 kind 是否属于"只有单口 vnet server"的移动端（JNI，无 multi FFI）。
+pub(crate) fn is_mobile_only_kind(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "phone" | "tablet" | "android" | "ios"
+    )
+}
+
+/// **端口语义兜底**：契约上只有手机能当这些端口的单口 server。
+///
+/// 为什么必须有（2026-11-12 复核）：`cached_device_kind` 是 presence 缓存，**冷缓存**
+/// （进程刚起、presence 还没拉到）返回 `None` ⇒ kind 未知 ⇒ 退回 multi ⇒ 手机上 5555
+/// 的黑洞原样复现。出包重启后立刻验收必然撞上这个窗口。5555 是当前唯一"对端必是单口
+/// server"的口（ADB，见 ADB-SHARE-TASK.md），按端口语义兜底不会误伤 PC↔PC。
+const SINGLE_PORT_ONLY_TARGET_PORTS: &[u16] = &[5555];
+
+/// 该 target 端口是否"对端一定是单口 server"（与 kind 无关的硬语义）。
+pub(crate) fn is_single_port_only_target(port: u16) -> bool {
+    SINGLE_PORT_ONLY_TARGET_PORTS.contains(&port)
+}
+
+/// peer 选择口径（纯函数，单测直击）：`true` = 拨 multi，`false` = 拨 per-port。
+///
+/// 三条同时成立才走 multi：① 全局开关开；② 设备类不是移动端单口；③ 端口语义不是单口。
+pub(crate) fn forward_use_multi(multi_enabled: bool, mobile_only: bool, target_port: u16) -> bool {
+    multi_enabled && !mobile_only && !is_single_port_only_target(target_port)
+}
+
+/// 按口径算该拨的 peer id（纯函数，单测直击）。
+///
+/// 这是唯一一处把「设备类 × 全局开关 × 端口语义」翻译成 peer id 的地方——回归测试对它
+/// 锁死公式，避免再次出现"5555 也走 multi"的走样。
+pub(crate) fn forward_peer_id_for(device: &str, port: u16, multi_enabled: bool, kind: Option<&str>) -> u32 {
+    let mobile_only = kind.map(is_mobile_only_kind).unwrap_or(false);
+    if forward_use_multi(multi_enabled, mobile_only, port) {
+        multi_server_peer_id_for(device)
+    } else {
+        server_peer_id_for(device, port)
+    }
+}
+
 #[derive(Clone)]
 struct SharedVnetConnection {
     conn: Arc<crate::vnet::Connection>,
@@ -702,9 +761,24 @@ fn start_vnet_forward_selected(entry: VnetForwardEntry) -> Result<u16, StartForw
     if let Err(e) = ensure_peer_identity() {
         return Err(StartForwardError::Other(e));
     }
-    if multi_forward_enabled() {
+    // 2026-11-12 手机 5555 真案：multi 只给能跑 multi 的设备类；手机/平板（JNI 单口 server）
+    // 恒走 per-port（`:server:<port>`）。kind 取同步缓存（presence 刷新时落表），
+    // **冷缓存/未知时还有端口语义兜底**（5555 恒 per-port），否则重启后第一次验收又撞黑洞。
+    let kind = crate::p2p_client::cached_device_kind(&entry.target_device_did);
+    let mobile_only = kind.as_deref().map(is_mobile_only_kind).unwrap_or(false);
+    let port_only = is_single_port_only_target(entry.target_port);
+    if forward_use_multi(multi_forward_enabled(), mobile_only, entry.target_port) {
         start_vnet_forward_multi(entry)
     } else {
+        if mobile_only || port_only {
+            crate::p2p_tunnel::elog!(
+                "[vnet-mf] multi 不适用（kind={} single-port-port={}）→ 改用 per-port peer :server:{}：…{}",
+                kind.as_deref().unwrap_or("<unknown>"),
+                port_only,
+                entry.target_port,
+                &entry.target_device_did[entry.target_device_did.len().saturating_sub(12)..]
+            );
+        }
         start_vnet_forward_inner(entry)
     }
 }
@@ -908,7 +982,9 @@ fn start_vnet_forward_multi(entry: VnetForwardEntry) -> Result<u16, StartForward
                 })?,
             );
             conn.enable_multi_forward();
-            conn.start_multi_forward().map_err(|e| {
+            // 2026-11-12 vendored 同步改名：start_multi_forward → start_client_multi
+            // （apps/vnet 356a63db 的命名，语义一致：只起后台线程不建 legacy listener）。
+            conn.start_client_multi().map_err(|e| {
                 conn.stop();
                 StartForwardError::Other(format!("vnet multi-forward 后台启动失败：{e}"))
             })?;
@@ -1486,7 +1562,49 @@ pub fn start_vnet_server(target_port: u16) -> Result<(), String> {
     crate::p2p_tunnel::elog!(
         "[vnet-server] :{target_port} 已启动（peer_id={peer_id:#010x}, relay={relay_display}, multiForward={multi}；multi 的其它 target 由 VNET_TARGET_PORTS 白名单显式授权）"
     );
+    // 2026-11-12 真案（手机→PC 3389 黑洞）沉淀：把 server 侧**实际生效的 target 白名单**
+    // 一行打进 stderr（带时间戳）。事故当天排查走了弯路——判定逻辑
+    // （`vnet/connection.rs::mf_target_allowed` = `--target-port` ∪ `VNET_TARGET_PORTS`，
+    // 启动时 OnceLock 读一次）与**每次拨号明细**（`[srv] STREAM_OPEN … -> 127.0.0.1:<target> OK/FAIL`）
+    // 都只走 `tracelog!`→`println!`（**stdout**：`%TEMP%\myco-stdout.log`），grep stderr 一片空，
+    // 于是被误读成"server 从未拨号"。这一行 + 下面这句指路，把这个案子压到一次 grep。
+    crate::p2p_tunnel::elog!(
+        "[vnet-server] target 白名单（multi-forward）：{}；拨号明细在 stdout 的 `[srv] STREAM_OPEN … -> 127.0.0.1:<target> OK/FAIL` 与 `MF_TARGET_DENIED`（Windows: %TEMP%\\myco-stdout.log）",
+        multi_forward_targets_summary(target_port, std::env::var("VNET_TARGET_PORTS").ok().as_deref())
+    );
     Ok(())
+}
+
+/// multi-forward **实际生效**的 target 白名单摘要（纯函数，单测直击）。
+///
+/// 口径与 `vnet/connection.rs::mf_target_allowed` 一致：
+/// `default_port`（本 server 的 `--target-port`）∪ `VNET_TARGET_PORTS`（逗号分隔，启动时读一次）。
+/// 唯一有意的差异：**0 被剔除**——它不是合法 target（拨 `127.0.0.1:0` 必失败），
+/// 摘要里列进 `allowed` 只会误导读日志的人（vnet 侧解析不过滤 0，但永远拨不通）。
+/// 目的：一行回答"3389 到底允不允许"，不必再去翻环境变量/加打印。
+pub(crate) fn multi_forward_targets_summary(default_target: u16, env_raw: Option<&str>) -> String {
+    let mut extra: Vec<u16> = env_raw
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse::<u16>().ok())
+                .filter(|p| *p != 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    extra.sort_unstable();
+    extra.dedup();
+    let env_disp = match env_raw.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => "<unset>".to_string(),
+    };
+    let mut allowed = extra.clone();
+    if default_target != 0 && !allowed.contains(&default_target) {
+        allowed.push(default_target);
+        allowed.sort_unstable();
+    }
+    format!(
+        "default={default_target} VNET_TARGET_PORTS={env_disp} extra={extra:?} allowed={allowed:?}"
+    )
 }
 
 /// 停止全部 vnet 服务端
@@ -2255,6 +2373,128 @@ mod startup_grace_tests {
         let a = process_uptime_ms();
         let b = process_uptime_ms();
         assert!(b >= a, "uptime 必须单调：{a} → {b}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2026-11-12 手机 5555 真案：客户端拨号口径（multi vs per-port）
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 现场 DID（手机）与两个公式值必须对得上——回归锁死「拨错 peer id」这个走样点。
+    #[test]
+    fn phone_5555_dials_per_port_peer_not_multi() {
+        let phone = "did:myco:z6MknpnC";
+        // 公式自检：multi 与 per-port 是两个不同 peer id（混用即黑洞）
+        assert_ne!(server_peer_id_for(phone, 5555), multi_server_peer_id_for(phone));
+        // 手机（单口 server）→ 必须 per-port
+        for kind in ["phone", "tablet", "android", "ios", " Phone "] {
+            assert_eq!(
+                forward_peer_id_for(phone, 5555, true, Some(kind)),
+                server_peer_id_for(phone, 5555),
+                "kind={kind} 必须拨 :server:5555"
+            );
+        }
+        // **冷缓存兜底**（2026-11-12 复核）：kind 未知 + 5555 → 仍必须 per-port，
+        // 否则进程刚起、presence 还没拉到时第一次验收又撞黑洞。
+        assert_eq!(
+            forward_peer_id_for(phone, 5555, true, None),
+            server_peer_id_for(phone, 5555),
+            "kind 未知 + 5555（单口语义）必须 per-port"
+        );
+        // 非移动端 / 未知 kind 且非单口端口 → 维持现行为（multi）
+        assert_eq!(
+            forward_peer_id_for(phone, 13911, true, Some("pc")),
+            multi_server_peer_id_for(phone),
+            "pc 维持 multi（不改变 PC↔PC 现状）"
+        );
+        assert_eq!(
+            forward_peer_id_for(phone, 13911, true, None),
+            multi_server_peer_id_for(phone),
+            "拿不到 kind + 非单口端口 = 未知 → 维持现行为"
+        );
+        // multi 总开关关掉时，任何设备都 per-port
+        for kind in [Some("pc"), Some("phone"), None] {
+            assert_eq!(
+                forward_peer_id_for(phone, 13911, false, kind),
+                server_peer_id_for(phone, 13911),
+                "MYCO_VNET_MULTI_FORWARD 未开 → per-port（kind={kind:?}）"
+            );
+        }
+    }
+
+    /// 非 5555 的目标（PC 侧 15200/13911/9100 等）行为不变：kind=pc/未知 仍走 multi。
+    #[test]
+    fn pc_targets_keep_multi_peer_selection() {
+        let pc = "did:myco:z6MkuyFr";
+        for port in [15200u16, 13911, 9100, 3389] {
+            assert_eq!(
+                forward_peer_id_for(pc, port, true, Some("pc")),
+                multi_server_peer_id_for(pc),
+                "PC 目标 :{port} 维持 multi"
+            );
+            // kind 未知也维持 multi（老客户端不报 kind），但这些端口不是"单口语义"
+            assert_eq!(forward_peer_id_for(pc, port, true, None), multi_server_peer_id_for(pc));
+        }
+    }
+
+    /// kind 分类边界 + 端口语义 + 口径函数三维。
+    #[test]
+    fn mobile_only_kind_classification() {
+        for k in ["phone", "PHONE", "tablet", "android", "ios", " phone "] {
+            assert!(is_mobile_only_kind(k), "{k} 应判为移动端单口");
+        }
+        for k in ["pc", "desktop", "laptop", "", "unknown", "server"] {
+            assert!(!is_mobile_only_kind(k), "{k} 不应判为移动端单口");
+        }
+        // 端口语义：目前只有 ADB 5555 是"对端必单口"
+        assert!(is_single_port_only_target(5555));
+        for p in [15200u16, 13911, 9100, 3389, 22, 5037, 3103] {
+            assert!(!is_single_port_only_target(p), "{p} 不是单口语义端口");
+        }
+        // 口径函数：multi 开关 × 设备类 × 端口语义
+        assert!(forward_use_multi(true, false, 13911));
+        assert!(!forward_use_multi(true, true, 13911), "移动端恒 per-port");
+        assert!(!forward_use_multi(true, false, 5555), "5555 恒 per-port（冷缓存兜底）");
+        assert!(!forward_use_multi(false, false, 13911));
+        assert!(!forward_use_multi(false, true, 5555));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2026-11-12 真案（手机→PC 3389 黑洞）：server 侧 target 白名单摘要
+    //
+    // 事故里"3389 不拨"的第一层判据就是"它在不在 allowed 里"。口径必须与
+    // `vnet/connection.rs::mf_target_allowed`（default ∪ VNET_TARGET_PORTS）逐字一致，
+    // 否则这行日志会把人带偏——比没有日志更糟。
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 现场环境：`VNET_TARGET_PORTS=15200,13911,3389,9100`，server 的 default=22。
+    #[test]
+    fn multi_forward_summary_lists_production_whitelist_including_3389() {
+        let s = multi_forward_targets_summary(22, Some("15200,13911,3389,9100"));
+        assert!(s.contains("default=22"), "{s}");
+        assert!(s.contains("VNET_TARGET_PORTS=15200,13911,3389,9100"), "原样透出：{s}");
+        assert!(s.contains("extra=[3389, 9100, 13911, 15200]"), "解析+排序+去重：{s}");
+        assert!(s.contains("allowed=[22, 3389, 9100, 13911, 15200]"), "default 并入且去重：{s}");
+        // 关键断言：3389 必须在 allowed 里 —— 若这行显示不在，才轮到"白名单拒"这条线索
+        assert!(s.contains("3389"), "3389 必须出现在摘要里：{s}");
+    }
+
+    /// 未设/空/含垃圾项：不能把"没配"误报成"配了"。
+    #[test]
+    fn multi_forward_summary_handles_unset_and_malformed_env() {
+        assert!(
+            multi_forward_targets_summary(9100, None).contains("VNET_TARGET_PORTS=<unset>"),
+            "未设必须显式标 <unset>"
+        );
+        let empty = multi_forward_targets_summary(9100, Some("   "));
+        assert!(empty.contains("extra=[]"), "{empty}");
+        assert!(empty.contains("allowed=[9100]"), "只有 default：{empty}");
+        // 垃圾项（非数字/0/超范围）一律丢弃，不能变成"允许 0 号端口"
+        let junk = multi_forward_targets_summary(22, Some("abc, 3389 ,,0,70000,13911"));
+        assert!(junk.contains("extra=[3389, 13911]"), "只留合法项：{junk}");
+        assert!(!junk.contains("[0"), "0 不得入白名单：{junk}");
+        // default 已在 extra 里 → 不重复
+        let dup = multi_forward_targets_summary(3389, Some("3389"));
+        assert!(dup.contains("allowed=[3389]"), "去重：{dup}");
     }
 }
 

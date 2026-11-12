@@ -2,9 +2,14 @@
 // 全真签名(ed25519 via WebCrypto),零 mock:签发→推注册表→查询 / 续签请求→收件箱→投递→取件。
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { mkdtempSync } from 'node:fs'
 
 // 被测路由处理函数直接调用(send 捕获)。文件级副作用:revocations.json 会写真实文件——
-// 测试前重定向到临时路径做不到(模块内常量),故用专用测试 youling 命名空间,断言后不清理(幂等合并)。
+// 2026-11-12 开源整改:模块支持 REVOCATIONS_PATH 覆盖,单测改指临时目录,
+// 不再污染仓内工作树(运行时数据不入库),每轮独立文件互不干扰。
+process.env.REVOCATIONS_PATH = join(mkdtempSync(join(tmpdir(), 'myco-rev-test-')), 'revocations.json')
 const { DELEGATION_ROUTES, handleDelegationPost, handleDelegationGet } = await import('./delegation.mjs')
 const { generateKeyPair, sign } = await import('./identity/crypto.mjs')
 const { didFromPublicKey, base58Encode } = await import('./identity/did.mjs')

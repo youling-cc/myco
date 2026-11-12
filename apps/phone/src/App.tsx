@@ -12,6 +12,7 @@ import { TaskList } from './components/TaskList'
 // 第83轮：任务卡事件 toast（App 根级——任意页面/Tab 下任务卡到达与完成都有通知；
 // 内部走 ensureBackgroundPoll，顺带修掉"停在任务页时信箱无人拉"的到达盲区）
 import { PeerTaskToasts, FriendsPanel } from './components/FriendsPanel'
+import { AdbShareCard } from './components/AdbShareCard'
 import { ChatView } from './components/ChatView'
 import { NodeRoamer, loadNodes, saveNodes, type NodeEntry } from './components/NodeRoamer'
 
@@ -407,6 +408,12 @@ export function App() {
           导致智能体页空白（chat/presence 数据其实都在）。放宽为 view === 'agents' 即渲染。 */}
       {view === 'agents' && (
         <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+          {/* 2026-11-12：「ADB 调试」卡提升到主页（用户口径：任务最终收敛 DSH/RDP/ADB
+              三张）。原挂点在 TaskList（transport 配对模式才渲染），独立模式下不可达
+              ——真机 03:20 实测点不开。零参自包含组件，两处挂载互不影响（状态各自轮询）。 */}
+          <div style={{ padding: '0 10px' }}>
+            <AdbShareCard />
+          </div>
           {/* 设备区（2026-10-09 与 PC 对齐——连接态智能体页此前只有 FriendsPanel，无设备区；
               PC 是智能体 tab 顶部常驻「我的智能体」卡。补同款（只读列表：本机+名册+在线）。 */}
           <DevicesSection />

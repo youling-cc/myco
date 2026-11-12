@@ -18,7 +18,10 @@ function b64ToBytes(b64) {
 }
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const REV_STORE = join(HERE, 'revocations.json')
+/** 吊销注册表落盘路径。2026-11-12 开源整改：支持 REVOCATIONS_PATH 覆盖——
+ *  单测指向临时目录，不再污染仓内工作树（运行时数据不入库）。默认仍为模块同目录。 */
+const REV_STORE =
+  process.env.REVOCATIONS_PATH || join(HERE, 'revocations.json')
 
 /** accountDid → revokedPubkeys[](注册表落盘,服务重启保留) */
 function loadRevocations() {
