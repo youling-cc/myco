@@ -43,7 +43,7 @@ tools/append-vectors.mjs  开发机专用（向量生成器）
 | 本仓（内部） | 开源仓（中性化） |
 |---|---|
 | `D:/Projects/AOP/<worktree>` | `repo-a/labs` |
-| `Users\jason` | `Users\you` |
+| `Users\<user>` | `Users\you` |
 | （另有 2 处同类路径/用户名） | 同上风格 |
 
 **规则**：从开源仓回流代码时，**忽略这 4 处 diff**，不要把中性化路径拉回内部仓（否则本机测试/真 host 直接失效）。
