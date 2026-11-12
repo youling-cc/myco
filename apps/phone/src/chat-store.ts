@@ -2467,15 +2467,21 @@ export async function shareTask(conv: string, card: { title: string; desc?: stri
   if (card.expiresDays && card.expiresDays > 0) payload.expiresAt = Date.now() + card.expiresDays * 86_400_000
   if (Array.isArray(card.env) && card.env.length > 0) payload.env = card.env
   if (card.caps !== undefined) payload.caps = card.caps
-  const targets = conv.startsWith('grp-')
+  const isGroupConv = conv.startsWith('grp-')
+  const targets = isGroupConv
     ? (listGroups().find((g) => g.id === conv)?.members ?? []).filter((m) => !accountDidEq(m, my))
     : [conv]
-  if (conv.startsWith('grp-')) {
+  if (isGroupConv) {
     const g = listGroups().find((x) => x.id === conv)
     if (!g) throw new Error('群不存在（可能已被清理，重进好友分区刷新）')
     if (groupTerminalStatus(g)) throw new Error('群已解散或你已被移出，无法分享任务卡') // 批二：终态只读
   }
-  if (!targets.length) throw new Error('没有可分享的成员')
+  // 单聊必须有目标；**群分享允许"只剩我自己"**：一人多设备（PC+手机+笔记本同一
+  // 账号）是常态，设备群 members 里只有自己账号，targets 过滤掉自己就空了——
+  // 旧守卫直接抛「没有可分享的成员」，导致手机永远建不出 ADB/RDP 这类"给别人用
+  // 我自己设备"的卡（2026-11-12 真机实测）。群路径本身按 members 端侧扇出，
+  // 含自己其它设备，不需要非己成员。
+  if (!isGroupConv && !targets.length) throw new Error('没有可分享的成员')
   // 批二：群 conv → 群会话一条 task-share（to=grp-*，p2pSendRaw 按 members 端侧扇出，
   // 含自己其他设备）——接收端 ingest 落群会话（全员可见同一张卡），不再逐成员单发。
   // 单聊分享行为不变（逐目标直推，失败自动入离线队列）。
@@ -2485,6 +2491,25 @@ export async function shareTask(conv: string, card: { title: string; desc?: stri
     payload.groupId = conv
     payload.groupName = g.name
     payload.members = g.members
+    // 2026-11-12 卡壳契约（真机 RED：ADB 卡到 PC 被静默丢弃）：PC 端
+    // `device_group_card_payload` 的 wire 形状是**外层信封 + card 包裹**——
+    // `device_group_task_ingest` 见不到 `payload.card` 就按「老形态」拒落库
+    // （宁可少一张，不可落来路不明的）。手机发送侧此前只发摊平字段，接收侧
+    // （flattenTaskSharePayload）却早已按 card 包裹解析——发送/接收两头一直
+    // 不对称。这里补上 card 包裹与 status（**只加不减**：摊平字段保留，旧接收
+    // 端/手机自己的回显不破坏）。
+    payload.status = 'todo'
+    payload.card = {
+      taskId: payload.taskId, title: payload.title, desc: payload.desc,
+      from: payload.from, fromName: payload.fromName,
+      createdAt: payload.createdAt, source: payload.source,
+      participants: payload.participants,
+      ...(payload.requirements !== undefined ? { requirements: payload.requirements } : {}),
+      ...(payload.reward !== undefined ? { reward: payload.reward } : {}),
+      ...(payload.expiresAt !== undefined ? { expiresAt: payload.expiresAt } : {}),
+      ...(payload.env !== undefined ? { env: payload.env } : {}),
+      ...(payload.caps !== undefined ? { caps: payload.caps } : {}),
+    }
     const { sendState } = await p2pSendRaw(conv, 'task-share', payload)
     agg = sendState
   } else {

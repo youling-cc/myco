@@ -190,6 +190,10 @@ export async function ensureAdbCard(deps: { identity?: () => { did: string } | n
     await shareTask(gid, {
       title: ADB_CARD_TITLE,
       desc: '授权设备经 vnet 隧道 adb connect 调试本机（端口 5555）',
+      // 消费端 env open 的能力闸（与 PC 的 rdp/dsh 环境卡同款）：不给 caps，
+      // 接收端 task open → POST /api/env/open 会以「此卡未授予该能力」拒绝
+      // （2026-11-12 真机：卡能落库但点开 denied，dry-run 显示 caps:[]）。
+      caps: ['vnet.forward'],
       env: [{
         kind: 'adb',
         device: did,
@@ -201,5 +205,51 @@ export async function ensureAdbCard(deps: { identity?: () => { did: string } | n
     return { created: true }
   } catch (e) {
     return { created: false, err: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/**
+ * 开机自启：**已建卡**才拉起本机 adb server（卡=授权声明；没卡就不对外暴露 adbd）。
+ *
+ * 为什么要有：server 生命周期绑在 app 进程上，app 一重启/被系统回收，出门在外的
+ * 调试者就断链，而人不在手机旁边没法点卡（2026-11-12 用户外出场景）。
+ * 幂等：已在跑直接返回 already。
+ */
+export async function adbBootstrap(
+  deps: { identity?: () => { did: string } | null } = {},
+): Promise<{ started: boolean; reason: string }> {
+  try {
+    const did = myDeviceDid(deps)
+    if (!did) return { started: false, reason: 'no-identity' }
+    if (!adbCardExists(did)) return { started: false, reason: 'no-card' }
+    const st = adbServerState()
+    if (st.running) return { started: true, reason: 'already' }
+    const r = await adbServerStart(deps)
+    return r.ok ? { started: true, reason: 'started' } : { started: false, reason: r.err || 'start-failed' }
+  } catch (e) {
+    return { started: false, reason: e instanceof Error ? e.message : String(e) }
+  }
+}
+
+/**
+ * 脚本/QA 入口：`window.MycoAdbShare`。
+ *
+ * 为什么需要：建卡/起停目前只有 UI 入口（FriendsPanel 点卡），而验证与自动化
+ * （真机回归、跨机装好后首次授权）没有可调面——2026-11-12 实测「PC 侧 adb 通了，
+ * 但卡还没建、笔记本也还没被授权」。挂一个窄口：只暴露本模块已有的幂等动作。
+ */
+export function installAdbShareBridge(): void {
+  try {
+    const w = window as unknown as Record<string, unknown>
+    w.MycoAdbShare = {
+      ensureCard: () => ensureAdbCard(),
+      bootstrap: () => adbBootstrap(),
+      start: () => adbServerStart(),
+      stop: () => adbServerStop(),
+      state: () => adbServerState(),
+      cardExists: () => adbCardExists(myDeviceDid()),
+    }
+  } catch {
+    /* 无 window（node 测试）/老壳：静默 */
   }
 }

@@ -575,7 +575,9 @@ describe('接线（源码合同）：手机任务列表行 env 优先于分享�
     expect(dshAt).toBeLessThan(envAt)
     // 通用 env 直开之前：RDP 先把设备隧道拉起来并回写本机口
     // （卡片里写死的 localPort 是 PC 侧口，手机上没人监听 → 直接 openTaskEnv 必连不上）
-    const rdpPrepAt = body.indexOf('ensureRdpForwardFor(env.device)')
+    // 2026-11-12：调用变成 ensureRdpForwardFor(env.device, env.localPort)——第二参把卡上
+    // 的固定口传下去（RDP 地址恒 127.0.0.1:23389）。断言只锚到参数表开头，不锚收括号。
+    const rdpPrepAt = body.indexOf('ensureRdpForwardFor(env.device')
     expect(rdpPrepAt).toBeGreaterThan(-1)
     expect(rdpPrepAt).toBeLessThan(envAt)
     // 通用 env 直开之后才是无 env 老卡的分享入口兜底
@@ -594,8 +596,9 @@ describe('接线（源码合同）：DSH 列表行不露「↗ 浏览器」（20
     // 主路径仍走应用内壳 openTaskEnv；RDP 的前置是「先有本机隧道口」——
     // 2026-11-11 改写成 `const prep = ensureRdpForwardFor(...); void prep.then(() => openTaskEnv(env, ...))`，
     // 断言顺序而不是某一句字面量，否则一句重构就假警。
+    // 2026-11-12：第二参 env.localPort（固定口）加入——同上只锚参数表开头。
     const body = fnBodyOf(src, 'openShare')
-    const prepAt = body.indexOf('ensureRdpForwardFor(env.device)')
+    const prepAt = body.indexOf('ensureRdpForwardFor(env.device')
     const envAt = body.indexOf('openTaskEnv(env,')
     expect(prepAt).toBeGreaterThan(-1)
     expect(envAt).toBeGreaterThan(prepAt)

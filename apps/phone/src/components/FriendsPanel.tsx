@@ -1661,8 +1661,18 @@ export function PeerTasksSection() {
   // （「我发起的 · 待接受/进行中」），不接受者视角的 一起做/开始/完成 按钮。
   const my = myAccountDid()
   const tasks = listTasks()
-  if (!tasks.length) return null
-  const views = tasks.map((t) => ({ t, v: peerTaskView(t, my) }))
+  // 2026-11-12 一处入口：本机的「ADB 调试」服务卡不进列表——它是发给**别的设备**
+  // 消费的（设备群 fan-out 会把卡回声给自己账号），手机上的唯一入口是页面顶部
+  // 那张专属开关卡（AdbShareCard：状态灯 + 开/关 + 建卡状态，点击同一组动作）。
+  // 只滤显示，卡数据不动；PC/笔记本端（chat_service 名册）不受影响——它们的
+  // 本机设备 did ≠ 卡上的 device，照常显示为可消费的 ADB 任务卡。
+  const myDev = myDeviceDid()
+  const visible = tasks.filter((t) => {
+    const envs = declaredEnvsOfCard(t as unknown as Record<string, unknown>, t.action)
+    return !envs.some((e) => e && e.kind === 'adb' && e.device && accountDidEq(e.device, myDev))
+  })
+  if (!visible.length) return null
+  const views = visible.map((t) => ({ t, v: peerTaskView(t, my) }))
   const pendingN = views.filter(({ v }) => !v.mine && v.statusKey === 'pending').length
   const stLabel: Record<string, string> = { pending: '待接受', todo: '待办', doing: '进行', done: '已完成' }
   const mineLabel: Record<string, string> = { pending: '待接受', doing: '进行中', done: '已完成' }
@@ -1715,7 +1725,7 @@ export function PeerTasksSection() {
       // 再交给 openTaskEnv 去算地址/复制/唤起远程桌面 App。不做这一步时卡片里写死的
       // localPort(23389) 是 PC 侧口，手机上没人监听（2026-11-11 真机"复制失败"）。
       const prep = env.kind === 'rdp' && env.device
-        ? ensureRdpForwardFor(env.device).catch(() => null)
+        ? ensureRdpForwardFor(env.device, env.localPort).catch(() => null)
         : Promise.resolve(null)
       void prep.then(() => openTaskEnv(env, {
         gate: envGateOf(t as unknown as Record<string, unknown>),

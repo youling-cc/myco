@@ -248,6 +248,16 @@ export function rdpStatus(device?: string, localPort?: number): RdpStatus {
 export async function copyText(text: string): Promise<boolean> {
   const t = String(text ?? '')
   if (!t) return false
+  // ① 壳桥优先：WebView 的 clipboard/execCommand 都要**用户手势**，而这里的复制常发生在
+  //    await（隧道 ensure）之后，手势已丢 —— 真机两条路都失败（2026-11-12）。
+  try {
+    const sh = (window as unknown as {
+      MycoShell?: { copyText?: (s: string) => boolean }
+    }).MycoShell
+    if (sh && typeof sh.copyText === 'function' && sh.copyText(t)) return true
+  } catch {
+    /* 落到浏览器路径 */
+  }
   try {
     const nav = navigator as Navigator & { clipboard?: Clipboard }
     if (nav.clipboard && typeof nav.clipboard.writeText === 'function') {
@@ -297,9 +307,13 @@ export function hasRdpBridge(): boolean {
 export function openRdpViaShell(address: string, device?: string): boolean {
   try {
     const w = window as unknown as { MycoShell?: RdpShell }
-    const fn = w.MycoShell?.openRdp
-    if (typeof fn !== 'function') return false
-    fn(address, device)
+    const shell = w.MycoShell
+    if (!shell || typeof shell.openRdp !== 'function') return false
+    // ⚠ 必须**带接收者**调用：`const fn = shell.openRdp; fn(...)` 在 Android WebView 上
+    // 会抛 "Java bridge method can't be invoked on a non-injected object"，被 catch 吞掉
+    // 后 UI 只看到「请在你的远程桌面 App 里连接」——RDP 卡片点了不启动客户端就是这么来的
+    // （2026-11-12 真机：forward 25911→3389 已就绪，top activity 仍是 myco）。
+    shell.openRdp(address, device)
     return true
   } catch {
     return false

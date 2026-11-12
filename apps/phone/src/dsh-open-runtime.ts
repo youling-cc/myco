@@ -406,8 +406,13 @@ export async function ensureShareEntryForwardFor(deviceDid: string): Promise<num
  * ——点卡只能弹"请在远程桌面 App 里连接"加一句"自动复制失败"。现在本地口由设备
  * 隧道自动分配（25910 起），必须回写才认得到。
  */
-export async function ensureRdpForwardFor(deviceDid: string): Promise<number | null> {
-  const lp = await ensureDeviceForward(deviceDid, DEVICE_PORT_RDP)
+export async function ensureRdpForwardFor(deviceDid: string, preferLocalPort?: number): Promise<number | null> {
+  // 固定口优先（2026-11-12 真机）：RDP 的本地口若每次重建都变（25910 起自动分配），
+  // 远程桌面 App 里存好的连接（127.0.0.1:23389）就永远指向死口——真机实测卡上写
+  // 23389、隧道却给 25912，用户点开 App 只能连旧的死口。卡的 `localPort` 就是
+  // 消费方该用的固定口（与 DSH 23911 同构：非 HTTP 每 (device,service) 固定本地口）。
+  const fixed = typeof preferLocalPort === 'number' && preferLocalPort > 0 ? preferLocalPort : 0
+  const lp = await ensureDeviceForward(deviceDid, DEVICE_PORT_RDP, fixed > 0 ? { localPort: fixed } : undefined)
   if (!lp) return null
   try {
     const { upsertLocalForward, RDP_TARGET_PORT } = await import('./remote-desktop')

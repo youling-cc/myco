@@ -21681,33 +21681,11 @@ async fn handle_announce_env_card(
         )
             .into_response();
     }
-    let title = if share.title.trim().is_empty() { sid.clone() } else { share.title.trim().to_string() };
-    let Some(conv) = crate::chat_service::ensure_device_group() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ok": false, "error": "设备群未就绪（稍后再试）" })),
-        )
-            .into_response();
-    };
-    match crate::chat_service::chat_share_task(
-        conv.clone(),
-        title,
-        "myco 环境卡：点卡打开对应环境（入口坐标已刷新）。".into(),
-        String::new(),
-        None,
-        None,
-        None,
-        Some(sid.clone()),
-    )
-    .await
-    {
-        Ok(v) => Json(json!({ "ok": true, "share": sid, "conv": conv, "card": v })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "ok": false, "error": e })),
-        )
-            .into_response(),
-    }
+    // 复用正源：sync_share_task = 重建卡记录（share_card_record → env 随现行
+    // 授权表 + 干净坐标重签）+ 落本机任务库 + 设备群广播（spawn_device_group_task_card）。
+    // 接收端按 taskId/shareId upsert——同一张卡只刷新不重复。
+    sync_share_task(&share);
+    Json(json!({ "ok": true, "share": sid })).into_response()
 }
 
 /// 建分享的**唯一实现**（HTTP `/api/dshShare/create` 与 Tauri 命令

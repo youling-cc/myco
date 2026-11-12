@@ -22,6 +22,12 @@ public final class VnetClient {
                 android.system.Os.setenv("VNET_RETRY_BUDGET_MS", "60000", false);
             }
         } catch (Throwable ignored) { }
+        // 2026-11-12 连接秒死案诊断旋钮（vnet 域方案 ①②）——都可用文件开关热切，
+        // 不用重编：MainActivity.onCreate 在本类加载前调用 applyEnvToggles(ctx)。
+        //  · VNET_STATUS_DIR → libvnet 状态文件落 app files dir（默认 temp_dir 在
+        //    Android 无处可读=观测盲区）
+        //  · VNET_NO_P2P=1 → 强制 relay，隔离「WiFi 省电拆 IPv6」假设
+        //  · VNET_DEBUG_TRACE=1 → vnet 侧 verbose（.so 支持时）
         // 两个库都要装（APK 的 lib/arm64-v8a/ 下）：
         //  · libvnet.so     —— vnet 出的纯 C FFI（只导出 vnet_* C 符号）
         //  · libvnetjni.so  —— 宿主侧 JNI 垫片（导出 Java_com_myco_phone_VnetClient_*）
@@ -29,6 +35,29 @@ public final class VnetClient {
         // 只 load libvnet 会 UnsatisfiedLinkError("No implementation found")。
         System.loadLibrary("vnet");
         System.loadLibrary("vnetjni");
+    }
+
+    /** 诊断旋钮（文件开关热切，须在任何 vnet_* 调用前调用——MainActivity.onCreate）：
+     *  files/vnet-no-p2p 存在 → VNET_NO_P2P=1（强制 relay）
+     *  files/vnet-debug 存在 → VNET_DEBUG_TRACE=1
+     *  VNET_STATUS_DIR 恒指 files/vnet-status/（vnet .so 支持该 env 时生效）。 */
+    public static void applyEnvToggles(android.content.Context ctx) {
+        try {
+            java.io.File files = ctx.getFilesDir();
+            // VNET_STATUS_DIR 指外部 files 目录（adb 可直接 cat——内部 /data/data
+            // 非 debuggable 包读不了，14:2x 实测盲区没解除就是这个）。
+            java.io.File ext = ctx.getExternalFilesDir(null);
+            java.io.File statusDir = new java.io.File(ext != null ? ext : files, "vnet-status");
+            if (!statusDir.exists()) { statusDir.mkdirs(); }
+            android.system.Os.setenv("VNET_STATUS_DIR", statusDir.getAbsolutePath(), false);
+            if (new java.io.File(files, "vnet-no-p2p").exists()) {
+                android.system.Os.setenv("VNET_NO_P2P", "1", false);
+                android.util.Log.w("VnetClient", "诊断模式：VNET_NO_P2P=1（强制 relay）");
+            }
+            if (new java.io.File(files, "vnet-debug").exists()) {
+                android.system.Os.setenv("VNET_DEBUG_TRACE", "1", false);
+            }
+        } catch (Throwable ignored) { }
     }
 
     // ── FFI 返回码（与 vnet_ffi.h 一致）──

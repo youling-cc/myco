@@ -409,6 +409,38 @@ export async function p2pDeliver(accountDid: string, envelope: Record<string, un
       console.log(`[p2p] 中继送达（直推${skipDirect ? '已跳过' : '不可达'}，to=…${accountDid.slice(-6)}）`)
       return true
     }
+    // 2026-11-12 vnet 兜底腿（真机 RED：ADB 任务卡在 outbox 卡了 2 小时）：
+    // PC 切 vnet 传输模式后 p2p 数据面只绑 127.0.0.1:9100 → 直连必败；8321 中继腿
+    // 在 PC 侧已退场为空壳（2026-11-06）永远超时——设备隧道是手机→PC 投递的
+    // 唯一活路。对账（p2pPostSync）早就有同款腿；deliver（chat/task-share）没有，
+    // 表现就是「手机建的卡永远到不了 PC」。includeAddrless：vnet 模式的 PC 在
+    // presence 里可能不报可达地址。
+    //
+    // ⚠ 逐台全发、不在首台成功后早退（2026-11-12 真机第二课）：deliver 的语义是
+    // 「任一送达=成功」，outbox 随即删消息——若 vnet 腿也在第一台（如笔记本老
+    // exe 秒回 ok）就早退，PC 永远收不到（实测：卡只到笔记本，PC 任务列表空）。
+    // 这里对**全部**在线 PC 设备各投一份，宁可重复（接收端 msgId/taskId 幂等），
+    // 不可漏投。
+    if (vnetP2pTunnel && !won) {
+      const devs = await peerDevicesOf(accountDid, { includeAddrless: true }).catch(() => [])
+      let anyOk = false
+      for (const d of devs) {
+        try {
+          const localPort = await vnetP2pTunnel(d.did)
+          if (localPort && localPort > 0) {
+            const r = await p2pPostViaVnet(localPort, '/p2p/msg', envelope)
+            if (r && r.ok) {
+              anyOk = true
+              noteSyncDiag('deliver-vnet-ok', {
+                dev: d.did.slice(-4), port: localPort,
+                kind: String((envelope as { kind?: string }).kind || ''),
+              })
+            }
+          }
+        } catch { /* 换下一台设备 */ }
+      }
+      if (anyOk) return true
+    }
     return won
   }
   if (!opts.budgetMs) return run()

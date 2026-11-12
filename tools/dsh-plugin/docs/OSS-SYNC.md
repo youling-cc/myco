@@ -1,6 +1,6 @@
 # 开源仓同步规则（DSH 插件）
 
-> 权威源：本仓库 `dsh-plugin-identity/`（`D:\Projects\AOP\myco` 的 worktree，分支 `feat/myco-cli-pc`）
+> 权威源：本仓库 `dsh-plugin-identity/`（`D:\Projects\labs\myco` 的 worktree，分支 `feat/myco-cli-pc`）
 > 发布目标：`github.com/youling-cc/myco` → `tools/dsh-plugin/`
 > 维护方：DSH插件会话（session-181a6a6d）· 对接：有灵开源会话（session-92007bec）
 
@@ -42,7 +42,7 @@ tools/append-vectors.mjs  开发机专用（向量生成器）
 
 | 本仓（内部） | 开源仓（中性化） |
 |---|---|
-| `D:/Projects/AOP/<worktree>` | `repo-a/labs` |
+| `D:/Projects/labs/<worktree>` | `repo-a/labs` |
 | `Users\<user>` | `Users\you` |
 | （另有 2 处同类路径/用户名） | 同上风格 |
 

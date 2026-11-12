@@ -658,10 +658,20 @@ impl PeerClaim {
 }
 
 pub fn status_file_path_for(role: &str, peer_id: u32) -> std::path::PathBuf {
-    match std::env::var("VNET_STATUS_FILE") {
-        Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
-        _ => std::env::temp_dir().join(format!("vnet-status-{}-{}.txt", role, peer_id)),
+    // VNET_STATUS_FILE（精确路径）> VNET_STATUS_DIR（目录，Android 可读位置）
+    // > temp_dir（默认）。2026-11-12 手机观测盲区：Android temp_dir =
+    // /data/local/tmp 无权限，宿主设 VNET_STATUS_DIR=app files dir 即可读。
+    if let Ok(p) = std::env::var("VNET_STATUS_FILE") {
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
     }
+    if let Ok(d) = std::env::var("VNET_STATUS_DIR") {
+        if !d.is_empty() {
+            return std::path::Path::new(&d).join(format!("vnet-status-{}-{}.txt", role, peer_id));
+        }
+    }
+    std::env::temp_dir().join(format!("vnet-status-{}-{}.txt", role, peer_id))
 }
 
 /// 列出临时目录下所有 vnet 状态文件（供 `vnet status` 全量展示）
@@ -766,6 +776,54 @@ fn p2p_inbound() -> &'static std::sync::Mutex<std::collections::HashMap<String, 
 /// P2P 处理线程调用：记录/刷新一个入站对端
 pub fn note_p2p_inbound(addr: &std::net::SocketAddr) {
     p2p_inbound().lock().unwrap().insert(addr.to_string(), std::time::Instant::now());
+}
+
+/// 解析状态文件的 kv 行（`k=v`，忽略空行/无等号行）。
+pub fn parse_status_kv(body: &str) -> Vec<(String, String)> {
+    body.lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() { None } else { Some((k.to_string(), v.trim().to_string())) }
+        })
+        .collect()
+}
+
+/// 读取一个角色的状态文件并解析为 kv（宿主对账用；文件不存在 → None）。
+/// 2026-11-12 修复：host 侧 `vnet_forward.rs` 引用了本函数但 vnet 从未提供
+/// （历史分支断档），补等价读面。
+pub fn read_status_file(role: &str, peer_id: u32) -> Option<Vec<(String, String)>> {
+    let body = std::fs::read_to_string(status_file_path_for(role, peer_id)).ok()?;
+    Some(parse_status_kv(&body))
+}
+
+/// 列出临时/状态目录下全部 vnet 状态快照：(路径, kv)。
+/// 宿主 peers 视图用它枚举 server 实例（比进程内表更全，跨进程可见）。
+pub fn list_status_snapshots() -> Vec<(std::path::PathBuf, Vec<(String, String)>)> {
+    list_status_files()
+        .into_iter()
+        .filter_map(|p| {
+            let body = std::fs::read_to_string(&p).ok()?;
+            Some((p, parse_status_kv(&body)))
+        })
+        .collect()
+}
+
+/// 进程内实时入站 P2P 对端快照：(addr, 静默毫秒)。
+/// 比状态文件（5s 粒度 + 可能被双写者覆盖）更实时；宿主"in 入站视图"用它。
+/// 只返回最近 120s 内活跃的条目（陈旧残留不展示）。
+pub fn p2p_inbound_snapshot() -> Vec<(String, u64)> {
+    let now = std::time::Instant::now();
+    let g = p2p_inbound().lock().unwrap();
+    let mut out: Vec<(String, u64)> = g
+        .iter()
+        .filter_map(|(addr, at)| {
+            let age_ms = now.saturating_duration_since(*at).as_millis() as u64;
+            if age_ms <= 120_000 { Some((addr.clone(), age_ms)) } else { None }
+        })
+        .collect();
+    out.sort_by_key(|(_, age)| *age);
+    out
 }
 
 fn learned_peers() -> &'static std::sync::Mutex<std::collections::HashSet<u32>> {
@@ -1536,6 +1594,9 @@ pub struct Connection {
     /// version==0 放行后的 5s 探测失败时，按 target_port 找到该 forward 的全部
     /// 活跃流，显式发 STREAM_END（本地排空关闭 + 通知对端），不留静默黑洞。
     mf_stream_targets: Arc<Mutex<HashMap<u16, u16>>>,
+    /// 观测：forward_targeted 开流计数 + 最近一次开流信息（Android 无 stdout，靠状态文件供数）
+    mf_opened: Arc<AtomicU64>,
+    mf_last_open_info: Arc<Mutex<String>>,
     /// 同机 peer_id 占位（跨进程串扰防护，见 [`PeerClaim`]）：
     /// keepalive 线程周期体检，发现被新进程接管即退位。
     claim: Arc<std::sync::Mutex<PeerClaim>>,
@@ -1718,6 +1779,8 @@ impl Connection {
             forwards: Arc::new(crate::forward::ForwardTable::new()),
             mf_enabled: Arc::new(AtomicBool::new(false)),
             mf_stream_targets: Arc::new(Mutex::new(HashMap::new())),
+            mf_opened: Arc::new(AtomicU64::new(0)),
+            mf_last_open_info: Arc::new(Mutex::new(String::new())),
             claim: Arc::new(std::sync::Mutex::new(claim)),
         })
     }
@@ -1962,6 +2025,8 @@ impl Connection {
             stream_flags: self.stream_flags.clone(),
             mf_stream_targets: self.mf_stream_targets.clone(),
             self_dial: self.target_peer_id == self.my_peer_id,
+            mf_opened: self.mf_opened.clone(),
+            mf_last_open_info: self.mf_last_open_info.clone(),
         }
     }
 
@@ -2072,12 +2137,13 @@ impl Connection {
 forward 127.0.0.1:{} -> remote:{} kept active",
                         conn.target_peer_id, local_port, target_port);
                 } else {
-                    eprintln!("  [FWD] ERROR: no PONG from peer {} in 5s — unreachable or \
-pre-multi-forward; explicitly closing streams of forward 127.0.0.1:{} -> remote:{}",
+                    // 2026-11-12 真案：P2P-v6 连接 + relay 探测 → PONG 不达（探测槽
+                    // 与 SilenceLadder 共享、路径不对称等）→ 误杀健康流（accepted=2
+                    // 但 PC 零 STREAM_OPEN）。改为 warn-only：探测失败只记日志，
+                    // 不终结流——黑洞由 dataPlaneAlive（宿主侧）或静默梯兜底。
+                    eprintln!("  [FWD] WARN: no PONG from peer {} in 5s (probe inconclusive — \
+P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{} kept active",
                         conn.target_peer_id, local_port, target_port);
-                    let n = conn.mf_terminate_forward_streams(target_port, "MF_PEER_UNREACHABLE");
-                    tracelog!("[FWD] caps probe-fail teardown: {} stream(s) STREAM_END (target={})",
-                        n, target_port);
                 }
             });
         if let Err(e) = spawned {
@@ -2220,6 +2286,9 @@ pre-multi-forward; explicitly closing streams of forward 127.0.0.1:{} -> remote:
         let ka_p2p_sock = self.listen_sock.clone();
         let ka_stop_calls = self.stop_calls.clone();
         let ka_local_port = self.local_port.clone();
+        // forward_targeted 观测（Android 状态文件排障）
+        let ka_mf_opened = self.mf_opened.clone();
+        let ka_mf_last_info = self.mf_last_open_info.clone();
         let ka_prq = self.probe_req_rx.clone();
         let ka_prp = self.probe_reply_rx.clone();
         let ka_lrx = self.listen_rx.clone();
@@ -2371,9 +2440,13 @@ pre-multi-forward; explicitly closing streams of forward 127.0.0.1:{} -> remote:
                         ka_p2p_port,
                         ka_fwd_list.len()));
                     for f in &ka_fwd_list {
-                        body.push_str(&format!("forward.{}={}:{} {}\n",
-                            f.local_port, f.target_port, f.accepted, f.listening));
+                        body.push_str(&format!("forward.{}={}:{}/{} {}\n",
+                            f.local_port, f.target_port, f.accepted, f.active, f.listening));
                     }
+                    // forward_targeted 观测：流开计数 + 最近一次开流信息（Android 黑洞排障）
+                    body.push_str(&format!("mf_opened={}\nmf_last_open={}\n",
+                        ka_mf_opened.load(Ordering::Relaxed),
+                        *ka_mf_last_info.lock().unwrap()));
                     let _ = std::fs::write(status_file_path_for("client", ka_id), body);
                 }
                 {
@@ -2481,6 +2554,11 @@ pre-multi-forward; explicitly closing streams of forward 127.0.0.1:{} -> remote:
         let net_status_for_status = self.local_net_status.clone();
         let remote_ns_for_status = self.remote_net_status.clone();
         let path_switches_for_status = self.path_switches.clone();
+        // 观测统一：punch 版也带 mf/arq 键（同一文件双写者格式必须一致，
+        // 2026-11-12 DSH 误判「mf_opened 不存在」= punch 版覆盖了 keepalive 版）
+        let mf_opened_for_status = self.mf_opened.clone();
+        let mf_last_info_for_status = self.mf_last_open_info.clone();
+        let arq_for_status = self.relay_arq.clone();
         let local_ip_watch = Arc::new(Mutex::new(get_my_local_ipv4()));
         let switch_score_net = self.switch_score.clone();
         let path_switches_net = self.path_switches.clone();
@@ -2953,13 +3031,24 @@ pre-multi-forward; explicitly closing streams of forward 127.0.0.1:{} -> remote:
                         .unwrap_or(0);
                     fields.push(("p2p_port".into(), p2p_port.to_string()));
                     // multi-forward：每条转发一行，key=实际 local_port（H.2.1 约定）
+                    // 2026-11-12：格式与 keepalive 版统一为 `<target>:<accepted>/<active> <listening>`
                     let fwd_list = forwards_for_status.list();
                     fields.push(("forwards".into(), fwd_list.len().to_string()));
                     for f in &fwd_list {
                         fields.push((
                             format!("forward.{}", f.local_port),
-                            format!("{}:{}/{}", f.target_port, f.accepted, f.active),
+                            format!("{}:{}/{} {}", f.target_port, f.accepted, f.active, f.listening),
                         ));
+                    }
+                    // forward_targeted 观测（与 keepalive 版同键，避免格式跳变）
+                    fields.push(("mf_opened".into(), mf_opened_for_status.load(Ordering::Relaxed).to_string()));
+                    fields.push(("mf_last_open".into(), mf_last_info_for_status.lock().unwrap().clone()));
+                    // ARQ 可观测（RDP 指针卡顿诊断）
+                    {
+                        let raq = arq_for_status.lock().unwrap();
+                        fields.push(("arq_retransmits".into(), raq.retransmit_count.to_string()));
+                        fields.push(("arq_window_full".into(), raq.window_full_count.to_string()));
+                        fields.push(("arq_stall_max_ms".into(), raq.max_stall_ms.to_string()));
                     }
                     let strategy = {
                         let ns = net_status_for_status.clone();
@@ -3861,6 +3950,9 @@ struct ForwardCtx {
     mf_stream_targets: Arc<Mutex<HashMap<u16, u16>>>,
     /// 自拨标志（target_peer_id == my_peer_id）：forward 时走 loopback 短路
     self_dial: bool,
+    /// 观测：forward_targeted 开流计数 + 最近一次开流信息（Android 无 stdout，靠状态文件供数）
+    mf_opened: Arc<AtomicU64>,
+    mf_last_open_info: Arc<Mutex<String>>,
 }
 
 impl ForwardCtx {
@@ -3898,6 +3990,11 @@ impl ForwardCtx {
         if let Some(t) = target {
             self.mf_stream_targets.lock().unwrap().insert(conn_id, t);
         }
+        // 观测：流开计数 + 路径（Android println 黑洞，靠状态文件供数）
+        self.mf_opened.fetch_add(1, Ordering::Relaxed);
+        *self.mf_last_open_info.lock().unwrap() = format!(
+            "conn#{} path={:?} peer={} target={:?}",
+            conn_id, *self.path.lock().unwrap(), self.target_peer_id, target);
         tracelog!("[conn#{}] OPEN path={:?} target_peer={}", conn_id,
                   *self.path.lock().unwrap(), self.target_peer_id);
         let hub_up = self.hub.clone();

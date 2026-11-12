@@ -94,8 +94,16 @@ impl ForwardTable {
         if spec.local_port != 0 && guard.iter().any(|e| e.actual == spec.local_port) {
             anyhow::bail!("MF_PORT_IN_USE: local port {} already forwarded", spec.local_port);
         }
+        // 2026-11-12 Android 真案：只绑 127.0.0.1 时 Java 侧 `localhost` 若解析为
+        // ::1（IPv6），连接走到别的通道——listener 在但 accepted=0。
+        // Android/Linux 绑 [::]（内核默认 dual-stack，v4 映射自动收）；
+        // Windows 保持 127.0.0.1（[::] 是 v6-only，V6ONLY 默认 true）。
+        #[cfg(target_os = "android")]
+        let listener = TcpListener::bind(format!("[::]:{}", spec.local_port)).map_err(|e| {
+            anyhow::anyhow!("MF_BIND_FAILED: bind [::]:{}: {:#}", spec.local_port, e)
+        })?;
+        #[cfg(not(target_os = "android"))]
         let listener = TcpListener::bind(("127.0.0.1", spec.local_port)).map_err(|e| {
-            // 严格绑定：绑不上就 Err，绝不静默换口（15119 事故的教训）
             anyhow::anyhow!("MF_BIND_FAILED: bind 127.0.0.1:{}: {:#}", spec.local_port, e)
         })?;
         let actual = listener.local_addr()?.port();

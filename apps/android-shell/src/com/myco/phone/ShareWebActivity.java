@@ -241,13 +241,13 @@ public class ShareWebActivity extends Activity {
         s.setSupportZoom(false);
         s.setBuiltInZoomControls(false);
         s.setDisplayZoomControls(false);
-        // 2026-11-12 白屏终修（真机实锤）：分享页全部走本机隧道 127.0.0.1:<port>，
-        // 端口每次重建都可能变（25910 起顺序分配）。Chromium 按 URL 缓存响应——
-        // 旧隧道口死掉时的 404/黑洞响应被缓存后，隧道恢复同一 URL 也拿缓存错误，
-        // 模块加载（/myco-assets/plugins/??…&rev=…）连环失败、页面退化成 46 条
-        // 错误清单且刷新无效（系统浏览器独立缓存=正常，对照实证）。
-        // 分享页是隧道动态面，缓存是纯负担 → 一律不缓存。
-        s.setCacheMode(WebSettings.LOAD_NO_CACHE);
+        // 2026-11-12 两段定案（撤 LOAD_NO_CACHE）：上午为「动态口变了→旧 URL 的 404
+        // 被 Chromium 按 URL 钉死」加过 NO_CACHE——但那把 /myco-assets 稳定前缀的
+        // 跨会话缓存也废了：DSH 页 ~11MB 资产每次全量重下（隧道 180KB/s ≈ 60s+）
+        // → 模块加载器超时 →「返回再开打不开」（13:40/13:51 真机两案，trajectory
+        // 模块 2.6MB 单发超线）。根因（动态口漂移）已由设备域固定口根治：URL 永不
+        // 变 ⇒ 404 钉死不可能发生 ⇒ 恢复默认缓存——首载后走缓存，返回再开与
+        // 二卡秒开都靠它（myco-assets 稳定前缀的设计初衷，见网关 public_router）。
         // 2026-10-12：控制台留证（白屏现场第一手日志落 gw-net.log；不带媒体授权）
         w.setWebChromeClient(new ShareChrome(this));
         w.setWebViewClient(new ShareSeen(this));

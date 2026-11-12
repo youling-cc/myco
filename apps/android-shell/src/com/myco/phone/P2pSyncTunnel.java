@@ -3,6 +3,7 @@ package com.myco.phone;
 import org.json.JSONObject;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -14,7 +15,7 @@ import java.util.Map;
  * multi-forward server（peer_id = SHA256("vnet-peer"||did||":server:multi-forward-v1")），
  * 逐端口 server（`:server:9100` 之类）根本不启动。所以：
  *   · 连接必须用**设备级** peer_id 建，且只建一条（多建会互抢本地口）；
- *   · 每个要用的对端端口（9100 对账 / 13911 分享网关 / 3389 RDP）用
+ *   · 每个要用的对端端口（9100 对账 / 15200 网关 / 3389 RDP）用
  *     `vnet_client_add_forward` 追加一条本地回环口。
  *
  * ## 为什么不再"单隧道、换目标先停旧实例"
@@ -23,6 +24,14 @@ import java.util.Map;
  *   ② 承接 DSH/RDP 的第二个端口无处可放。
  * 现在按 **device** 一条连接、按 **(device,targetPort)** 一条转发，本地口由本类
  * 从 {@link #PORT_BASE} 起自动分配，调用方不需要自己算。
+ *
+ * ## 期望面（DESIRED）：重建后必须重放，不能只补当前这一条
+ * vnet 的 `stopClientPeer` 是**整条连接**级的：它一停，挂在这条连接上的**所有端口**
+ * listener 同时消失。2026-11-12 实测 RED：给同一设备再 ensure 一个坏端口
+ * （target 22，探活必然失败）→ 触发重建 → 该设备的转发表只剩新端口，
+ * DSH 的 23912 和对账的 25911 **一起消失**，浏览器当场 ERR_CONNECTION_REFUSED。
+ * 所以本类另存一份与连接无关的"期望转发集" `DESIRED`：重建时按它逐条重放，
+ * **本地口沿用旧值**——已经打开的页面 URL（`<alias>.localhost:23912`）不会失效。
  *
  * ## 与 :tunnel 进程 VnetTransport.arm 的分工
  * 那是 RDP/DSH 的 `ForwardListener` 语义数据面（撤注即 vnet_client_stop 停全部
@@ -36,6 +45,17 @@ public final class P2pSyncTunnel {
     /** 本地回环口自动分配起点（避开 ForwardListener/env 固定口段）。 */
     public static final int PORT_BASE = 25910;
     public static final int PORT_MAX = 25999;
+    /** dataPlaneAlive 结论复用窗口：窗口内重复 ensure 不再端到端探活。
+     *  为什么需要：探活最坏 5s（读超时），而 JS 一次打开会并发/连续 ensure 多个端口，
+     *  串行叠加会把 ensure 拖到十几秒（实测曾有 14 个 p2p-ensure 线程排队）。 */
+    public static final long ALIVE_TTL_MS = 8000;
+    /** 重建后的冷静期：这段时间内不再因探活失败二次重建。
+     *  为什么需要：重建后客户端刚起，P2P/relay 还在握手，别的端口这一拍的
+     *  dataPlaneAlive 必然失败 → 又触发重建 → 重建风暴（2026-11-12 实测一次
+     *  ensure 引发 rebuilds 1→3，第二次重建把正在加载的页面打断）。
+     *  冷静期内只认 listener（probeLocal），把「数据面是否真通」交给调用方的
+     *  真实请求去判——失败由用户/页面下一次 ensure 兜。 */
+    public static final long REBUILD_GRACE_MS = 12000;
 
     /** deviceDid → 该设备的 multi-forward client peer_id。 */
     private static final Map<String, Integer> DEVICE_CLIENT = new HashMap<>();
@@ -43,12 +63,25 @@ public final class P2pSyncTunnel {
     private static final Map<String, Integer> FORWARDS = new HashMap<>();
     /** 本地回环口 → "deviceDid|targetPort"（反向占用表，防两个组合抢同一口）。 */
     private static final Map<Integer, String> PORT_OWNER = new HashMap<>();
+    /** deviceDid → (targetPort → localPort)：**期望**转发集，跨客户端重建存活。 */
+    private static final Map<String, Map<Integer, Integer>> DESIRED = new HashMap<>();
+    /** 本地回环口 → 上次端到端探活通过的时刻（见 {@link #ALIVE_TTL_MS}）。 */
+    private static final Map<Integer, Long> ALIVE_OK_AT = new HashMap<>();
+    /** deviceDid → 上次重建时刻（冷静期判据，见 {@link #REBUILD_GRACE_MS}）。 */
+    private static final Map<String, Long> REBUILD_AT = new HashMap<>();
 
     private static volatile String lastErr = "";
     private static volatile long lastOkAtMs = 0;
     private static volatile String lastDevice = "";
     private static volatile int lastTargetPort = 0;
     private static volatile int lastLocalPort = 0;
+    private static volatile long rebuilds = 0;
+    private static volatile String lastRebuildReason = "";
+    private static volatile long lastRebuildAtMs = 0;
+    /** 最后一次重建的重放明细（逐端口 rc/probe/why），重建失败时唯一的现场。 */
+    private static volatile String lastReplay = "";
+    /** 最后一次 ensure 的分支轨迹（走了哪条路、命中什么、重建看到什么）。 */
+    private static volatile String lastTrace = "";
 
     private P2pSyncTunnel() {}
 
@@ -73,21 +106,43 @@ public final class P2pSyncTunnel {
         return false;
     }
 
-    /** 清掉该设备的全部转发映射与客户端连接（探活失败时用；其他端口的转发
-     *  挂在同一条客户端连接上——连接死则全死，各自在下次 ensure 时懒重建）。 */
-    private static void evictDevice(String device) {
-        Integer cp = DEVICE_CLIENT.remove(device);
-        if (cp != null) {
-            try { VnetClient.stopClientPeer(cp); } catch (Throwable ignored) { }
+    /** 数据面端到端探活：经隧道拉网关的 /myco-assets/manifest.webmanifest
+     *  （无鉴权小文件 ~0.5KB，网关恒供）。probeLocal 只证「listener 在 accept」，
+     *  app 后台冻结杀 socket 后 listener 仍在但 vnet 连接已死——数据全黑洞。
+     *  超时口径：连接层失败/立即 EOF = 死；首字节慢（P2P-v6 冷启动可能 >2s）不算死
+     *  ——读超时 5s，只在 IOException（拒绝/重置）时判死，readTimeout 到点视为
+     *  「慢但活」不 evict（避免误杀健康连接引发重建循环）。 */
+    private static boolean dataPlaneAlive(int port) {
+        java.net.HttpURLConnection c = null;
+        try {
+            java.net.URL u = new java.net.URL("http://127.0.0.1:" + port
+                    + "/myco-assets/manifest.webmanifest");
+            c = (java.net.HttpURLConnection) u.openConnection();
+            c.setConnectTimeout(800);
+            c.setReadTimeout(5000);
+            c.setRequestProperty("Accept-Encoding", "identity");
+            return c.getResponseCode() == 200;
+        } catch (java.net.SocketTimeoutException e) {
+            // 读超时 = 首字节慢（P2P-v6 冷启动/对端忙）——慢≠死，不 evict
+            return true;
+        } catch (java.io.IOException e) {
+            // 连接拒绝/重置/立即 EOF = listener 或隧道真死
+            return false;
+        } catch (Throwable t) {
+            return true; // 未知异常保守视为活，交由上层 open 语义兜底
+        } finally {
+            if (c != null) { try { c.disconnect(); } catch (Throwable ignored) { } }
         }
-        java.util.Iterator<Map.Entry<String, Integer>> it = FORWARDS.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<String, Integer> e = it.next();
-            if (e.getKey().startsWith(device + "|")) {
-                PORT_OWNER.remove(e.getValue());
-                it.remove();
-            }
-        }
+    }
+
+    /** 带结论缓存的端到端探活（见 {@link #ALIVE_TTL_MS}）。 */
+    private static boolean aliveCached(int port) {
+        Long at = ALIVE_OK_AT.get(port);
+        long now = System.currentTimeMillis();
+        if (at != null && now - at >= 0 && now - at < ALIVE_TTL_MS) return true;
+        boolean ok = dataPlaneAlive(port);
+        if (ok) ALIVE_OK_AT.put(port, now); else ALIVE_OK_AT.remove(port);
+        return ok;
     }
 
     /** 分配一个没被占用的本地口（从 PORT_BASE 起顺序找）。 */
@@ -96,6 +151,121 @@ public final class P2pSyncTunnel {
             if (!PORT_OWNER.containsKey(p)) return p;
         }
         return 0;
+    }
+
+    /** 起一条设备级客户端（先停同 peer_id 的旧实例，保证干净）。
+     *  返回 peer_id 或 **null**（失败，原因在 {@link #lastErr}）。
+     *
+     *  ⚠ 必须用可空 Integer 判失败：vnet peer_id 是 **u32**，Java `int` 有一半概率
+     *  是负数（实测 `cp=-1827200503` 是合法 id）。2026-11-12 用 `cp < 0` 判失败，
+     *  把自己刚起的连接当失败，连带 rebuild 直接早退不重放——整链假死。
+     */
+    private static Integer startClientFor(String device, String targetDevice, String relay, String secret) {
+        int cp = VnetTransport.clientPeerId(device, targetDevice, 0);
+        int multiServer = VnetTransport.multiServerPeerId(targetDevice);
+        try { VnetClient.stopClientPeer(cp); } catch (Throwable ignored) { }
+        int rc = VnetClient.vnet_client_start_multi(relay, cp, multiServer, secret);
+        if (rc != VnetClient.VNET_OK && rc != VnetClient.VNET_ERR_RUNNING) {
+            lastErr = "vnet_client_start_multi rc=" + rc + " why=" + VnetClient.lastError();
+            return null;
+        }
+        DEVICE_CLIENT.put(targetDevice, cp);
+        return cp;
+    }
+
+    /** 逐端口 arm 结果明细（重建排障用：只记最后一次 arm 的 rc/probe/why）。 */
+    private static volatile String armDetail = "";
+
+    /** 挂一条转发并登记到活表/期望表（幂等：重复挂同口同目标无害）。 */
+    private static boolean armPort(int clientPeer, String targetDevice, int targetPort, int localPort) {
+        int rc = VnetClient.vnet_client_add_forward(clientPeer, (short) localPort, (short) targetPort);
+        if (rc != VnetClient.VNET_OK && rc != VnetClient.VNET_ERR_RUNNING) {
+            // 幂等兜底：vnet 对「同口重复转发」返回 INTERNAL；若该口确实在 accept，
+            // 说明映射早已存在于连接里（活表丢帧/重放重复），按已挂处理而不是报错。
+            boolean listening = probeLocal(localPort);
+            armDetail = localPort + "<-" + targetPort + " rc=" + rc + " probe=" + listening
+                    + " why=" + VnetClient.lastError();
+            if (!listening) {
+                lastErr = "add_forward(" + localPort + "->" + targetPort + ") rc=" + rc
+                        + " why=" + VnetClient.lastError();
+                return false;
+            }
+        } else {
+            armDetail = localPort + "<-" + targetPort + " rc=" + rc + " ok";
+        }
+        FORWARDS.put(key(targetDevice, targetPort), localPort);
+        PORT_OWNER.put(localPort, key(targetDevice, targetPort));
+        Map<Integer, Integer> want = DESIRED.get(targetDevice);
+        if (want == null) {
+            want = new LinkedHashMap<>();
+            DESIRED.put(targetDevice, want);
+        }
+        want.put(targetPort, localPort);
+        return true;
+    }
+
+    /**
+     * 客户端重建：停旧实例 → 起新实例 → **按 DESIRED 重放该设备全部转发**（本地口不变）。
+     *
+     * 为什么必须重放：`stopClientPeer` 是连接级的，会把挂在这条连接上的所有端口
+     * listener 一起销毁。只补当前这一条 → 其余端口（DSH 23912 / RDP / 对账 25911）
+     * 静默失效，页面打开瞬间 ERR_CONNECTION_REFUSED（2026-11-12 RED 实测）。
+     *
+     * @return 重建后的 client peer_id（u32 位型，可能为负）；重放一条都没成功则 **null**。
+     */
+    private static Integer rebuildDevice(String device, String targetDevice, String relay,
+                                         String secret, String reason) {
+        Integer old = DEVICE_CLIENT.remove(targetDevice);
+        if (old != null) { try { VnetClient.stopClientPeer(old); } catch (Throwable ignored) { } }
+        // 清活表（端口已随连接销毁），**不清 DESIRED**——期望面跨重建存活
+        java.util.Iterator<Map.Entry<String, Integer>> it = FORWARDS.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Integer> e = it.next();
+            if (e.getKey().startsWith(targetDevice + "|")) {
+                ALIVE_OK_AT.remove(e.getValue());
+                PORT_OWNER.remove(e.getValue());
+                it.remove();
+            }
+        }
+        rebuilds++;
+        lastRebuildAtMs = System.currentTimeMillis();
+        lastRebuildReason = reason;
+        REBUILD_AT.put(targetDevice, lastRebuildAtMs);
+
+        Integer cp = startClientFor(device, targetDevice, relay, secret);
+        if (cp == null) {
+            android.util.Log.w("P2pDeviceTunnel", "rebuild failed: " + reason + " — " + lastErr);
+            return null;
+        }
+        int armed = 0;
+        int lost = 0;
+        StringBuilder replay = new StringBuilder();
+        Map<Integer, Integer> want = DESIRED.get(targetDevice);
+        lastTrace = lastTrace + " | rebuild cp=" + cp + " want=" + (want == null ? "null" : want.toString())
+                + " live=" + FORWARDS.size() + " owner=" + PORT_OWNER.size();
+        if (want != null) {
+            for (Map.Entry<Integer, Integer> w : new LinkedHashMap<>(want).entrySet()) {
+                if (armPort(cp, targetDevice, w.getKey(), w.getValue())) armed++;
+                else lost++;
+                if (replay.length() > 0) replay.append(",");
+                replay.append(armDetail);
+            }
+        }
+        lastReplay = replay.toString();
+        android.util.Log.w("P2pDeviceTunnel", String.format(
+                "rebuild(0x%08X) reason=%s replay=%d lost=%d [%s]",
+                cp, reason, armed, lost, lastReplay));
+        return (armed > 0 || lost == 0) ? cp : null;
+    }
+
+    private static String okJson(int localPort, int targetPort, boolean created) throws Exception {
+        lastOkAtMs = System.currentTimeMillis();
+        lastLocalPort = localPort;
+        lastTargetPort = targetPort;
+        return new JSONObject()
+                .put("ok", true).put("localPort", localPort)
+                .put("targetPort", targetPort).put("multi", true)
+                .put("created", created).toString();
     }
 
     /**
@@ -131,25 +301,40 @@ public final class P2pSyncTunnel {
             String secret = o.optString("secret", "");
             if (secret.isEmpty()) secret = VnetTransport.DEFAULT_SECRET;
 
-            // 已 armed 且端口仍在占用表里 → **先验活**再幂等返回（2026-11-12 白屏实案：
-            // vnet 客户端连接死亡后 FORWARDS/PORT_OWNER 仍留旧口，上层拿到死口开分享页
-            // = WebView 白屏。探活失败 → 清掉该设备全部映射并走重建，绝不返回死口。）
+            // 已 armed 且端口仍在占用表里 → **两级验活**再幂等返回：
+            // ① probeLocal（回环 accept）抓「连接销毁后映射残留」；
+            // ② dataPlaneAlive（端到端 HTTP 拉网关 manifest）抓「listener 活着但隧道已死」。
+            // 任一失败 → rebuildDevice：停机重建后按 DESIRED 重放该设备**全部**端口，
+            // 绝不能只补当前这一条（否则别的端口被连坐，见类注释）。
             Integer hit = FORWARDS.get(key(targetDevice, targetPort));
             if (hit != null && PORT_OWNER.containsKey(hit)) {
-                if (probeLocal(hit)) {
+                if (probeLocal(hit) && aliveCached(hit)) {
                     lastDevice = targetDevice;
                     lastTargetPort = targetPort;
                     lastLocalPort = hit;
-                    return new JSONObject()
-                            .put("ok", true).put("localPort", hit)
-                            .put("targetPort", targetPort).put("multi", true)
-                            .put("created", false).toString();
+                    return okJson(hit, targetPort, false);
                 }
-                android.util.Log.w("P2pDeviceTunnel",
-                        "stale forward :" + hit + " -> " + targetDevice + ":" + targetPort
-                                + " (listener dead) — evicting device maps, re-arming");
-                evictDevice(targetDevice);
-                // 不 return：落到下方重建路径
+                boolean listener = probeLocal(hit);
+                lastTrace = "hitdead port=" + hit + " listener=" + listener + " alive=false";
+                Long rebuiltAt = REBUILD_AT.get(targetDevice);
+                if (listener && rebuiltAt != null
+                        && System.currentTimeMillis() - rebuiltAt < REBUILD_GRACE_MS) {
+                    // 冷静期内不二次重建（防重建风暴）：listener 在就交回调用方，
+                    // 数据面是否真通由它这次真实请求说了算（见 REBUILD_GRACE_MS）。
+                    lastDevice = targetDevice;
+                    lastTargetPort = targetPort;
+                    lastLocalPort = hit;
+                    lastTrace = lastTrace + " grace-skip rebuild";
+                    return okJson(hit, targetPort, false);
+                }
+                rebuildDevice(device, targetDevice, relay, secret,
+                        "probe-fail:" + hit + "->" + targetPort + " listener=" + listener);
+                Integer again = FORWARDS.get(key(targetDevice, targetPort));
+                if (again != null && PORT_OWNER.containsKey(again)) {
+                    lastDevice = targetDevice;
+                    return okJson(again, targetPort, true);
+                }
+                return err("重建后仍无可用口（" + lastErr + "）");
             }
 
             if (!VnetClient.ensureInit()) {
@@ -160,53 +345,41 @@ public final class P2pSyncTunnel {
             ensureIdentity();
 
             Integer clientPeer = DEVICE_CLIENT.get(targetDevice);
+            lastTrace = "nohit target=" + targetDevice + " port=" + targetPort
+                    + " wantLocal=" + wantLocal + " cp=" + clientPeer;
             boolean created = false;
             if (clientPeer == null) {
-                int cp = VnetTransport.clientPeerId(device, targetDevice, 0);
-                int multiServer = VnetTransport.multiServerPeerId(targetDevice);
-                try { VnetClient.stopClientPeer(cp); } catch (Throwable ignored) { }
-                int rc = VnetClient.vnet_client_start_multi(relay, cp, multiServer, secret);
-                if (rc != VnetClient.VNET_OK && rc != VnetClient.VNET_ERR_RUNNING) {
-                    String why = VnetClient.lastError();
-                    lastErr = "vnet_client_start_multi rc=" + rc + " why=" + why;
-                    return err("设备隧道建立失败 rc=" + rc + " why=" + why);
+                Integer started = startClientFor(device, targetDevice, relay, secret);
+                lastTrace = lastTrace + " start cp=" + started + " err=" + lastErr;
+                if (started == null) {
+                    return err("设备隧道建立失败 " + lastErr);
                 }
-                DEVICE_CLIENT.put(targetDevice, cp);
-                clientPeer = cp;
+                clientPeer = started;
                 created = true;
             }
 
             int localPort = wantLocal > 0 ? wantLocal : allocPort();
-            if (localPort <= 0) return err("本地口耗尽（25910-25999 全被占）");
+            if (localPort <= 0) return err("本地口耗尽（" + PORT_BASE + "-" + PORT_MAX + " 全被占）");
             String owner = PORT_OWNER.get(localPort);
             if (owner != null && !owner.equals(key(targetDevice, targetPort))) {
                 return err("本地口 " + localPort + " 已被 " + owner + " 占用");
             }
-            int rcFwd = VnetClient.vnet_client_add_forward(clientPeer, (short) localPort, (short) targetPort);
-            if (rcFwd != VnetClient.VNET_OK) {
-                String why = VnetClient.lastError();
-                lastErr = "add_forward rc=" + rcFwd + " why=" + why;
+            if (!armPort(clientPeer, targetDevice, targetPort, localPort)) {
                 // 连接是本轮新建的且这条转发失败 → 没有可用转发就回收连接
                 if (created && !FORWARDS.containsKey(key(targetDevice, targetPort))) {
                     try { VnetClient.stopClientPeer(clientPeer); } catch (Throwable ignored) { }
                     DEVICE_CLIENT.remove(targetDevice);
                 }
-                return err("转发口建立失败 rc=" + rcFwd + " why=" + why);
+                return err("转发口建立失败 " + lastErr);
             }
-            FORWARDS.put(key(targetDevice, targetPort), localPort);
-            PORT_OWNER.put(localPort, key(targetDevice, targetPort));
             lastErr = "";
-            lastOkAtMs = System.currentTimeMillis();
             lastDevice = targetDevice;
             lastTargetPort = targetPort;
             lastLocalPort = localPort;
             android.util.Log.i("P2pDeviceTunnel", String.format(
                     "armed :%d -> %s:%d (peer 0x%08X, created=%s)",
                     localPort, targetDevice, targetPort, clientPeer, created));
-            return new JSONObject()
-                    .put("ok", true).put("localPort", localPort)
-                    .put("targetPort", targetPort).put("multi", true)
-                    .put("created", created).toString();
+            return okJson(localPort, targetPort, created);
         } catch (Exception e) {
             lastErr = String.valueOf(e);
             return err("参数错误：" + e.getMessage());
@@ -231,13 +404,27 @@ public final class P2pSyncTunnel {
         } catch (Throwable ignored) { }
     }
 
-    /** 状态快照（诊断）。多设备多端口全列出来。 */
+    /** 状态快照（诊断）。多设备多端口全列出来（含期望面与重建计数）。 */
     public static synchronized String state() {
         try {
             JSONObject o = new JSONObject();
             o.put("ok", !FORWARDS.isEmpty());
             o.put("forwards", new JSONObject(new HashMap<>(FORWARDS)));
             o.put("devices", DEVICE_CLIENT.size());
+            o.put("rebuilds", rebuilds);
+            o.put("lastRebuildReason", lastRebuildReason);
+            o.put("lastRebuildAtMs", lastRebuildAtMs);
+            o.put("lastReplay", lastReplay);
+            o.put("lastTrace", lastTrace);
+            JSONObject want = new JSONObject();
+            for (Map.Entry<String, Map<Integer, Integer>> e : DESIRED.entrySet()) {
+                JSONObject ports = new JSONObject();
+                for (Map.Entry<Integer, Integer> p : e.getValue().entrySet()) {
+                    ports.put(String.valueOf(p.getKey()), p.getValue());
+                }
+                want.put(e.getKey(), ports);
+            }
+            o.put("desired", want);
             o.put("lastDevice", lastDevice.isEmpty() ? "" : NativeRdpTunnel.shortDid(lastDevice));
             o.put("lastTargetPort", lastTargetPort);
             o.put("lastLocalPort", lastLocalPort);

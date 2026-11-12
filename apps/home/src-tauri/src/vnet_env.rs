@@ -1094,29 +1094,63 @@ pub async fn env_open_with(rt: &dyn EnvRuntime, body: &Value) -> Value {
     }
 
     // ③ keep + 建链
+    let mut drift_from: Option<u16> = None;
     // 2026-11-09 负缓存自锁突破：env_open 是**用户显式打开**（不是后台无脑重试），
     // 先清该 (device, port) 的负缓存——否则 keeper 的 120s 退避会让「用户点击」也
     // 直接短路成「设备离线」（今天笔记本 13911 反复 offline 的直接机制）。
     if !spec.device.trim().is_empty() && spec.port != 0 {
         crate::vnet_forward::clear_vnet_backoff(&spec.device, spec.port);
     }
-    let (local_port, how) = match tokio::time::timeout(FORWARD_BUDGET, rt.ensure_forward(&spec)).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            let ms = t0.elapsed().as_millis();
-            let (state, msg) = forward_failure_state(&call, &spec, &e);
-            env_trace!("env-open forward-err state={} msg={msg}", state.as_str());
-            // 租约：建链失败=上游/本机故障 → degraded（已有的租约不释放、不换口）
-            rt.lease_event(&call, &spec, LeaseHook::UpstreamFail(e.clone()));
-            rt.audit(&call, state, 0, false, ms);
-            return envelope(&call, state, 0, &Launch::default(), ms, Some(msg));
-        }
-        Err(_) => {
-            let ms = t0.elapsed().as_millis();
-            let state = EnvState::Offline;
-            rt.lease_event(&call, &spec, LeaseHook::UpstreamFail("建链超时".into()));
-            rt.audit(&call, state, 0, false, ms);
-            return envelope(&call, state, 0, &Launch::default(), ms, Some("建链超时（设备离线或网络不稳）".into()));
+    let (local_port, how) = {
+        // adb 消费口「占用顺延」：**只有 adb 允许**（见 [`adb_port_drift_allowed`]）。
+        // 返回 Ok(Ok(v))=成功 / Ok(Err(e))=建链失败 / Err(())=建链超时。
+        let mut drifted_from: Option<u16> = None;
+        let mut cur = spec.clone();
+        let mut tries = 0u16;
+        let attempt: Result<Result<(u16, String), String>, ()> = loop {
+            match tokio::time::timeout(FORWARD_BUDGET, rt.ensure_forward(&cur)).await {
+                Ok(Ok(v)) => break Ok(Ok(v)),
+                Ok(Err(e)) => {
+                    if tries < ADB_PORT_DRIFT_MAX && adb_port_drift_allowed(&spec, &e) {
+                        tries += 1;
+                        drifted_from = Some(spec.local_port);
+                        cur.local_port = spec.local_port.saturating_add(tries);
+                        env_trace!(
+                            "env-open adb port drift {} -> {}（{}）",
+                            spec.local_port,
+                            cur.local_port,
+                            e
+                        );
+                        continue;
+                    }
+                    break Ok(Err(e));
+                }
+                Err(_) => break Err(()),
+            }
+        };
+        match attempt {
+            Ok(Ok(v)) => {
+                if let Some(from) = drifted_from {
+                    drift_from = Some(from);
+                }
+                v
+            }
+            Ok(Err(e)) => {
+                let ms = t0.elapsed().as_millis();
+                let (state, msg) = forward_failure_state(&call, &spec, &e);
+                env_trace!("env-open forward-err state={} msg={msg}", state.as_str());
+                // 租约：建链失败=上游/本机故障 → degraded（已有的租约不释放、不换口）
+                rt.lease_event(&call, &spec, LeaseHook::UpstreamFail(e.clone()));
+                rt.audit(&call, state, 0, false, ms);
+                return envelope(&call, state, 0, &Launch::default(), ms, Some(msg));
+            }
+            Err(()) => {
+                let ms = t0.elapsed().as_millis();
+                let state = EnvState::Offline;
+                rt.lease_event(&call, &spec, LeaseHook::UpstreamFail("建链超时".into()));
+                rt.audit(&call, state, 0, false, ms);
+                return envelope(&call, state, 0, &Launch::default(), ms, Some("建链超时（设备离线或网络不稳）".into()));
+            }
         }
     };
     env_trace!("env-open forward-ok local={local_port} how={how}");
@@ -1196,6 +1230,17 @@ pub async fn env_open_with(rt: &dyn EnvRuntime, body: &Value) -> Value {
     if let Some(o) = out.as_object_mut() {
         o.insert("tunnel".into(), json!(how));
         o.insert("selfTarget".into(), json!(presence == Presence::SelfTarget));
+        // adb 消费口顺延要如实回带：卡上写的是 15555，实际给的是 local_port。
+        if let Some(from) = drift_from {
+            o.insert("portDrifted".into(), json!(true));
+            o.insert("driftFrom".into(), json!(from));
+            o.insert(
+                "message".into(),
+                json!(format!(
+                    "本地口 {from} 被本机其它进程占用，已顺延到 {local_port}（adb 用这个口：adb connect 127.0.0.1:{local_port}）"
+                )),
+            );
+        }
         o.insert(
             "presence".into(),
             json!(match presence {
@@ -1217,6 +1262,24 @@ fn is_local_port_error(e: &str) -> bool {
         || e.contains("本地监听失败")
         || e.contains("localPort")
         || e.contains("隧道白名单")
+}
+
+/// adb 消费口顺延上限（顺延 20 个口都占满=本机端口环境异常，如实报错）。
+const ADB_PORT_DRIFT_MAX: u16 = 20;
+
+/// 本地口被占时，**是否允许顺延到下一个口**。
+///
+/// 只给 `adb`：其它 kind 的本地口是**缓存坐标**（RDP 复制地址、DSH 干净 URL 的
+/// `:port` 段），静默漂移会让用户拿旧地址连错口——2026-10-25 的真案（本机 svchost
+/// 占 23911，旧逻辑把别人的监听当自己的口返回，协议探测报「目标未提供服务」），
+/// 因此那类 kind 必须硬失败。
+///
+/// adb 的消费方式是命令行 `adb connect 127.0.0.1:<localPort>`，口是从响应字段现取的
+/// （envelope 同时回带 `requestedLocalPort`），漂移只需如实回带。而 `15555` 在本机
+/// 长期被 frpc 的老「手机 adb」映射占着（2026-11-12 实测：卡上写 15555 必失败，
+/// 改 15556 立刻通），不让顺延就等于这张卡永远打不开。
+fn adb_port_drift_allowed(spec: &EnvSpec, err: &str) -> bool {
+    spec.kind == "adb" && is_local_port_error(err)
 }
 
 /// 建链失败 → 终态 + 人话。默认口（卡上没给 localPort）被占时，文案必须点名
@@ -2655,6 +2718,10 @@ mod tests {
         launch: Launch,
         /// 租约专项测试：Opened/健康事件委托真实 vnet_lease；其余测试保持 no-op。
         use_real_lease: bool,
+        /// 这些本地口「被本机其它进程占用」→ ensure_forward 返回硬错误（顺延专项）。
+        port_busy: Vec<u16>,
+        /// 成功时回显 `spec.local_port`（顺延专项需要看到漂移后的口）。
+        echo_port: bool,
         c: Arc<Counters>,
     }
 
@@ -2664,9 +2731,21 @@ mod tests {
             let p = self.presence;
             Box::pin(async move { p })
         }
-        fn ensure_forward<'a>(&'a self, _spec: &'a EnvSpec) -> BoxFut<'a, Result<(u16, String), String>> {
+        fn ensure_forward<'a>(&'a self, spec: &'a EnvSpec) -> BoxFut<'a, Result<(u16, String), String>> {
             self.c.forward.fetch_add(1, Ordering::SeqCst);
-            let r = self.forward.clone();
+            let busy = self.port_busy.contains(&spec.local_port);
+            let echo = self.echo_port;
+            let want = spec.local_port;
+            let r = if busy {
+                Err(format!(
+                    "固定本地口 127.0.0.1:{} 绑定失败：端口已被本机其他进程占用；请释放该端口或改 localPort",
+                    spec.local_port
+                ))
+            } else if echo {
+                Ok((want, "opened".into()))
+            } else {
+                self.forward.clone()
+            };
             Box::pin(async move { r })
         }
         fn probe<'a>(&'a self, _spec: &'a EnvSpec, _l: u16) -> BoxFut<'a, bool> {
@@ -2726,6 +2805,8 @@ mod tests {
                 probe,
                 launch: Launch { started: true, client: "mstsc".into(), pid: Some(4242), error: None, hint: None },
                 use_real_lease: false,
+                port_busy: Vec::new(),
+                echo_port: false,
                 c: c.clone(),
             },
             c,
@@ -2755,8 +2836,7 @@ mod tests {
         assert!(out["message"].as_str().unwrap().contains("离线"));
     }
 
-    /// R27 / V20.4：TCP 通但协议不响应 → no-service，不启动客户端。
-    #[tokio::test]
+    /// R27 / V20.4：TCP 通但协议不响应 → no-service，不启动客户端。    #[tokio::test]
     async fn env_open_no_service_when_probe_fails() {
         let (rt, c) = mock(Presence::Online, true, false);
         let out = env_open_with(&rt, &body(json!(["vnet.forward"]))).await;
@@ -2766,6 +2846,41 @@ mod tests {
         assert_eq!(out["address"], "127.0.0.1:23389");
         assert_eq!(c.launch.load(Ordering::SeqCst), 0, "无服务时不许启动客户端");
         assert!(out["message"].as_str().unwrap().contains("远程桌面"));
+    }
+
+    /// adb 消费口被本机其它进程占用（15555 被 frpc 老映射占的真案）→ **顺延**到
+    /// 下一个空闲口，并如实回带 requestedLocalPort/portDrifted，让消费者用新口。
+    #[tokio::test]
+    async fn env_open_adb_port_busy_drifts_and_reports() {
+        let (mut rt, _c) = mock(Presence::Online, true, true);
+        rt.port_busy = vec![15555];
+        rt.echo_port = true;
+        let b = json!({
+            "cardId": "sh-adb-drift", "taskId": "task-adb-drift", "caps": ["vnet.forward"],
+            "env": { "kind": "adb", "device": "did:myco:z6MkPhone",
+                     "port": 5555, "localPort": 15555 }
+        });
+        let out = env_open_with(&rt, &b).await;
+        assert_eq!(out["state"], "ready", "顺延后必须 ready: {out}");
+        assert_eq!(out["localPort"], 15556);
+        assert_eq!(out["requestedLocalPort"], 15555);
+        assert_eq!(out["portDrifted"], true);
+        assert_eq!(out["driftFrom"], 15555);
+        assert_eq!(out["address"], "127.0.0.1:15556");
+        assert!(out["message"].as_str().unwrap().contains("15556"));
+    }
+
+    /// 负对照：非 adb 的口被占**绝不允许**顺延（本地口是缓存坐标，漂移=连错口）。
+    #[tokio::test]
+    async fn env_open_non_adb_port_busy_never_drifts() {
+        let (mut rt, _c) = mock(Presence::Online, true, true);
+        rt.port_busy = vec![23389];
+        rt.echo_port = true;
+        let out = env_open_with(&rt, &body(json!(["vnet.forward"]))).await;
+        assert_eq!(out["ok"], false);
+        assert_eq!(out["state"], "error");
+        assert!(out.get("portDrifted").is_none(), "rdp 不许顺延: {out}");
+        assert_eq!(out["requestedLocalPort"], 23389);
     }
 
     /// R27 / V20.5：caps 缺 vnet.forward → denied，连 presence 都不问。

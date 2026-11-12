@@ -71,6 +71,10 @@ public class MainActivity extends Activity {
     @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle b) {
+        // 2026-11-12 vnet 诊断旋钮（连接秒死案）：必须在 VnetClient 类加载（System
+        // .loadLibrary + env 读取都更早）之前设 env——onCreate 第一句。文件开关热切：
+        // files/vnet-no-p2p、files/vnet-debug（见 VnetClient.applyEnvToggles）。
+        VnetClient.applyEnvToggles(this);
 
         // 2026-10-28 深链接登录（DL-Auth）：检查启动 Intent 是否是 myco://auth
         handleDeepLink(getIntent());
@@ -502,6 +506,20 @@ public class MainActivity extends Activity {
 
     /** JS bridge:PWA 侧 window.MycoShell 探测/保活/自更新。 */
     private static class MycoShell {
+        /** 2026-11-12 连接秒死案：诊断开关热切（vnet-no-p2p / vnet-debug）。
+         *  写/删 files 下标记文件，重启 app 后 applyEnvToggles 生效（env 须在
+         *  vnet_* 调用前设——重启代价 3s，诊断期可接受）。 */
+        @android.webkit.JavascriptInterface
+        public String vnetDiagToggle(String name, boolean on) {
+            try {
+                java.io.File f = new java.io.File(act.getFilesDir(), name);
+                if (on) { java.io.FileWriter w = new java.io.FileWriter(f); w.write("1"); w.close(); }
+                else { f.delete(); }
+                return "{\"ok\":true,\"name\":\"" + name + "\",\"on\":" + on + "}";
+            } catch (Exception e) {
+                return "{\"ok\":false,\"err\":\"" + String.valueOf(e).replace("\"", "'") + "\"}";
+            }
+        }
         /**
          * 2026-10-23：应用内浏览器（DSH 分享页专用）。
          * 系统浏览器（荣耀/百度 LightSearchActivity）经 vnet forward 打开 127.0.0.1 页面不可用；
@@ -542,6 +560,39 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public boolean isApk() { return true; }
+
+        /**
+         * 2026-11-12：剪贴板桥。
+         *
+         * 为什么必须走壳：WebView 里 `navigator.clipboard.writeText` / `execCommand('copy')`
+         * 都要求**用户手势上下文**，而 RDP 卡片的复制发生在若干 await（隧道 ensure）之后，
+         * 手势早就丢了 —— 真机实测两条路都失败，卡片只能提示「自动复制失败，手动输入」。
+         * 壳侧 setPrimaryClip 不需要手势，稳定成功。
+         */
+        @JavascriptInterface
+        public boolean copyText(String text) {
+            try {
+                final String t = text == null ? "" : text;
+                if (t.isEmpty()) return false;
+                final android.app.Activity a = act;
+                a.runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        try {
+                            android.content.ClipboardManager cm =
+                                    (android.content.ClipboardManager) a.getSystemService(
+                                            android.content.Context.CLIPBOARD_SERVICE);
+                            if (cm != null) {
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("myco", t));
+                            }
+                        } catch (Throwable ignored) { }
+                    }
+                });
+                return true;
+            } catch (Throwable e) {
+                android.util.Log.e("MycoShell", "copyText failed: " + e);
+                return false;
+            }
+        }
 
         /**
          * 2026-11-06 目标②：RDP 桥——启动手机上的 Microsoft Remote Desktop。
