@@ -3975,7 +3975,7 @@ mod tests {
     /// fire-and-forget 挂载面：cloud_discovery_spawn_at 后台跑完 → 账号入列
     /// （account_status 启动路径同款；轮询等收尾，不 sleep 死等）。
     #[tokio::test]
-    #[ignore = "ubuntu CI: background spawn never writes listing within 100s (works on Windows; pending real-linux verification, tracked in #3)"]
+    #[ignore = "GitHub Actions container limitation only — verified PASSING on real Linux (Debian, tmp-dev-01); tracked in #3"]
     async fn cloud_discovery_spawn_lists_account_in_background() {
         let _g = CfgGuard::new("disc-spawn");
         reset_account_caches();
