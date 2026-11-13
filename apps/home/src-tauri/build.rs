@@ -58,18 +58,24 @@ fn main() {
     // feat/cli-suite：GUI 变体才跑 tauri 构建（生成 context/资源清单，要求
     // tauri.conf.json + frontendDist）；CLI 变体（--no-default-features）纯 Rust，
     // 跳过——docker headless 构建不需要 webkit/dist。
+    // 2026-11-13 开源 Issue #3：build.rs 无 cfg! 宏，用 CARGO_CFG_TARGET_OS 判平台。
+    // MSVC link-arg / dpi.rc / embed_manifest 仅 Windows——Linux+gui 时喂给 lld 必挂。
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let is_windows = target_os == "windows";
     if std::env::var("CARGO_FEATURE_GUI").is_ok() {
         tauri_build::build();
-        // PMv2 DPI manifest(进程启动前生效,比运行时 API 可靠——tao 可能覆盖后者)
-        if std::path::Path::new("../../shared/dpi.rc").exists() {
-            println!("cargo:rerun-if-changed=../../shared/permonitor.manifest");
-            println!("cargo:rerun-if-changed=../../shared/dpi.rc");
-            embed_manifest();
+        if is_windows {
+            // PMv2 DPI manifest(进程启动前生效,比运行时 API 可靠——tao 可能覆盖后者)
+            if std::path::Path::new("../../shared/dpi.rc").exists() {
+                println!("cargo:rerun-if-changed=../../shared/permonitor.manifest");
+                println!("cargo:rerun-if-changed=../../shared/dpi.rc");
+                embed_manifest();
+            }
+            // 集成测试目标（tests/）嵌 SxS manifest（见文件头注释）：只此作用域，
+            // bin 不碰（CVT1100），lib 单测不需要（cfg(not(test)) 不链 webview）。
+            println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+            println!("cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
         }
-        // 集成测试目标（tests/）嵌 SxS manifest（见文件头注释）：只此作用域，
-        // bin 不碰（CVT1100），lib 单测不需要（cfg(not(test)) 不链 webview）。
-        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
     } else {
         println!("cargo:rerun-if-changed=build.rs");
     }
