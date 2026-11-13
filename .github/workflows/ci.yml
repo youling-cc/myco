@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -67,3 +67,7 @@ jobs:
       - run: pnpm --dir apps/media/ui build
       - uses: dtolnay/rust-toolchain@stable
       - run: cd apps/home/src-tauri && cargo test --workspace --lib
+  # --lib only: GUI bin/test targets link the tauri webview stack, which crashes
+  # rust-lld on ubuntu (lld crash stack, raw-dylibs path). Integration tests
+  # (tests/) are verified locally on Windows. Revisit when CLI variant (issue #3 A3)
+  # builds — then CI can run the non-gui targets too.

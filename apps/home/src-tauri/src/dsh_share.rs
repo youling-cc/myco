@@ -29232,7 +29232,10 @@ mod tests {
         );
     }
 
+    // 2026-11-13 D 修（开源 Issue #3）：system32_tool() 是 Windows 路径语义
+    // （C:\Windows\System32\tasklist.exe），非 Windows 上 is_absolute() 恒 false。
     #[test]
+    #[cfg(windows)]
     fn system32_tools_use_absolute_paths() {
         assert!(system32_tool("tasklist.exe").is_absolute());
         assert!(system32_tool("netstat.exe").is_absolute());
