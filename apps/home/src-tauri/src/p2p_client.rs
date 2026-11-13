@@ -197,6 +197,26 @@ static PRESENCE_CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(std::time:
 static PRESENCE_FETCH_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// 立即作废 presence 行缓存（下一次查询强制回源）。
+///
+/// 为什么需要（2026-11-12 delegation_notify_full_path 真案）：集成测试在同一进程里
+/// 切换 mock 场景（在线→死地址→离线），2.5s TTL 内场景②吃到①缓存的旧地址——
+/// POST 打到场景①仍在监听的 mock 上返回 2xx，「地址不可达应 false」被污染成 true
+/// （0.01s 完成、零网络日志即此特征）。生产语义不受影响（缓存仍按 TTL 滚动），
+/// 本函数只给测试/运维一个显式失效入口。
+pub fn presence_cache_invalidate() {
+    // try_lock 而非 blocking_lock：本函数会在 async 测试上下文被调（blocking_lock
+    // 在 tokio worker 线程上直接 panic「cannot block the current thread」）。
+    // 缓存写入持锁窗口极短（毫秒级回源），自旋重试必然抢到。
+    for _ in 0..200 {
+        if let Ok(mut c) = PRESENCE_CACHE.try_lock() {
+            *c = None;
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// 拉 presence 全量在线列表（发现层查询；失败=空——调用方按"无人在线"兜底）。
 async fn presence_list() -> Vec<Value> {
     presence_list_result().await.unwrap_or_default()
@@ -232,6 +252,8 @@ async fn presence_list_result() -> Result<Vec<Value>, ()> {
         // 网络/签名失败 = 未知，不冒充"没有人在线"（stale 也不拿来冒充新鲜名册）。
         Err(_) => return Err(()),
     };
+    // 2026-11-12：顺手刷新 (did → kind) 同步缓存（客户端 peer-id 选择要用，见 cached_device_kind）。
+    presence_kind_cache_update(&rows);
     if rows.is_empty() {
         // 空结果：有过期缓存就沿用（宁可 2.5s+ 旧列表，也别把"服务慢"变成"0 台"）；
         // 没有缓存才是真的空名册（= 目标确实不在线）。
@@ -287,6 +309,56 @@ async fn presence_devices(account: &str) -> Vec<PeerDevice> {
         .filter(|d| row_targets_account(d, account))
         .filter_map(|d| peer_from_entry(d, &my_device))
         .collect()
+}
+
+/// 最近一次 presence 拉取里各设备的 `kind`（同步缓存）。
+///
+/// 为什么需要同步版（2026-11-12 手机 5555 真案）：客户端选 peer id
+/// （`multi-forward-v1` vs `:server:<port>`）发生在**同步**的建链路径里
+/// （`vnet_forward::start_vnet_forward_selected` 跑在 spawn_blocking 里），
+/// 不能在里面 await presence。这里在 presence 刷新时顺手落一张 (did → kind) 表，
+/// 同步路径只读它：拿不到 = `None` = 调用方按现行为处理（不改变 PC↔PC multi）。
+static PRESENCE_KIND_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 用一次 presence 原始行刷新 kind 缓存（只在拉取成功时调用；失败不写，避免把"不知道"写成"没有"）。
+fn presence_kind_cache_update(rows: &[Value]) {
+    let mut g = PRESENCE_KIND_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    for row in rows {
+        let did = row.get("did").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if did.is_empty() || kind.is_empty() {
+            continue;
+        }
+        g.insert(did.to_string(), kind.to_string());
+    }
+}
+
+/// 同步读某个设备最近上报的 `kind`（`phone`/`tablet`/`pc`/…）；未知 = `None`。
+///
+/// 走 `did_equiv` 归一（`did:myco:` / `did:youling:` 同钥等价），与 presence 其它查询口径一致。
+pub(crate) fn cached_device_kind(device_did: &str) -> Option<String> {
+    let g = PRESENCE_KIND_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(k) = g.get(device_did) {
+        return Some(k.clone());
+    }
+    g.iter()
+        .find(|(did, _)| core_id::did_equiv(did, device_did))
+        .map(|(_, k)| k.clone())
+}
+
+/// 测试钩子：写入 kind 缓存（只给单测用；`None` = 清）。
+#[cfg(test)]
+pub(crate) fn test_set_cached_device_kind(device_did: &str, kind: Option<&str>) {
+    let mut g = PRESENCE_KIND_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    match kind {
+        Some(k) => {
+            g.insert(device_did.to_string(), k.to_string());
+        }
+        None => {
+            g.remove(device_did);
+        }
+    }
 }
 
 /// presence 行 → 正向直推设备清单（纯函数；与 [`presence_devices`] 同口径，
@@ -1139,15 +1211,76 @@ pub async fn deliver_to_account(account: &str, envelope: &Value) -> bool {
 /// vnet 隧道有独立候选赛跑+中继兜底（R23/影子已证秒级可达）。
 /// 用 oneshot channel 隔离（Receiver<bool> 是具体类型，不引入 tunnel_open 的 future 类型链）。
 
-/// M1-2 退避表：设备 did → 退避截止时间。失败后 30s 内不再为该设备烧赛跑预算。
-/// 任一设备 vnet 隧道成功 → 全部清零（网络恢复信号）。
+/// 投递失败的**层**（2026-11-12 现场沉淀）：
+/// `POST 失败 ≠ 建链失败`。事故里 `[p2p-post] … 连接失败`（隧道内被关）被当成"设备离线"
+/// 一并喂进退避，而同一台设备 presence 明确在线（自己家的笔记本）——层混了就必然误判。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryFailure {
+    /// 建链失败（route_open / tunnel_acquire 拿不到本地口）。
+    Build,
+    /// 隧道开了，但本地口 POST 在**连接层**失败（accept 后被隧道内关闭）
+    /// → 旧 route/Connection 已死（对端重启后未重建），要拆掉重来。
+    PostTransport,
+    /// 对端应答了但非 2xx / 读体失败 → 隧道活着，对端忙或协议问题，**不是不可达**。
+    PeerAnswered,
+}
+
+impl DeliveryFailure {
+    /// 是否算"对端不可达"证据（只有这两种才喂共享退避阶梯）。
+    pub(crate) fn feeds_ladder(self) -> bool {
+        matches!(self, DeliveryFailure::Build | DeliveryFailure::PostTransport)
+    }
+
+    /// 喂阶梯时的原因串（进 `/api/vnet/leases` 的 failReason / backoffs[].reason）。
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            DeliveryFailure::Build => "deliver-build-fail",
+            DeliveryFailure::PostTransport => "deliver-post-connect-fail",
+            DeliveryFailure::PeerAnswered => "deliver-peer-answered",
+        }
+    }
+}
+
+/// 本地口 POST 结果 → 失败层（`None` = 成功，不算失败）。
+///
+/// 纯函数，单测直击：这是"POST 失败别把在线设备打成离线"这条要求的判定核。
+pub(crate) fn classify_post_failure(o: &LocalPostOutcome) -> Option<DeliveryFailure> {
+    match o {
+        LocalPostOutcome::Ok(_) => None,
+        LocalPostOutcome::ConnectFail(_) => Some(DeliveryFailure::PostTransport),
+        // 能应答（HTTP 非 2xx）/ 读体失败 / 签名失败：隧道活着，不算不可达。
+        LocalPostOutcome::HttpStatus(_) | LocalPostOutcome::Other(_) => {
+            Some(DeliveryFailure::PeerAnswered)
+        }
+    }
+}
+
+/// 投递失败统一记账：**分层喂表** + 旧 route 失效。
+///
+/// · `Build` / `PostTransport` → 喂共享退避阶梯（对端真的不可达）；
+/// · `PostTransport` 额外 `route_close`：现场根因是 `route_open` 会复用
+///   `accept_alive` 的**旧 route**（对端 01:36 重启后它已死），不拆就永远重试同一个
+///   死 Connection（`[p2p-post] → 连接失败` 每 30s 一次、`偶发兜底送达`）；
+/// · `PeerAnswered` → **不喂表**（隧道活着，喂表会把在线设备打成离线）。
+pub(crate) fn note_delivery_failure(device: &str, port: u16, failure: DeliveryFailure, now: u64) {
+    if failure.feeds_ladder() {
+        crate::vnet_lease::rebuild_backoff_note_failure(device, port, now, failure.reason());
+    }
+    if failure == DeliveryFailure::PostTransport {
+        crate::vnet_forward::route_close(device, port);
+    }
+}
+
+/// M1-2 退避表：设备 did → 退避截止时间。**只给"对端已应答但投递失败"（PeerAnswered）
+/// 这类噪声做 30s 抑制**；真正的不可达由共享退避阶梯管（2026-11-12：原先所有失败都走
+/// 这张 30s 表，既绕过阶梯又把在线设备打成离线）。
 static M1_2_BACKOFF: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 const M1_2_BACKOFF_SECS: u64 = 30;
 
 fn vnet_tunnel_fallback_spawn(did: String, envelope: Value) -> tokio::sync::oneshot::Receiver<bool> {
-    // 退避检查：同一设备 30s 内失败过 → 跳过（只记一行，不刷屏）
+    // 噪声抑制：同一设备 30s 内"对端已应答但投递失败"过 → 跳过（只记一行）
     {
         let g = M1_2_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(until) = g.get(&did) {
@@ -1163,27 +1296,61 @@ fn vnet_tunnel_fallback_spawn(did: String, envelope: Value) -> tokio::sync::ones
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
+        // ── 闸门：与聊天池/keeper **共用同一张离线退避表** + presence 在线旁路 ──
+        // （2026-11-12：原先这条腿直接 route_open，既不看退避也不看 presence，
+        //  于是"设备在线但隧道旧"时每 30s 建→投→拆一次，旁路也救不到它。）
+        let now = now_ms().max(0) as u64;
+        let backoff_active = crate::vnet_lease::rebuild_backoff_active(&did, 9100, now);
+        let peer_online = if backoff_active {
+            chat_delivery_peer_online(&did).await
+        } else {
+            None
+        };
+        if chat_tunnel_build_gate(false, backoff_active, peer_online) == TunnelBuildGate::SkipBackoff {
+            // 离线（或拿不到在线证据）+ 退避中 → 不建链、不打日志（阶梯到点再来）
+            let _ = tx.send(false);
+            return;
+        }
+        if backoff_active && peer_online == Some(true) {
+            // 在线 = 恢复证据：清退避再建链（失败会重新入表）
+            chat_delivery_record_success(&did);
+        }
         let ok = match crate::vnet_forward::route_open(&did, 9100, None).await {
             Ok(port) => {
-                let sent = p2p_post_via_local(port, "/p2p/msg", &envelope).await.is_some();
-                if sent {
-                    eprintln!(
-                        "[p2p-client] M1-2 vnet 隧道兜底送达 {}(port={})",
-                        &did.chars().take(20).collect::<String>(),
-                        port
-                    );
-                    // 成功 → 清全部退避（网络恢复信号，其它设备也该重试）
-                    M1_2_BACKOFF.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                } else {
-                    eprintln!(
-                        "[p2p-client] M1-2 vnet 隧道开了(port={})但 /p2p/msg POST 失败 {}",
-                        port,
-                        &did.chars().take(20).collect::<String>()
-                    );
+                let outcome = p2p_post_via_local_ex(port, "/p2p/msg", &envelope).await;
+                match classify_post_failure(&outcome) {
+                    None => {
+                        eprintln!(
+                            "[p2p-client] M1-2 vnet 隧道兜底送达 {}(port={})",
+                            &did.chars().take(20).collect::<String>(),
+                            port
+                        );
+                        chat_delivery_record_success(&did);
+                        M1_2_BACKOFF.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                        true
+                    }
+                    Some(failure) => {
+                        // 分层：PostTransport（隧道内被关）→ 拆旧 route + 喂阶梯；
+                        //       PeerAnswered（对端应答了）→ 只做 30s 噪声抑制，不喂阶梯。
+                        note_delivery_failure(&did, 9100, failure, now_ms().max(0) as u64);
+                        if failure == DeliveryFailure::PeerAnswered {
+                            M1_2_BACKOFF
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(did.clone(), std::time::Instant::now() + std::time::Duration::from_secs(M1_2_BACKOFF_SECS));
+                        }
+                        eprintln!(
+                            "[p2p-client] M1-2 vnet 隧道开了(port={})但 /p2p/msg 失败 {}（layer={:?}）",
+                            port,
+                            &did.chars().take(20).collect::<String>(),
+                            failure
+                        );
+                        false
+                    }
                 }
-                sent
             }
             Err(e) => {
+                note_delivery_failure(&did, 9100, DeliveryFailure::Build, now_ms().max(0) as u64);
                 eprintln!(
                     "[p2p-client] M1-2 tunnel_open 失败 {}: {}",
                     &did.chars().take(20).collect::<String>(),
@@ -1192,13 +1359,6 @@ fn vnet_tunnel_fallback_spawn(did: String, envelope: Value) -> tokio::sync::ones
                 false
             }
         };
-        if !ok {
-            // 失败 → 该设备退避 30s
-            M1_2_BACKOFF
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(did.clone(), std::time::Instant::now() + std::time::Duration::from_secs(M1_2_BACKOFF_SECS));
-        }
         let _ = tx.send(ok);
     });
     rx
@@ -1459,6 +1619,29 @@ async fn chat_tunnel_ensure(device: &str) -> Option<u16> {
         );
         return Some(port);
     }
+    // 建链闸门（2026-11-11 §5/§5b）：走到这里说明两个缓存都没有可用隧道（has_cached=false）。
+    // 对端若在离线退避中 → **本轮不建链、不打日志**：p2p sync 每 ≈12s 投一次，
+    // 不设闸就是"建 mf → 投递失败 → 拆 mf"每 12s 一对（实测 1992 次建/拆）。
+    // presence 只在退避期查（正常建链零额外开销）；**明确在线 → 开闸**（恢复证据），
+    // 拿不到/离线 → fail-closed 照走退避。
+    let backoff_active =
+        crate::vnet_lease::rebuild_backoff_active(device, 9100, now_ms().max(0) as u64);
+    let peer_online = if backoff_active {
+        chat_delivery_peer_online(device).await
+    } else {
+        None
+    };
+    match chat_tunnel_build_gate(false, backoff_active, peer_online) {
+        TunnelBuildGate::SkipBackoff => return None, // 静默跳过（不建链、不关缓存、不打日志）
+        TunnelBuildGate::Reuse | TunnelBuildGate::Build => {
+            if backoff_active && peer_online == Some(true) {
+                // 在线 = 恢复证据：清退避再建链。若这台设备其实"灯亮但数据面不通"，
+                // 建链后的投递失败会走既有 ConnectFail 分支重新入表（阶梯重新爬），
+                // 不会因为这一次放行把退避永久关掉。
+                chat_delivery_record_success(device);
+            }
+        }
+    }
     let _build = RELAY_BUILD_LOCK.lock().await;
     // 双检：等锁期间别的消息可能已经建好
     {
@@ -1547,6 +1730,96 @@ fn post_failure_keeps_tunnel(o: &LocalPostOutcome) -> bool {
     !matches!(o, LocalPostOutcome::ConnectFail(_))
 }
 
+// ── 投递层离线退避闸门（2026-11-11 §5）────────────────────────────────────────
+//
+// 事故残留：`did:myco:z6Mkmx14…:9100`（永久离线的旧手机身份）每 ≈12.1s 走一轮
+//   `[p2p-relay] 隧道连接失败 → 判死重建` → `[vnet-route] close` → `[dsh-share] 隧道口
+//   投递失败 → 已失效缓存并关闭` → 下一轮投递 `[vnet-mf] …:9100 → :25012` …
+// 驱动者是**投递/同步层**（p2p sync 每 ≈12s 投递一次），不是 keeper：路被投递层
+// 建→投→拆，keeper 全程看不到"目标缺失"，所以 keeper 的退避阶梯拿不到输入。
+// 修法：闸门下沉到投递层，并与 keeper **共用同一张退避表**（vnet_lease）：
+// · 投递成功 → 清零；连接层失败 → 记一次失败（阶梯才会真的往上走）；
+// · 退避期内没隧道 → 不建链、不关缓存、也不打日志（静默跳过）。
+
+/// 投递层建链闸门（纯函数，单测直击）：**已有可用隧道照用**，只拦"新建"。
+///
+/// 第三个参数是 presence 的**三态**结论（`None` = 拿不到/不确定）：
+/// · `Some(true)`（明确在线）= 恢复证据 → 放行建链（调用方同时清退避）；
+/// · `Some(false)` / `None` = **fail-closed**，按原退避走（拿不准一律不放行）。
+///
+/// 顺序有讲究（`Reuse` 优先于退避/旁路）：退避只该拦住"反复重建"，不该拦住
+/// "用一条已经建好的隧道"——否则一台恰好恢复的设备会把已建好的腿也晾在一边。
+fn chat_tunnel_build_gate(
+    has_cached_tunnel: bool,
+    backoff_active: bool,
+    peer_online: Option<bool>,
+) -> TunnelBuildGate {
+    if has_cached_tunnel {
+        return TunnelBuildGate::Reuse;
+    }
+    // 退避期内只有"明确在线"能开闸；离线/未知一律 fail-closed。
+    if backoff_active && peer_online != Some(true) {
+        return TunnelBuildGate::SkipBackoff;
+    }
+    TunnelBuildGate::Build
+}
+
+/// 对端是否**明确在线**（`Some(true)` 在线 / `Some(false)` 明确不在 / `None` 拿不到）。
+///
+/// 数据源（2026-11-12 修正）：`roster_lookup_by_did_any_kind`——**设备 DID 精确匹配**
+/// `presence_list()` 原始行，不按 `rootDid` 聚合、不排除 own-device。
+///
+/// 为什么不再用 `chat_service::presence_lights()`：那条链的"灯"是按 `rootDid`（账号）
+/// 聚合的，且会滤掉 `rootDid` 为空的设备行——本账号自己的设备（笔记本）在
+/// `rootDid` 缺失/延迟的部署形态下会查不到，own-device 就永远 `None`，旁路对自家设备
+/// 凭空失效。现场证据（01:42 `/api/msg/route` 502）：笔记本是 CJ26 自己的设备，
+/// 必须能判在线。
+///
+/// fail-closed 不变：名册查不了（签名/身份/网络）→ `Unavailable` → `None`（不放行）。
+#[cfg(feature = "gui")]
+async fn chat_delivery_peer_online(device: &str) -> Option<bool> {
+    #[cfg(test)]
+    {
+        // 测试注入（全局态；用注入的测试自行取 test_env_lock 串行）
+        if let Some(v) = *TEST_PEER_ONLINE.lock().unwrap_or_else(|e| e.into_inner()) {
+            return v;
+        }
+    }
+    match roster_lookup_by_did_any_kind(device).await {
+        RosterLookup::Online => Some(true),
+        RosterLookup::Absent => Some(false),
+        RosterLookup::Unavailable => None, // 查不了 ≠ 离线；对"旁路"一律不放行
+    }
+}
+
+/// 测试注入口：`Some(Some(true))` = 注入在线，`Some(None)` = 注入"拿不到"。
+#[cfg(test)]
+static TEST_PEER_ONLINE: std::sync::LazyLock<std::sync::Mutex<Option<Option<bool>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// `chat_tunnel_build_gate` 的三种结论。
+#[derive(Debug, PartialEq, Eq)]
+enum TunnelBuildGate {
+    /// 已有隧道，直接用（不受退避影响）。
+    Reuse,
+    /// 对端在离线退避中且没有在线证据：本轮不建链、不打日志。
+    SkipBackoff,
+    /// 正常建链。
+    Build,
+}
+
+/// 投递层连接层失败 → 记一次"对端不可达"证据，喂给**同一张**退避表（阶梯的输入）。
+///
+/// 单独成函数是为了单测能直接打（不建链、不碰网络）。
+fn chat_delivery_record_failure(device: &str, now_ms: u64) {
+    crate::vnet_lease::rebuild_backoff_note_failure(device, 9100, now_ms, "deliver-connect-fail");
+}
+
+/// 投递层投递成功 → 清零退避（"恢复一次成功即清零"）。
+fn chat_delivery_record_success(device: &str) {
+    crate::vnet_lease::rebuild_backoff_reset(device, 9100);
+}
+
 /// 启动心跳巡检（进程内一次）：空闲 ≥60s 的持久隧道发一条轻量 `/p2p/ping`
 /// （手机 data-face 回 404 keep-alive——**能应答即活着**），失败才判死重建。
 /// 目的：T7「空闲 30/60/120s 后再发不重新握手」；同时避免手机 120s 空闲回收。
@@ -1632,6 +1905,8 @@ async fn deliver_via_relay_devices(devices: &[String], envelope: &Value, budget_
                 Ok(LocalPostOutcome::Ok(_)) => {
                     dev_relay_pref_mark(&did); // 热路径记忆：下次跳过直推死路
                     chat_tunnel_mark_used(&did).await;
+                    // 投递成功 = 最硬的"对端可达"证据 → 清零投递层/keeper 共用的离线退避
+                    chat_delivery_record_success(&did);
                     true
                 }
                 Ok(LocalPostOutcome::HttpStatus(code)) => {
@@ -1640,12 +1915,17 @@ async fn deliver_via_relay_devices(devices: &[String], envelope: &Value, budget_
                     false
                 }
                 Ok(LocalPostOutcome::ConnectFail(e)) => {
+                    // 隧道开了但**隧道内被关**（连接层）→ 旧 route 已死：分层记账
+                    // （喂阶梯 + 拆旧 route，让下一次拿到新 Connection），不是"对端离线"的
+                    // 单点结论。PostTransport 的证据强度足够进阶梯，但拆 route 才是根治。
+                    note_delivery_failure(&did, 9100, DeliveryFailure::PostTransport, now_ms().max(0) as u64);
                     eprintln!("[p2p-relay] 隧道连接失败 → 判死重建（{did}）: {e}");
                     chat_tunnel_clear(&did).await;
                     false
                 }
                 Ok(LocalPostOutcome::Other(e)) => {
-                    // 超时/读体错误 ≠ 隧道死（可能只是手机 JS 忙）：保留隧道。
+                    // 超时/读体错误 ≠ 隧道死（可能只是手机 JS 忙）：保留隧道，
+                    // 也**不喂阶梯**（PeerAnswered 类：隧道活着，喂表会把在线设备打成离线）。
                     eprintln!("[p2p-relay] 隧道口投递异常（保留隧道，{did}）: {e}");
                     false
                 }
@@ -2529,6 +2809,262 @@ mod relay_targets_tests {
         assert!(chat_tunnel_heartbeat_due(true, Duration::from_secs(60)), "60s 心跳（T7 空闲保活）");
         assert!(chat_tunnel_heartbeat_due(true, Duration::from_secs(120)), "120s 仍要续命（手机侧空闲回收线）");
         assert!(!chat_tunnel_heartbeat_due(false, Duration::from_secs(300)), "已判死的隧道不心跳（等下条重建）");
+    }
+
+    // ── 2026-11-11 §5：投递层离线退避闸门（残留 12s 热循环的根修） ──
+    /// 闸门契约：**已有可用隧道照用**（退避不能拦住"用现有腿"），只在"没有隧道 +
+    /// 退避中 + 没有在线证据"时跳过建链。
+    #[test]
+    fn delivery_gate_reuses_cached_tunnel_but_skips_build_during_backoff() {
+        assert_eq!(
+            chat_tunnel_build_gate(true, true, None),
+            TunnelBuildGate::Reuse,
+            "有隧道就照用，退避不拦复用"
+        );
+        assert_eq!(chat_tunnel_build_gate(true, false, None), TunnelBuildGate::Reuse);
+        assert_eq!(
+            chat_tunnel_build_gate(false, true, None),
+            TunnelBuildGate::SkipBackoff,
+            "没隧道 + 退避中 + presence 未知 → 不建链（每 12s 建/拆一对 mf 的抑制点）"
+        );
+        assert_eq!(chat_tunnel_build_gate(false, false, None), TunnelBuildGate::Build);
+    }
+
+    /// **§5b presence 在线旁路**：退避封顶中只要 presence 明确在线 → 开闸放行 + 清退避
+    /// （"离线退避"不该压住一台已经回来的设备，否则聊天投递最坏要等 10min）。
+    #[test]
+    fn presence_online_bypass_reopens_the_delivery_gate() {
+        let did = "did:myco:presence-bypass-test";
+        crate::vnet_lease::rebuild_backoff_reset(did, 9100);
+        let now = 7_000_000u64;
+        for _ in 0..8 {
+            chat_delivery_record_failure(did, now); // 冲到封顶 10min
+        }
+        assert!(crate::vnet_lease::rebuild_backoff_info(did, 9100, now).2 >= 5, "前置：封顶");
+        assert_eq!(
+            chat_tunnel_build_gate(false, true, None),
+            TunnelBuildGate::SkipBackoff,
+            "前置：没有在线证据时不建链"
+        );
+        // 在线信号到了 → 开闸
+        assert_eq!(
+            chat_tunnel_build_gate(false, true, Some(true)),
+            TunnelBuildGate::Build,
+            "presence 明确在线 → 下一拍建链放行"
+        );
+        // 调用方在放行同时清退避（chat_tunnel_ensure 里就是这么做的）
+        chat_delivery_record_success(did);
+        assert_eq!(
+            crate::vnet_lease::rebuild_backoff_info(did, 9100, now),
+            (0, 0, 0),
+            "在线信号 = 恢复证据 → 退避清零"
+        );
+        assert!(!crate::vnet_lease::rebuild_backoff_active(did, 9100, now));
+        assert_eq!(
+            chat_tunnel_build_gate(false, crate::vnet_lease::rebuild_backoff_active(did, 9100, now), Some(true)),
+            TunnelBuildGate::Build
+        );
+        crate::vnet_lease::rebuild_backoff_reset(did, 9100);
+    }
+
+    /// **fail-closed**：presence 离线（`Some(false)`）或拿不到（`None`）时旁路不生效，
+    /// 退避照走——"拿不准"绝不冒充"在线"。
+    #[test]
+    fn presence_unknown_or_offline_never_bypasses() {
+        assert_eq!(
+            chat_tunnel_build_gate(false, true, None),
+            TunnelBuildGate::SkipBackoff,
+            "拿不到 presence → 不放行"
+        );
+        assert_eq!(
+            chat_tunnel_build_gate(false, true, Some(false)),
+            TunnelBuildGate::SkipBackoff,
+            "明确离线 → 不放行"
+        );
+        // 不在退避时 presence 不参与决策（照建）
+        assert_eq!(chat_tunnel_build_gate(false, false, None), TunnelBuildGate::Build);
+        assert_eq!(chat_tunnel_build_gate(false, false, Some(false)), TunnelBuildGate::Build);
+    }
+
+    /// 注入探针的语义（唯一使用该注入的测试；用完归还全局态）：
+    /// 注入"拿不到" → `None`（fail-closed），注入离线/在线 → 原样透出。
+    #[tokio::test]
+    async fn peer_online_lookup_passes_through_injection_and_defaults_to_unknown() {
+        let probe = "did:myco:peer-online-probe";
+        *TEST_PEER_ONLINE.lock().unwrap() = Some(None);
+        assert_eq!(chat_delivery_peer_online(probe).await, None, "注入'拿不到'");
+        *TEST_PEER_ONLINE.lock().unwrap() = Some(Some(false));
+        assert_eq!(chat_delivery_peer_online(probe).await, Some(false), "注入离线");
+        *TEST_PEER_ONLINE.lock().unwrap() = Some(Some(true));
+        assert_eq!(chat_delivery_peer_online(probe).await, Some(true), "注入在线");
+        *TEST_PEER_ONLINE.lock().unwrap() = None; // 归还全局态
+    }
+
+    /// **own-device 在线必须能旁路**（2026-11-12 01:42 事故：笔记本是本账号自己的设备，
+    /// `/api/msg/route` 502 state=sending）。数据源已改成设备 DID 精确匹配的
+    /// `roster_lookup_by_did_any_kind`（不再按 `rootDid` 账号灯聚合），这保证自家设备
+    /// 与好友设备走同一条判定；离线时阶梯照走（不牺牲退避语义）。
+    #[test]
+    fn own_device_online_bypasses_backoff_but_offline_device_still_backs_off() {
+        let own_laptop = "did:myco:z6MkpYTe3QL6GHkm1hf8DdNfT7G1Hffn2KBS1Ggx1TbM6Cqf";
+        let now = 8_000_000u64;
+        crate::vnet_lease::rebuild_backoff_reset(own_laptop, 9100);
+        for _ in 0..8 {
+            note_delivery_failure(own_laptop, 9100, DeliveryFailure::Build, now);
+        }
+        assert!(crate::vnet_lease::rebuild_backoff_info(own_laptop, 9100, now).2 >= 5, "前置：封顶");
+        // 离线/未知 → 不放行（fail-closed）
+        assert_eq!(
+            chat_tunnel_build_gate(false, true, None),
+            TunnelBuildGate::SkipBackoff,
+            "自己家设备也拿不到在线证据时不得放行"
+        );
+        // 明确在线（设备 DID 命中名册）→ 放行 + 清退避
+        assert_eq!(
+            chat_tunnel_build_gate(false, true, Some(true)),
+            TunnelBuildGate::Build,
+            "own-device 在线必须能开闸"
+        );
+        chat_delivery_record_success(own_laptop);
+        assert_eq!(crate::vnet_lease::rebuild_backoff_info(own_laptop, 9100, now), (0, 0, 0));
+        // 另一台真离线设备的退避不受影响（清除是按设备 DID 的）
+        let offline = "did:myco:z6Mkmx14JkeA4k4CVnuKAxthNAG1FsHNqEzftKMHRqEqWsyL";
+        note_delivery_failure(offline, 9100, DeliveryFailure::Build, now);
+        assert!(crate::vnet_lease::rebuild_backoff_active(offline, 9100, now), "离线设备阶梯照走");
+        crate::vnet_lease::rebuild_backoff_reset(offline, 9100);
+    }
+
+    /// **POST 失败 ≠ 建链失败**（分层喂表）：只有 Build/PostTransport 喂阶梯，
+    /// 对端已应答（HTTP 非 2xx / 读体失败）一律不喂——否则在线设备会被打成离线。
+    #[test]
+    fn post_failure_vs_build_failure_are_classified_and_fed_differently() {
+        assert_eq!(classify_post_failure(&LocalPostOutcome::Ok(json!({"ok": true}))), None);
+        assert_eq!(
+            classify_post_failure(&LocalPostOutcome::ConnectFail("reset".into())),
+            Some(DeliveryFailure::PostTransport),
+            "隧道内被关 = PostTransport（旧 route 死，要拆）"
+        );
+        assert_eq!(
+            classify_post_failure(&LocalPostOutcome::HttpStatus(403)),
+            Some(DeliveryFailure::PeerAnswered),
+            "403 = 对端应答了（授权问题），隧道活"
+        );
+        assert_eq!(
+            classify_post_failure(&LocalPostOutcome::Other("read body".into())),
+            Some(DeliveryFailure::PeerAnswered)
+        );
+        // 喂表语义
+        assert!(DeliveryFailure::Build.feeds_ladder(), "建链失败 → 喂阶梯");
+        assert!(DeliveryFailure::PostTransport.feeds_ladder(), "隧道内被关 → 喂阶梯");
+        assert!(!DeliveryFailure::PeerAnswered.feeds_ladder(), "对端应答复 → 不喂阶梯");
+        // 端到端：PeerAnswered 不改变退避；PostTransport 让人进（且拆旧 route）
+        let dev = "did:myco:layer-semantics-test";
+        let now = 9_000_000u64;
+        crate::vnet_lease::rebuild_backoff_reset(dev, 9100);
+        note_delivery_failure(dev, 9100, DeliveryFailure::PeerAnswered, now);
+        assert!(
+            !crate::vnet_lease::rebuild_backoff_active(dev, 9100, now),
+            "对端应答 ≠ 不可达：不得进退避"
+        );
+        note_delivery_failure(dev, 9100, DeliveryFailure::PostTransport, now);
+        assert!(
+            crate::vnet_lease::rebuild_backoff_active(dev, 9100, now),
+            "隧道内被关 → 进退避（且已 route_close 等下次重建）"
+        );
+        crate::vnet_lease::rebuild_backoff_reset(dev, 9100);
+    }
+
+    /// 投递层连接失败必须**喂进同一张退避表**（否则 keeper 的阶梯拿不到输入，
+    /// 闸门永远停在"立即重试"= 热循环原样复现）。成功一次即清零。
+    #[test]
+    fn delivery_connect_fail_feeds_the_shared_backoff_ladder() {
+        let did = "did:myco:delivery-feed-test";
+        let now = 3_000_000u64;
+        crate::vnet_lease::rebuild_backoff_reset(did, 9100);
+        assert!(!crate::vnet_lease::rebuild_backoff_active(did, 9100, now), "前置：不在退避");
+        chat_delivery_record_failure(did, now);
+        assert!(crate::vnet_lease::rebuild_backoff_active(did, 9100, now), "失败当拍即进入退避");
+        assert_eq!(
+            crate::vnet_lease::rebuild_backoff_info(did, 9100, now),
+            (1_000, now + 1_000, 1),
+            "第 1 级 1s"
+        );
+        // 到点再失败 → 第 2 级 5s（阶梯真的在往上走）
+        let t1 = now + 1_000;
+        chat_delivery_record_failure(did, t1);
+        assert_eq!(
+            crate::vnet_lease::rebuild_backoff_info(did, 9100, t1),
+            (5_000, t1 + 5_000, 2),
+            "第 2 级 5s"
+        );
+        // 投递成功 = 恢复 → 清零（API 三个字段归 0）
+        chat_delivery_record_success(did);
+        assert!(!crate::vnet_lease::rebuild_backoff_active(did, 9100, t1));
+        assert_eq!(crate::vnet_lease::rebuild_backoff_info(did, 9100, t1), (0, 0, 0));
+    }
+
+    /// 用**真实函数**按真机节奏（p2p sync 每 ≈12s 一拍）模拟"投递→连接失败"循环，
+    /// 锁两条验收线：
+    /// 1. 封顶后整个 10min 窗口内投递层不建链（= 不再刷 `[vnet-mf] …→:25012` 那一对行）；
+    /// 2. **稳态 ≤1 对 mf / 10min**（末 10 分钟只允许一次建链）。
+    #[test]
+    fn delivery_layer_stays_silent_for_the_full_cap_window() {
+        let did = "did:myco:delivery-cap-test";
+        crate::vnet_lease::rebuild_backoff_reset(did, 9100);
+        let now = 5_000_000u64;
+        for _ in 0..8 {
+            chat_delivery_record_failure(did, now);
+        }
+        let (wait_ms, next_retry_at, level) = crate::vnet_lease::rebuild_backoff_info(did, 9100, now);
+        assert!(level >= 5, "已冲到封顶（level={level}）");
+        assert_eq!(wait_ms, 600_000, "封顶 10min");
+
+        // 窗口内每 12s 一拍（真实 sync 节奏）：全部 SkipBackoff（不建链 = 不打那三行）
+        let mut t = now;
+        let mut ticks = 0;
+        while t < next_retry_at {
+            let active = crate::vnet_lease::rebuild_backoff_active(did, 9100, t);
+            assert!(active, "退避窗口内必须 active（t={t}）");
+            assert_eq!(
+                chat_tunnel_build_gate(false, active, None),
+                TunnelBuildGate::SkipBackoff,
+                "退避窗口内不得建链（t={t}）"
+            );
+            t += 12_000;
+            ticks += 1;
+        }
+        assert!(ticks >= 49, "10min / 12s ≈ 50 拍（实际 {ticks}）");
+        // 到点那一拍才允许建链 → 最多 1 对 mf / 10min
+        assert_eq!(
+            chat_tunnel_build_gate(false, crate::vnet_lease::rebuild_backoff_active(did, 9100, next_retry_at), None),
+            TunnelBuildGate::Build,
+            "退避到点才允许再试一次"
+        );
+
+        // ── 虚拟 30 分钟全循环（建链 → 投递必失败 → 记失败），统计建链次数 ──
+        crate::vnet_lease::rebuild_backoff_reset(did, 9100);
+        let start = 10_000_000u64;
+        let mut t = start;
+        let mut builds = 0u32;
+        let mut builds_in_last_10min = 0u32;
+        while t < start + 30 * 60_000 {
+            if chat_tunnel_build_gate(false, crate::vnet_lease::rebuild_backoff_active(did, 9100, t), None)
+                == TunnelBuildGate::Build
+            {
+                builds += 1;
+                if t >= start + 20 * 60_000 {
+                    builds_in_last_10min += 1;
+                }
+                chat_delivery_record_failure(did, t); // 建链后投递必失败（对端永久离线）
+            }
+            t += 12_000;
+        }
+        assert!(
+            builds_in_last_10min <= 1,
+            "稳态必须 ≤1 对 mf / 10min（末 10 分钟实际 {builds_in_last_10min}）"
+        );
+        assert!(builds <= 8, "30 分钟内总建链次数应 ≈爬坡 5 + 稳态 2（实际 {builds}）");
+        crate::vnet_lease::rebuild_backoff_reset(did, 9100);
     }
     #[test]
     fn same_account_loose_handles_gui_anomaly_and_tails() {

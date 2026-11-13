@@ -55,7 +55,6 @@ function allowedHosts(): string[] {
     'did.youling.cc',
     'localhost', '127.0.0.1',
     // 安全白名单双 IP（过渡期 vnext 活到 9/29，平台 callback 可能从任一 IP 来）
-    'myco.youling.cc',
   ])
   try { base.add(new URL(DEFAULT_SVC).hostname) } catch { /* DEFAULT_SVC 非法时仅静态列表 */ }
   try { base.add(new URL(location.origin).hostname) } catch { /* file:// 等 */ }

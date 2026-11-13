@@ -83,6 +83,30 @@ pub fn enabled() -> bool {
     state().local.lock().unwrap().is_some()
 }
 
+/// peer resolver 是否已注入（未注入 = 无法验证对端 AUTH → 闸门降级 PSK-only）
+/// 2026-11-12 ADB P0：JNI 单口 server（手机）没有 set_peer_resolver 入口——
+/// 原实现 fail-closed 全拒（UnknownKey），PC 的流全被 AUTH_REQUIRED 优雅关掉。
+/// 降级语义：无 resolver = PSK 已验证网络准入 + 身份信息仅作 advisory（VNETP 前导
+/// 报告对端声明 DID，但不做验签）。宿主需要严格验证时调 set_peer_resolver 恢复全闸。
+pub fn has_resolver() -> bool {
+    state().resolver.lock().unwrap().is_some()
+}
+
+/// 显式 PSK-only 闸门模式（默认关闭=严格）。
+/// 宿主（如手机 JNI server）无 peer resolver 入口时调此开关降级：
+/// 安全级别回到「身份功能加入前」（PSK 网络准入），AUTH 帧不做验签。
+/// 显式开关而非自动降级：避免静默放松有 resolver 宿主的安全语义（R10/R12/R13 教训）。
+static GATE_PSK_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_gate_psk_only() {
+    GATE_PSK_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+    println!("  [AUTH] gate mode: PSK-only (identity advisory, no signature verification)");
+}
+
+pub fn gate_psk_only() -> bool {
+    GATE_PSK_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn local_did() -> Option<String> {
     state().local.lock().unwrap().as_ref().map(|l| l.0.clone())
 }

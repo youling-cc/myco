@@ -5,8 +5,13 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { mkdtempSync } from 'node:fs'
 import { createRootApi } from './identity/root.mjs'
-import { addRevocationInternal, handleDelegationGet } from './delegation.mjs'
+// 2026-11-12 开源整改：吊销注册表改指临时目录，不再写仓内 revocations.json。
+process.env.REVOCATIONS_PATH = join(mkdtempSync(join(tmpdir(), 'myco-rev-registry-test-')), 'revocations.json')
+const { addRevocationInternal, handleDelegationGet } = await import('./delegation.mjs')
 import { generateKeyPair, exportPublicKeyRaw, sign } from './identity/crypto.mjs'
 import { didFromPublicKey } from './identity/did.mjs'
 

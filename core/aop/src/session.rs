@@ -243,7 +243,7 @@ impl AopSession {
         }
     }
 
-    /// 人工节点交付(/api/aop/human_submit)。
+    /// 人工节点交付(/api/labs/human_submit)。
     pub async fn submit_human(&self, sub: HumanSubmission) -> Result<(), String> {
         self.human_tx
             .send(sub)

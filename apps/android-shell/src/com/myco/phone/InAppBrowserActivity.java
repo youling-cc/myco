@@ -145,6 +145,10 @@ public class InAppBrowserActivity extends Activity {
             s.setDomStorageEnabled(true);
             s.setMediaPlaybackRequiresUserGesture(false);
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+            // 2026-11-12 两段定案（撤 LOAD_NO_CACHE，同 ShareWebActivity）：动态口
+            // 漂移已由设备域固定口根治，URL 永不变 ⇒ 404 钉死不可能；恢复默认缓存
+            // ——/myco-assets 稳定前缀 ~11MB 资产首载后走缓存，返回再开（R10b）不
+            // 再每次全量重下（NO_CACHE 期间真机 13:40/13:51 两案：模块加载器超时）。
             // 分享入口要用 cookie（302 Set-Cookie）；主壳已放开，这里保持一致
             try {
                 CookieManager cm = CookieManager.getInstance();

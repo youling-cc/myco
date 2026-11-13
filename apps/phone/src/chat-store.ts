@@ -37,7 +37,7 @@ import * as ed from '@noble/ed25519'
 import { accountDidAliases, accountDidCanonical, accountDidEq, convSafe, convSafesAll, didSafeId, restoreDidSafe } from './didUtil'
 // 「点卡就进」的回包投递（share-entry-grant → 唤醒等在 remoteOpen 的调用方）。
 // 无循环依赖：share-entry 只依赖 p2p-tunnel 的类型与纯函数，不引 chat-store。
-import { deliverShareEntryGrant, actionShareCoords } from './share-entry'
+import { actionShareCoords } from './share-entry'
 // 2026-10-25 文案精简：任务卡标题显示时抹掉 127.0.0.1:端口 等技术细节（纯显示层，
 // task-env 只导出纯函数，无循环依赖）。数据与打开链路不动。
 import { cleanCardTitle } from './task-env'
@@ -230,7 +230,7 @@ export interface PeerTask {
   titleTs?: number
   /** 关联的 myco 分享（`sh-…`）——有它才有"随时点开"的入口 */
   shareId?: string
-  /** **源设备** did（隧道目标）与展示名：点开 = 向它取票、经隧道把那一页拉过来 */
+  /** **源设备** did（隧道目标）与展示名：点开 = 经设备隧道 VNETP 直入把那一页拉过来 */
   sourceDevice?: string; sourceDeviceName?: string
   /** 源账号 did（grant 名单按它比对；转授申请要投给它） */
   sourceAccount?: string
@@ -604,26 +604,6 @@ function markTaskTombstoned(taskId: string, shareId: string): void {
     if (!exact) list.push({ ...(tid ? { taskId: tid } : {}), ...(sid ? { shareId: sid } : {}), revokedAt: now })
   }
   writeArr(K.taskTombstones(), list)
-}
-
-/** 2026-10-20：按 shareId 删任务卡（僵尸卡自愈用：分享已停止时手机端自动清理）。
- *  返回删掉的条数。 */
-export function removeTasksByShareId(shareId: string): number {
-  if (!shareId) return 0
-  const list = readArr<PeerTask>(K.tasks())
-  const kept = list.filter((t) => {
-    const c = taskShareCardOf(t)
-    if (c && c.shareId === shareId) return false
-    // 兜底：卡形状不标准（缺 device/account）时 taskShareCardOf 返回 null，
-    // 直接看 action.url 里是否带这个 shareId（老卡/僵尸卡形态）。
-    const url = typeof (t as { action?: { url?: string } }).action?.url === 'string'
-      ? String((t as { action?: { url?: string } }).action?.url)
-      : ''
-    return !url.includes(shareId)
-  })
-  const removed = list.length - kept.length
-  if (removed > 0) writeArr(K.tasks(), kept)
-  return removed
 }
 
 export function upsertFriend(did: string, name: string, status: Friend['status']): void {
@@ -1643,15 +1623,9 @@ function ingestTaskRename(my: string, m: ServerMsg): boolean {
 export function ingestMsg(my: string, m: ServerMsg): boolean {
   // 2026-10-20 小灵官方通知：验签通过才落「小灵」会话（与 PC ingest_msg 同位置）
   if (m.kind === OFFICIAL_NOTICE_KIND) return ingestOfficialNotice(my, m)
-  // 2026-10-09 跨设备「代打开」控制 kind（与 PC 端 chat_service::ingest_msg 同位置、同语义）：
-  //   · `share-entry-grant`：源设备现签的窄票回来了 → 唤醒在等的「点卡就进」。
-  //     **没有会话语义**，落行会把"收到一张票"变成聊天记录；放在最前面拦掉。
-  //   · `share-entry-request` 的对侧处理在 PC（手机永远不是源设备，收到即丢弃——
-  //     不给探测者当放大器）。
-  if (m.kind === 'share-entry-grant') {
-    return deliverShareEntryGrant(m as unknown as Record<string, unknown>)
-  }
-  if (m.kind === 'share-entry-request') return true
+  // 2026-11-12 取票链整链删除后，`share-entry-grant`/`share-entry-request` 已无发送方：
+  // 收到的都是历史残留/旁路消息——**直接丢弃、不落行**（不给探测者当放大器）。
+  if (m.kind === 'share-entry-grant' || m.kind === 'share-entry-request') return true
   // §3.23 转授闸（与 PC 端 chat_service::ingest_msg 同位置、同语义）：
   //   · `reshare-grant`：主人批/驳了我那张卡的转授申请 → 刷新本地卡的转授能力
   //     （**只改这一张卡的元数据**，不落气泡、不新增卡）；
@@ -2469,8 +2443,10 @@ export async function createGroup(name: string, members: string[]): Promise<stri
   return gid
 }
 
-/** 分享任务卡（conv=好友 did 或群 id；群逐成员单发）。 */
-export async function shareTask(conv: string, card: { title: string; desc?: string; requirements?: string; reward?: string; expiresDays?: number }): Promise<void> {
+/** 分享任务卡（conv=好友 did 或群 id；群逐成员单发）。
+ *  2026-11-11：`env`（环境卡，如手机「ADB 调试」卡的 adb 环境）随卡下发——
+ *  与 PC `share_card_record` 的 env[] 同形状，接收端 envsOfCard 直接可读。 */
+export async function shareTask(conv: string, card: { title: string; desc?: string; requirements?: string; reward?: string; expiresDays?: number; env?: unknown[]; caps?: unknown }): Promise<void> {
   const my = requireMy()
   if (!card.title.trim()) throw new Error('任务标题不能为空')
   const taskId = `peer-task-${Date.now().toString(36)}`
@@ -2483,15 +2459,23 @@ export async function shareTask(conv: string, card: { title: string; desc?: stri
   if (card.requirements?.trim()) payload.requirements = card.requirements.trim().slice(0, 400)
   if (card.reward?.trim()) payload.reward = card.reward.trim().slice(0, 32)
   if (card.expiresDays && card.expiresDays > 0) payload.expiresAt = Date.now() + card.expiresDays * 86_400_000
-  const targets = conv.startsWith('grp-')
+  if (Array.isArray(card.env) && card.env.length > 0) payload.env = card.env
+  if (card.caps !== undefined) payload.caps = card.caps
+  const isGroupConv = conv.startsWith('grp-')
+  const targets = isGroupConv
     ? (listGroups().find((g) => g.id === conv)?.members ?? []).filter((m) => !accountDidEq(m, my))
     : [conv]
-  if (conv.startsWith('grp-')) {
+  if (isGroupConv) {
     const g = listGroups().find((x) => x.id === conv)
     if (!g) throw new Error('群不存在（可能已被清理，重进好友分区刷新）')
     if (groupTerminalStatus(g)) throw new Error('群已解散或你已被移出，无法分享任务卡') // 批二：终态只读
   }
-  if (!targets.length) throw new Error('没有可分享的成员')
+  // 单聊必须有目标；**群分享允许"只剩我自己"**：一人多设备（PC+手机+笔记本同一
+  // 账号）是常态，设备群 members 里只有自己账号，targets 过滤掉自己就空了——
+  // 旧守卫直接抛「没有可分享的成员」，导致手机永远建不出 ADB/RDP 这类"给别人用
+  // 我自己设备"的卡（2026-11-12 真机实测）。群路径本身按 members 端侧扇出，
+  // 含自己其它设备，不需要非己成员。
+  if (!isGroupConv && !targets.length) throw new Error('没有可分享的成员')
   // 批二：群 conv → 群会话一条 task-share（to=grp-*，p2pSendRaw 按 members 端侧扇出，
   // 含自己其他设备）——接收端 ingest 落群会话（全员可见同一张卡），不再逐成员单发。
   // 单聊分享行为不变（逐目标直推，失败自动入离线队列）。
@@ -2501,6 +2485,25 @@ export async function shareTask(conv: string, card: { title: string; desc?: stri
     payload.groupId = conv
     payload.groupName = g.name
     payload.members = g.members
+    // 2026-11-12 卡壳契约（真机 RED：ADB 卡到 PC 被静默丢弃）：PC 端
+    // `device_group_card_payload` 的 wire 形状是**外层信封 + card 包裹**——
+    // `device_group_task_ingest` 见不到 `payload.card` 就按「老形态」拒落库
+    // （宁可少一张，不可落来路不明的）。手机发送侧此前只发摊平字段，接收侧
+    // （flattenTaskSharePayload）却早已按 card 包裹解析——发送/接收两头一直
+    // 不对称。这里补上 card 包裹与 status（**只加不减**：摊平字段保留，旧接收
+    // 端/手机自己的回显不破坏）。
+    payload.status = 'todo'
+    payload.card = {
+      taskId: payload.taskId, title: payload.title, desc: payload.desc,
+      from: payload.from, fromName: payload.fromName,
+      createdAt: payload.createdAt, source: payload.source,
+      participants: payload.participants,
+      ...(payload.requirements !== undefined ? { requirements: payload.requirements } : {}),
+      ...(payload.reward !== undefined ? { reward: payload.reward } : {}),
+      ...(payload.expiresAt !== undefined ? { expiresAt: payload.expiresAt } : {}),
+      ...(payload.env !== undefined ? { env: payload.env } : {}),
+      ...(payload.caps !== undefined ? { caps: payload.caps } : {}),
+    }
     const { sendState } = await p2pSendRaw(conv, 'task-share', payload)
     agg = sendState
   } else {
@@ -2528,6 +2531,12 @@ export function registerSharedTask(conv: string, my: string, myNm: string, paylo
     createdAt: payload.createdAt as number, expiresAt: payload.expiresAt as number | undefined,
     participants: payload.participants as TaskParticipant[], source: 'peer',
     status: 'shared', convId: didSafe(conv) }
+  // 2026-11-11：环境卡字段透传（env/caps/action）——手机建的「ADB 调试」卡与
+  // PC 建的 RDP/DSH 环境卡同一条路径入库，列表行的 env 入口（declaredEnvsOfCard）
+  // 只认这三个字段。
+  if (Array.isArray(payload.env)) t.env = payload.env
+  if (payload.caps !== undefined) t.caps = payload.caps
+  if (payload.action && typeof payload.action === 'object') t.action = payload.action as PeerTask['action']
   tasks.push(t)
   writeArr(K.tasks(), tasks)
   return t

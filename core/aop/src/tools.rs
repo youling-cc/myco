@@ -414,7 +414,13 @@ mod boundary_tests {
     async fn bash_timeout_enforced() {
         let d = tmpdir();
         let r = ToolRunner::new(d.clone());
-        let out = r.run("bash", &json!({"command": "ping -n 30 127.0.0.1", "timeout_sec": 1})).await;
+        // 2026-11-13 D 修（开源 Issue #3）：跨平台超时命令——
+        // Windows 工具壳走 cmd.exe（ping -n 可用）；Unix 走 bash（sleep 可用）。
+        #[cfg(windows)]
+        let cmd = "ping -n 30 127.0.0.1";
+        #[cfg(not(windows))]
+        let cmd = "sleep 30";
+        let out = r.run("bash", &json!({"command": cmd, "timeout_sec": 1})).await;
         assert!(out.contains("超时"), "1s 超时应触发: {out}");
         std::fs::remove_dir_all(&d).ok();
     }

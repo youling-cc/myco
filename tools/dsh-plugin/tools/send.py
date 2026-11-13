@@ -527,21 +527,25 @@ def sender_info(sessions: list) -> tuple[str, str]:
     return id8(sid), sid
 
 
-def build_header(sender_name: str, sender_sid: str) -> str:
-    """构造署名头（v6「充要」版，与 myco.exe 的 format_chat_header 同格式）。
+def build_header(sender_name: str, sender_sid: str, steer: bool = True) -> str:
+    """构造署名头（v6「充要」版，与 Rust `format_chat_header` **逐字一致**）。
 
     ```
-    [from: 会话名 · 10-19 19:16]
+    [from: 会话名 · ⚡插队 · 10-19 19:16]      # steer（默认）= 有插队标记
+    [from: 会话名 · 10-19 19:16]               # queue = 无标记
     reply-to: session-<完整 sessionId>
     ```
-    只留必要且充分的三件事：谁发的（名字，人读）、回给谁（完整 id，路由）、什么时候。
+    只留必要且充分的三件事：谁发的（名字，人读）、回给谁（完整 id，路由）、什么时候；
+    steer 时额外带 `⚡插队`（"被打断"是接收方需要知道的事实，见 cli.rs 测试
+    `chat_header_is_minimal_and_reply_to_exact`）。
     砍掉的都是可推导/重复的：reply-to-name（= from 名字）、id 尾（= reply-to 末 8）、
     设备尾（会话 id 已定位设备侧）、via myco/via skill（通道是实现细节）、---
     （两行前缀自识别）。用户原话：「这个消息头太冗长啊，你不能秉持充要么」。
     """
     stamp = time.strftime('%m-%d %H:%M')
     name = (sender_name or "").strip() or "myco"
-    lines = [f"[from: {name} · {stamp}]"]
+    prio = " · ⚡插队" if steer else ""
+    lines = [f"[from: {name}{prio} · {stamp}]"]
     if sender_sid:
         sid = sender_sid if sender_sid.startswith("session-") else f"session-{sender_sid}"
         lines.append(f"reply-to: {sid}")
@@ -764,12 +768,14 @@ def send_remote(target: str, sender_sid: str, text: str, mode: str = "steer") ->
 
 def send_cross_account(to_did: str, body: str, mode: str = "steer",
                        from_name: str = "", from_did: str = "",
-                       session_id: str = "") -> dict:
+                       session_id: str = "", from_session_id: str = "") -> dict:
     """跨账号路由：POST :3102/api/msg/route（接口契约已与 myco 网关侧定稿）。
 
-    请求体：{"to": 目标账号DID, "sessionId": 目标DSH会话(可选), "fromName": 发送者
-    显示名, "fromDid": 发送者DID, "kind": "dsh-session-msg", "body": 正文, "mode":
-    steer|queue}。发送方身份走结构化字段（网关到达端负责重组署名），body 只放纯正文。
+    请求体：{"to": 目标账号DID, "sessionId": 目标DSH会话(必填，缺省网关回
+    sessionId-required), "fromName": 发送者显示名, "fromDid": 发送者DID,
+    "fromSessionId": 发送方会话 id, "kind": "dsh-session-msg", "body": 正文,
+    "mode": steer|queue}。发送方身份走结构化字段（网关到达端负责重组署名，
+    头由 format_chat_header 生成并追加 reply-to-session 行），body 只放纯正文。
 
     成功：{"ok":true,"delivered":true,"sessionId":"...","via":"p2p-direct"}。
 
@@ -789,6 +795,9 @@ def send_cross_account(to_did: str, body: str, mode: str = "steer",
     }
     if session_id:
         payload["sessionId"] = session_id
+    if from_session_id:
+        full = from_session_id if from_session_id.startswith("session-") else f"session-{from_session_id}"
+        payload["fromSessionId"] = full
     status, parsed = _http_request(MSG_ROUTE_PATH, "POST", payload, timeout=30)
     if status is None:
         return {"ok": False, "unimplemented": True,
@@ -870,12 +879,13 @@ def _raw_quote_loss(seg: str, argv_text: str) -> int:
 def parse_args(args: list) -> dict:
     """手写解析：任何无法识别的多余片段都视为"正文被 shell 拆开"的硬错误。"""
     opts = {"to": None, "text": None, "file": None, "stdin": False,
-            "mode": "steer", "verify": True, "verify_timeout": 5.0}
+            "mode": "steer", "verify": True, "verify_timeout": 5.0,
+            "session": None}
     leftovers = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("--to", "--text", "--file", "--mode", "--verify-timeout"):
+        if a in ("--to", "--text", "--file", "--mode", "--verify-timeout", "--session"):
             if i + 1 >= len(args):
                 _die(f"❌ {a} 缺少参数值")
             v = args[i + 1]
@@ -889,6 +899,10 @@ def parse_args(args: list) -> dict:
                 if v not in ("queue", "steer"):
                     _die("❌ --mode 只接受 queue 或 steer")
                 opts["mode"] = v
+            elif a == "--session":
+                # 跨账号专用：对端要投递的目标 DSH 会话 id（信封 sessionId）。
+                # 缺省时网关会回 sessionId-required（不投"最近活跃"）。
+                opts["session"] = v.strip() or None
             else:
                 try:
                     opts["verify_timeout"] = float(v)
@@ -1013,10 +1027,15 @@ def deliver_local(target: dict, full_text: str, header: str, opts: dict):
 
 
 def deliver_cross_account(to_did: str, to_desc: str, body: str, opts: dict,
-                          from_name: str, from_did: str, session_id: str = ""):
-    """跨账号投递 + 打印。/api/msg/route 不可用时优雅降级（一句话 + 退出码 1）。"""
+                          from_name: str, from_did: str, session_id: str = "",
+                          from_session_id: str = ""):
+    """跨账号投递 + 打印。/api/msg/route 不可用时优雅降级（一句话 + 退出码 1）。
+
+    session_id      = **对端**要投递的目标会话（`--session` / 分享绑定会话）
+    from_session_id = **我自己**的会话 id（信封 fromSessionId，供对端拼 reply-to-session）
+    """
     result = send_cross_account(to_did, body, opts["mode"], from_name, from_did,
-                                session_id)
+                                session_id, from_session_id)
     if result.get("unimplemented"):
         print("❌ 跨账号消息路由暂不可用（myco 网关未实现 /api/msg/route），消息未发送",
               file=sys.stderr)
@@ -1114,6 +1133,9 @@ def main():
     sender_name, sender_sid = sender_info(sessions)
     from_name = meta.get("myName") or sender_name or "unknown"
     from_did = meta.get("myDid", "")
+    # 信封 fromSessionId：**我自己的**会话 id（对端用它拼 reply-to-session 行）。
+    # 与 opts["session"]（对端目标会话）是两回事，别混。
+    from_session_id = sender_sid or ""
 
     # 手写头剥离（本地/跨账号同样生效——2026-10-23：调用方模仿接收格式手写头的
     # 误用被审计实锤 44 次，这里让它无害化：剥掉后统一用自动署名）
@@ -1122,7 +1144,7 @@ def main():
         print(f"⚠️  检测到调用方手写消息头 {stripped} 行，已自动剥离。"
               f"规范头（[from:…]+reply-to:）由 send.py 自动生成，调用方永远不要自己写。",
               file=sys.stderr)
-    header = build_header(sender_name, sender_sid)
+    header = build_header(sender_name, sender_sid, steer=(opts.get("mode", "steer") == "steer"))
     full_text = header + "\n" + text
 
     kind = classify_target(opts["to"])
@@ -1162,7 +1184,9 @@ def main():
             desc = f"{entry['displayName']}({_short_did(did)})"
         else:
             desc = f"{entry['displayName']}({entry['shareId']} owner)"
-        deliver_cross_account(did, desc, text, opts, from_name, from_did)
+        deliver_cross_account(did, desc, text, opts, from_name, from_did,
+                              session_id=opts.get("session") or "",
+                              from_session_id=from_session_id or "")
         return
 
     if kind == "share-id":
@@ -1195,7 +1219,9 @@ def main():
         return
     if hit["kind"] == "friend":
         deliver_cross_account(hit["did"], f"{hit['displayName']}({_short_did(hit['did'])})",
-                              text, opts, from_name, from_did)
+                              text, opts, from_name, from_did,
+                              session_id=opts.get("session") or "",
+                              from_session_id=from_session_id or "")
         return
     deliver_share(hit, text, opts, from_name, from_did)
 

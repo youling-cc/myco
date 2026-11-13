@@ -104,9 +104,9 @@ profile without them still loads, the title line is simply omitted.
 From the profile directory (this is what `dsh plugin --profile <name> add` does for you):
 
 ```powershell
-dsh plugin --profile <name> add "link:D:/Projects/AOP/myco/dsh-plugin-identity"
+dsh plugin --profile <name> add "link:<path-to-dsh-plugin>"
 # or, for a copy instead of a live link:
-dsh plugin --profile <name> add "file:D:/Projects/AOP/myco/dsh-plugin-identity"
+dsh plugin --profile <name> add "file:<path-to-dsh-plugin>"
 ```
 
 `link:` is what the desktop profile already uses for local plugins (`@local/dsh-*` in

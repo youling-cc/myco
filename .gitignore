@@ -2,6 +2,13 @@
 node_modules/
 target/
 dist/
+
+# dsh-plugin build output
+tools/dsh-plugin/lib/
+
+# identity-svc runtime data
+revocations.json
+msg-inbox.json
 build/
 *.apk
 *.idsig

@@ -15,8 +15,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: cd apps/phone && npm ci
-      - run: cd apps/phone && npx vitest run
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - run: cd apps/phone && pnpm install --frozen-lockfile --ignore-workspace
+      - run: cd apps/phone && pnpm exec vitest run
 
   identity-svc-tests:
     name: Identity Service Tests (node:test)
@@ -25,8 +28,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - run: cd services/identity-svc && npm ci
+          node-version: 24        # node:sqlite 需 22.5+（本地开发 Node 25；20 无此内建模块）
+      - run: cd services/identity-svc && npm install --no-audit --no-fund
       - run: cd services/identity-svc && node --test
 
   home-ui-tests:
@@ -63,4 +66,8 @@ jobs:
       - run: pnpm --dir apps/home/ui build
       - run: pnpm --dir apps/media/ui build
       - uses: dtolnay/rust-toolchain@stable
-      - run: cd apps/home/src-tauri && cargo test --workspace
+      - run: cd apps/home/src-tauri && cargo test --workspace --lib
+  # --lib only: GUI bin/test targets link the tauri webview stack, which crashes
+  # rust-lld on ubuntu (lld crash stack, raw-dylibs path). Integration tests
+  # (tests/) are verified locally on Windows. Revisit when CLI variant (issue #3 A3)
+  # builds — then CI can run the non-gui targets too.

@@ -71,6 +71,10 @@ public class MainActivity extends Activity {
     @SuppressLint("SetJavaScriptEnabled")
     @Override
     protected void onCreate(Bundle b) {
+        // 2026-11-12 vnet 诊断旋钮（连接秒死案）：必须在 VnetClient 类加载（System
+        // .loadLibrary + env 读取都更早）之前设 env——onCreate 第一句。文件开关热切：
+        // files/vnet-no-p2p、files/vnet-debug（见 VnetClient.applyEnvToggles）。
+        VnetClient.applyEnvToggles(this);
 
         // 2026-10-28 深链接登录（DL-Auth）：检查启动 Intent 是否是 myco://auth
         handleDeepLink(getIntent());
@@ -84,6 +88,9 @@ public class MainActivity extends Activity {
             registerReceiver(screenOnReceiver, sf);
         } catch (Throwable ignored) { }
         super.onCreate(b);
+        // 2026-11-13 期望面持久化：恢复上次的 DESIRED 转发集并排恢复线程
+        // （RDP 3389 不再等点卡才挂——重启后首点失败根修）。
+        try { P2pSyncTunnel.init(this); } catch (Throwable ignored) { }
         // 记录本进程启动时的版本（只首次赋值：同一个旧进程即使 Activity 重建，也不会把新包版号写进来）
         if (sProcessVersionCode < 0) {
             try { sProcessVersionCode = currentVersionCode(); } catch (Throwable ignored) { }
@@ -502,6 +509,20 @@ public class MainActivity extends Activity {
 
     /** JS bridge:PWA 侧 window.MycoShell 探测/保活/自更新。 */
     private static class MycoShell {
+        /** 2026-11-12 连接秒死案：诊断开关热切（vnet-no-p2p / vnet-debug）。
+         *  写/删 files 下标记文件，重启 app 后 applyEnvToggles 生效（env 须在
+         *  vnet_* 调用前设——重启代价 3s，诊断期可接受）。 */
+        @android.webkit.JavascriptInterface
+        public String vnetDiagToggle(String name, boolean on) {
+            try {
+                java.io.File f = new java.io.File(act.getFilesDir(), name);
+                if (on) { java.io.FileWriter w = new java.io.FileWriter(f); w.write("1"); w.close(); }
+                else { f.delete(); }
+                return "{\"ok\":true,\"name\":\"" + name + "\",\"on\":" + on + "}";
+            } catch (Exception e) {
+                return "{\"ok\":false,\"err\":\"" + String.valueOf(e).replace("\"", "'") + "\"}";
+            }
+        }
         /**
          * 2026-10-23：应用内浏览器（DSH 分享页专用）。
          * 系统浏览器（荣耀/百度 LightSearchActivity）经 vnet forward 打开 127.0.0.1 页面不可用；
@@ -542,6 +563,39 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public boolean isApk() { return true; }
+
+        /**
+         * 2026-11-12：剪贴板桥。
+         *
+         * 为什么必须走壳：WebView 里 `navigator.clipboard.writeText` / `execCommand('copy')`
+         * 都要求**用户手势上下文**，而 RDP 卡片的复制发生在若干 await（隧道 ensure）之后，
+         * 手势早就丢了 —— 真机实测两条路都失败，卡片只能提示「自动复制失败，手动输入」。
+         * 壳侧 setPrimaryClip 不需要手势，稳定成功。
+         */
+        @JavascriptInterface
+        public boolean copyText(String text) {
+            try {
+                final String t = text == null ? "" : text;
+                if (t.isEmpty()) return false;
+                final android.app.Activity a = act;
+                a.runOnUiThread(new Runnable() {
+                    @Override public void run() {
+                        try {
+                            android.content.ClipboardManager cm =
+                                    (android.content.ClipboardManager) a.getSystemService(
+                                            android.content.Context.CLIPBOARD_SERVICE);
+                            if (cm != null) {
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("myco", t));
+                            }
+                        } catch (Throwable ignored) { }
+                    }
+                });
+                return true;
+            } catch (Throwable e) {
+                android.util.Log.e("MycoShell", "copyText failed: " + e);
+                return false;
+            }
+        }
 
         /**
          * 2026-11-06 目标②：RDP 桥——启动手机上的 Microsoft Remote Desktop。
@@ -857,6 +911,94 @@ public class MainActivity extends Activity {
             String s = TunnelProcessService.readState(act);
             if (s == null || s.isEmpty()) return "{\"ok\":true,\"armed\":false}";
             return s;
+        }
+
+        // ═══ 2026-11-11「ADB 调试」分享卡（需求 youling-myco apps/vnet/docs/
+        // ADB-SHARE-TASK.md）：手机当 vnet server（5555），授权设备经隧道
+        // adb connect。与上面的 vnetRdpArm 方向相反——那是"我去连别人"的
+        // 数据面，这是"别人连我"。peer_id 公式与 PC vnet_forward.rs 同源。
+        // ⚠️ 凡触 libvnet 的桥一律**异步**（注册重试在调用线程会冻 WebView，
+        // 真机事故实证）；state() 只读原子字段，保持同步。═══
+
+        /** 启动 ADB vnet server（异步；结果经 callbackJs(resultJson) 回）。
+         *  json：{device:本机设备did, targetPort:5555, relay?, secret?}。 */
+        @JavascriptInterface
+        public void vnetAdbServerStartAsync(final String callbackJs, final String json) {
+            final MainActivity a = act;
+            new Thread(new AdbServerTask(a, callbackJs, json, true), "myco-adb-ensure").start();
+        }
+
+        /** 停止 ADB vnet server（异步；撤销=闸门随 server 消亡立即断开）。 */
+        @JavascriptInterface
+        public void vnetAdbServerStopAsync(final String callbackJs) {
+            final MainActivity a = act;
+            new Thread(new AdbServerTask(a, callbackJs, "", false), "myco-adb-ensure").start();
+        }
+
+        /** ADB vnet server 状态快照（running/targetPort/startedAtMs/lastErr）——
+         *  只读原子字段，不触 libvnet，同步安全。 */
+        @JavascriptInterface
+        public String vnetAdbServerState() {
+            return AdbShareServer.state();
+        }
+
+        /** 本机设备 did（轻量同步桥，不触 libvnet）：优先 RelayProvider 装配时
+         *  注入的 did，并持久化到 SharedPreferences（下次冷启动 relay 未装配时
+         *  也能取到）。空串 = 尚未就绪。JS 侧身份 vault 没有 rootDid 字段
+         *  （2026-11-11 DSH协议应用 踩过），手机 DID 以本桥为准。 */
+        @JavascriptInterface
+        public String myDeviceDid() {
+            try {
+                String did = RelayProvider.deviceDid();
+                if (did != null && did.length() >= 8) {
+                    act.getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+                            .edit().putString("my_device_did", did).apply();
+                    return did;
+                }
+                return act.getSharedPreferences(PREFS_APP, MODE_PRIVATE)
+                        .getString("my_device_did", "");
+            } catch (Throwable t) {
+                return "";
+            }
+        }
+
+        /**
+         * 2026-11-11：注入本机设备身份到 libvnet（seed 传 base64，同
+         * `youling.vault.keyB64`）。必须在起任何 vnet client 之前调一次。
+         *
+         * 不做成异步：内部只是 base64→hex + 一次 setter，微秒级，不碰网络。
+         * 返回 "ok" / 错误串；`vnetHasLocalIdentity()` 可复核。
+         */
+        @JavascriptInterface
+        public String vnetSetLocalIdentity(String did, String seedB64) {
+            try {
+                int rc = VnetClient.setLocalIdentityB64(did, seedB64);
+                return rc == VnetClient.VNET_OK ? "ok" : ("rc=" + rc);
+            } catch (Throwable t) {
+                return String.valueOf(t);
+            }
+        }
+
+        @JavascriptInterface
+        public boolean vnetHasLocalIdentity() {
+            return VnetClient.hasLocalIdentity();
+        }
+
+        /** 2026-11-11 对账数据面 vnet 隧道（手机 → 对端 p2p :9100，本地回环口）。
+         *  json：{targetDevice, targetPort:9100, localPort:25910, device:本机did}。
+         *  **异步桥**（vnet Rust 修复前 libvnet 的 Connection 构造在调用线程同步
+         *  做 relay 注册重试/STUN，最长 ~30s——同步桥会冻住 WebView JS 线程，
+         *  真机事故实证）。结果经 callbackJs(resultJson) 回；单次尝试不重试。 */
+        @JavascriptInterface
+        public void p2pTunnelEnsureAsync(final String callbackJs, final String json) {
+            final MainActivity a = act;
+            new Thread(new P2pTunnelEnsureTask(a, callbackJs, json), "myco-p2p-ensure").start();
+        }
+
+        /** 对账隧道状态（诊断；只读原子字段，不碰 vnet）。 */
+        @JavascriptInterface
+        public String p2pTunnelState() {
+            return P2pSyncTunnel.state();
         }
 
         @JavascriptInterface

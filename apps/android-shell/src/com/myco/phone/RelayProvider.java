@@ -87,6 +87,12 @@ public class RelayProvider {
         host = h; port = p; deviceDid = did; localPort = lp;
     }
 
+    /** 最近装配的本机设备 did（2026-11-11：MycoShell.myDeviceDid() 的数据源——
+     *  JS 身份 vault 没有 rootDid 字段，手机 DID 以 Java 侧装配记录为准）。 */
+    public static String deviceDid() {
+        return deviceDid == null ? "" : deviceDid;
+    }
+
     /** 启动常驻注册循环（幂等；线程若已死会重开）。设备 did / 本地口未就绪时静默返回。 */
     public static void setContext(Context c) { appCtx = c == null ? null : c.getApplicationContext(); }
 

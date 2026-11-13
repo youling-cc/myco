@@ -151,7 +151,7 @@ impl TraceRecorder {
         let _ = f.write_all(line.as_bytes()).await;
     }
 
-    /// 读取全部帧(SSE 重连补帧 /api/aop/frames/:id 用)。
+    /// 读取全部帧(SSE 重连补帧 /api/labs/frames/:id 用)。
     pub async fn read_all(&self) -> Vec<AopFrame> {
         Self::read_all_path(&self.path).await
     }
@@ -225,7 +225,7 @@ mod tests {
     use super::*;
 
     /// 旧格式帧(无 from 字段)必须仍可反序列化(旧 traces.jsonl 回放路径:
-    /// TraceRecorder::read_all → /api/aop/frames/:id 补帧)。
+    /// TraceRecorder::read_all → /api/labs/frames/:id 补帧)。
     #[test]
     fn legacy_frame_without_from_deserializes() {
         let line = r#"{"sessionId":"s-legacy","slug":"task","layer":"-","attempt":0,"executorKind":"agent","kind":"tool","o":"obs","s":"state","a":"act","r":"","at":"2026-08-14T00:00:00+00:00"}"#;

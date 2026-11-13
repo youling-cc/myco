@@ -527,6 +527,47 @@ tests.push(
   }],
 );
 
+tests.push(
+  ["身份头 + 空策略表 → 503（fail-closed）；有策略但缺该 DID → 403；已授权放行", async () => {
+    const { startProxySuite } = await import("../src/web-listener.js");
+    const { canonicalBody } = await import("../src/policy-proxy.js");
+    const { createHmac, randomBytes, randomUUID } = await import("node:crypto");
+    const key = randomBytes(32);
+    const upstream = (await import("node:http")).createServer((q, s) => {
+      q.resume();
+      q.on("end", () => { s.writeHead(200, { "content-type": "application/json" }); s.end("{}"); });
+    });
+    await new Promise((r) => upstream.listen(0, "127.0.0.1", r));
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = await mkdtemp(join(tmpdir(), "policyless-"));
+    const suite = await startProxySuite({
+      env: { DSH_WEB_URL: `http://127.0.0.1:${upstream.address().port}` },
+      config: { stateFile: join(dir, "s.json"), basePort: 28000 + Math.floor(Math.random() * 900) },
+      secret: randomBytes(32), controlKey: key, controlPort: 0, log: () => {},
+    });
+    const call = (did) => fetch(`http://127.0.0.1:${suite.owner.port}/api/session/list`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(did ? { "x-myco-viewer-did": did } : {}) },
+      body: "{}",
+    });
+    // 空策略表 + 身份头 → **503 authorization-not-ready**（用户裁决：零容忍，绝不放行）
+    const empty = await call("did:myco:NotConfigured");
+    assert.equal(empty.status, 503, "空策略表必须 fail-closed（503）");
+    assert.ok((await empty.text()).includes("not ready"), "503 正文应写明授权未就绪");
+    // 推一条策略后：未授权 DID → 403
+    const body = { nonce: randomUUID(), ts: Date.now(), viewerDid: "did:myco:Allowed", authz: { taskCaps: {}, taskVis: {}, grant: {} } };
+    body.sig = createHmac("sha256", key).update(canonicalBody(body)).digest("base64url");
+    await fetch(`http://127.0.0.1:${suite.controlPort}/policy`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const denied = await call("did:myco:NotConfigured");
+    assert.equal(denied.status, 403, "有策略表但缺该 DID 必须 403（撤销语义）");
+    assert.ok((await denied.text()).includes("policy"), "403 文案应说明 policy 缺失");
+    assert.equal((await call("did:myco:Allowed")).status, 200, "已授权 DID 放行");
+    suite.close(); upstream.close();
+  }],
+);
+
 if (process.env.VITEST !== undefined) {
   const { describe, it } = await import("vitest");
   describe("web listener (mock upstream)", () => {

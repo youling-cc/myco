@@ -368,6 +368,10 @@ pub fn lease_open(key: &LeaseKey, local_port: u16) -> Result<(), String> {
             rec.updated_at_ms = now;
             g.leases.insert(ks, rec);
             save_locked(&g);
+            // 显式开卡 = 新的可达性证据：后台 keeper 的离线退避不该挡住用户这次请求
+            // （终态由下一次探活/抖动重新判定，见「离线设备重建退避」段）。
+            drop(g);
+            rebuild_backoff_reset(&key.device, key.port);
             Ok(())
         }
         Err(e) => {
@@ -607,6 +611,276 @@ fn sanitize_reason(r: &str) -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// 离线设备重建退避（2026-11-11 RDP 三连断事故 §2）
+//
+// 事故数字（PC 日志抽样 20 万行）：永久离线的旧手机身份 `did:myco:z6Mkmx14…`
+// 的 `:9100` 转发被反复建/拆 **1992 次**（`[vnet-mf] …:9100 → :25012` 紧跟
+// `[vnet-mf] :25012 已移除`），每条真实路由也被重建 88–103 次。为什么旧逻辑退不掉：
+// 对端离线时 **vnet 建链照样 Ok**（中继注册成功 ≠ 对端可达），于是 keeper 每拍
+// 250ms 就"缺了就重建"，退避阶梯一次都没走上去——旧代码只有"失败负缓存"，
+// 没有"反复抖动"的判据。
+//
+// 设计（三层，缺一不可）：
+// 1. **阶梯**：1s → 5s → 30s → 2min → 10min（封顶）。数值不是拍脑袋，全部复用本仓
+//    既有周期契约：
+//    · 1s = `p2p_tunnel::restore_remembered_tunnels` 里"失败每 1s 重试（30 次上限）"
+//      的既有节奏（同一子系统对"对端可能正在重启"的既有单位），同时是 keeper
+//      250ms 一拍的 4 倍，不会被单拍抖动带偏；
+//    · 5s = `UPSTREAM_PROBE_INTERVAL_MS`（探活周期）——退避不超过一个探活间隔，
+//      避免"对端已恢复但还要多等一轮探活"；
+//    · 30s = 探活黑洞 `force_vnet_backoff(…, 30_000)` 的负缓存长度（同一子系统
+//      既有的"手气不好先退 30s"量级）；
+//    · 2min = 本文件黑洞回退分支注释里的"120s 后再试直连"；
+//    · 10min = `vnet_forward::VNET_DEVICE_BACKOFF_MS`（对端没跑 vnet server 时整设备
+//      停用时长）——离线设备的重试节奏与"设备级黑洞"同量级才算真收敛。
+// 2. **失败证据**（只有这三种会升级）：重建返回 Err；重建成功后**不足 10s 又缺失**
+//    （抖动/flapping）；`tunnel_fail_streak >= 3`（真实连接连续失败）。
+//    **重建返回 Ok 不算恢复**——1992 次热循环里每次重建都是 Ok，若 Ok 就清零，
+//    阶梯永远停在 1s，这个 bug 就修不掉。
+// 3. **成功证据**（清零）：上游探活通过（`lease_upstream_ok`）；或路由连续存活
+//    ≥30s（keeper 每拍观测）。用户显式开卡（`lease_open`）也清零——那是新证据，
+//    不该被后台退避挡住。
+//
+// 退避期内 keeper **跳过重建与探活**（不烧 relay/CPU）；状态经
+// `/api/vnet/leases`（`backoffMs`/`nextRetryAtMs`）与 `/api/vnet/forwards`
+// （`backoffs[]`）可见，不必再靠日志数次数。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 退避阶梯（ms）：第 1 次失败等 1s，之后 5s / 30s / 2min / 10min 封顶。
+pub(crate) const REBUILD_BACKOFF_LADDER_MS: [u64; 5] = [1_000, 5_000, 30_000, 120_000, 600_000];
+/// 重建成功后不足这么久又"缺失" = 抖动（flapping），按失败升级退避。
+pub(crate) const REBUILD_FLAP_WINDOW_MS: u64 = 10_000;
+/// 路由连续存活超过这么久 = 真恢复（清零退避；与 30s 黑洞负缓存同量级）。
+pub(crate) const REBUILD_STABLE_RESET_MS: u64 = 30_000;
+
+/// 一条 `(device, port)` 的重建退避状态（纯内存；不进 vnet-leases.json——它描述的是
+/// keeper 的重试节奏，不是租约坐标，进程重启后按"没失败过"重来才是对的）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RebuildBackoff {
+    /// 连续失败次数（0 = 未退避）。同时是阶梯下标（第 n 次失败 → 阶梯[n-1]）。
+    pub consecutive: u32,
+    /// 下一次允许重建/探活的时刻（ms；0 = 立即可试）。
+    pub next_retry_at_ms: u64,
+    /// 最近一次重建成功（bind + accept 起来）的时刻（ms）。
+    pub last_ok_ms: u64,
+    /// 最近一次失败判定的时刻（ms）。
+    pub last_fail_ms: u64,
+    /// 最近一次失败原因（人话；只用于诊断面，不含凭证）。
+    pub reason: &'static str,
+}
+
+/// 第 `consecutive` 次失败该等多久（1 起；越界一律取封顶值）。
+pub(crate) fn rebuild_backoff_delay_ms(consecutive: u32) -> u64 {
+    let idx = consecutive.saturating_sub(1) as usize;
+    REBUILD_BACKOFF_LADDER_MS[idx.min(REBUILD_BACKOFF_LADDER_MS.len() - 1)]
+}
+
+/// 整条阶梯（诊断/测试用）：`[1s, 5s, 30s, 2min, 10min]`，严格递增后封顶。
+pub(crate) fn rebuild_backoff_ladder() -> Vec<u64> {
+    (1..=REBUILD_BACKOFF_LADDER_MS.len() as u32)
+        .map(rebuild_backoff_delay_ms)
+        .collect()
+}
+
+static REBUILD_BACKOFF: LazyLock<Mutex<HashMap<String, RebuildBackoff>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn rebuild_backoff_key(device: &str, port: u16) -> String {
+    format!("{device}#{port}")
+}
+
+/// 升一级并排出下次重试时刻（纯状态转移；单测直击阶梯）。
+fn backoff_on_failure(e: &mut RebuildBackoff, now: u64, reason: &'static str) {
+    e.consecutive = e.consecutive.saturating_add(1);
+    e.last_fail_ms = now;
+    e.reason = reason;
+    e.next_retry_at_ms = now.saturating_add(rebuild_backoff_delay_ms(e.consecutive));
+}
+
+/// 是否仍在退避期内（true = 本拍跳过重建与探活）。
+pub fn rebuild_backoff_active(device: &str, port: u16, now: u64) -> bool {
+    let g = REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    g.get(&rebuild_backoff_key(device, port))
+        .map(|e| e.consecutive > 0 && now < e.next_retry_at_ms)
+        .unwrap_or(false)
+}
+
+/// 失败证据：升一级退避（重建 Err / 抖动 / 真实连接连败）。
+pub fn rebuild_backoff_note_failure(device: &str, port: u16, now: u64, reason: &'static str) {
+    let mut g = REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let e = g.entry(rebuild_backoff_key(device, port)).or_default();
+    backoff_on_failure(e, now, reason);
+}
+
+/// 重建成功（bind + accept 起来）：只记"最近成功时刻"，**不清零**。
+///
+/// 这是本修复的关键不变量：对端离线时重建照样 Ok（中继注册成功），若此处清零，
+/// 1s 的退避永远升不上去，1992 次热循环原样复现。清零只认"探活通过"或"稳定存活"。
+pub fn rebuild_backoff_note_rebuild_ok(device: &str, port: u16, now: u64) {
+    let mut g = REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let e = g.entry(rebuild_backoff_key(device, port)).or_default();
+    e.last_ok_ms = now;
+}
+
+/// 成功证据：清零（探活通过 / 稳定存活 ≥30s / 用户显式开卡）。
+pub fn rebuild_backoff_reset(device: &str, port: u16) {
+    let mut g = REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    g.remove(&rebuild_backoff_key(device, port));
+}
+
+/// 抖动判定：重建成功（或从没记录过）之后**不足 10s 又缺失** → 视为抖动并升一级。
+///
+/// 返回 true 表示本拍已按失败处理（调用方应跳过本次重建，等退避到点）。
+pub fn rebuild_backoff_note_missing(device: &str, port: u16, now: u64) -> bool {
+    let mut g = REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let e = g.entry(rebuild_backoff_key(device, port)).or_default();
+    if e.last_ok_ms == 0 || now.saturating_sub(e.last_ok_ms) >= REBUILD_FLAP_WINDOW_MS {
+        return false;
+    }
+    backoff_on_failure(e, now, "flapping<10s");
+    true
+}
+
+/// keeper 每拍：路由仍活着时调用。连续存活 ≥30s → 清零退避（真恢复）。
+pub(crate) fn rebuild_backoff_note_live(device: &str, port: u16, now: u64) -> bool {
+    let mut g = REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let key = rebuild_backoff_key(device, port);
+    let Some(e) = g.get_mut(&key) else { return false };
+    if e.consecutive == 0 {
+        return false;
+    }
+    if e.last_ok_ms == 0 {
+        e.last_ok_ms = now;
+        return false;
+    }
+    if now.saturating_sub(e.last_ok_ms) < REBUILD_STABLE_RESET_MS {
+        return false;
+    }
+    g.remove(&key);
+    true
+}
+
+/// 诊断面：某 `(device, port)` 的退避三元组 `(backoffMs, nextRetryAtMs, consecutiveFailures)`。
+/// 未退避返回全 0（API 里直接展开成 `backoffMs=0, nextRetryAtMs=0`）。
+pub fn rebuild_backoff_info(device: &str, port: u16, now: u64) -> (u64, u64, u32) {
+    let g = REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    match g.get(&rebuild_backoff_key(device, port)) {
+        Some(e) if e.consecutive > 0 => (
+            e.next_retry_at_ms.saturating_sub(now),
+            e.next_retry_at_ms,
+            e.consecutive,
+        ),
+        _ => (0, 0, 0),
+    }
+}
+
+/// 诊断面：全部仍在退避中的条目（`/api/vnet/forwards` 的 `backoffs[]`）。
+///
+/// 元组 = `(device, port, backoffMs, nextRetryAtMs, lastFailMs, consecutiveFailures, reason)`。
+pub fn rebuild_backoff_views(now: u64) -> Vec<(String, u16, u64, u64, u64, u32, String)> {
+    let g = REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<(String, u16, u64, u64, u64, u32, String)> = g
+        .iter()
+        .filter(|(_, e)| e.consecutive > 0)
+        .filter_map(|(k, e)| {
+            let (device, port) = k.rsplit_once('#')?;
+            Some((
+                device.to_string(),
+                port.parse::<u16>().ok()?,
+                e.next_retry_at_ms.saturating_sub(now),
+                e.next_retry_at_ms,
+                e.last_fail_ms,
+                e.consecutive,
+                e.reason.to_string(),
+            ))
+        })
+        .collect();
+    out.sort_by(|a, b| b.3.cmp(&a.3));
+    out
+}
+
+/// 测试钩子：清空退避表（进程重启语义；磁盘无此状态）。
+///
+/// **不要在测试里用它抹全局态**（会造成"过滤跑红/全量跑绿"的假阴性）：
+/// 各测试用自己唯一的 DID 键 + `rebuild_backoff_reset` 只清自己即可。
+/// 这里保留给"需要断言空表"的未来用例。
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn test_reset_rebuild_backoff() {
+    REBUILD_BACKOFF.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// keeper 日志节流（2026-11-11 事故 §4：`[vnet-keeper]` 占全日志 35%）
+//
+// 同一 `(device, port, event)` 10s 内只打一条，其余计数并进下一条的 `suppressed=N`。
+// 为什么不是"少打点"：这些行是事故里唯一能证明"谁在反复重建"的证据，删掉就瞎了；
+// 要的是**不重复**，不是**不记录**。真值仍在（一次性偏差 = 最坏 10s 延迟）。
+//
+// 自足性：节流表是进程级全局态，但每个测试只用自己唯一的 DID 键，
+// 且**没有任何测试提供"清空整表"的钩子**——避免并行/过滤跑时互相抹状态。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// keeper 诊断行节流窗口（同一 event 10s 一条）。
+pub(crate) const KEEPER_LOG_WINDOW_MS: u64 = 10_000;
+
+/// 节流表：`(device, port, event)` → (上次打印时刻 ms, 期间被抑制条数)。
+static KEEPER_LOG_THROTTLE: LazyLock<Mutex<HashMap<(String, u16, String), (u64, u32)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 纯判定：`(是否打印, 本条该报的 suppressed 计数)`。
+///
+/// 语义（直接对应 §4 要求"其余计数在打到的那条里带 suppressed=N"）：
+/// · 距上次打印不足窗口 → **不打印**，返回 0（调用方把表里的计数 +1）；
+/// · 窗口到点 → 允许打印，返回"距上一条之间被压掉的条数"（下一次打印时报它）；
+/// · 从没打印过 → 打印，报 0。
+pub(crate) fn keeper_log_decision(now: u64, last: Option<(u64, u32)>, window_ms: u64) -> (bool, u32) {
+    match last {
+        Some((last_ms, _)) if now.saturating_sub(last_ms) < window_ms => (false, 0),
+        Some((_, suppressed)) => (true, suppressed),
+        None => (true, 0),
+    }
+}
+
+/// 节流后的 keeper 诊断行：放行时返回整行文本（含 `suppressed=N` 尾缀），否则 None。
+///
+/// 抽成"返回文本"的函数而不是直接打印，才能被单测钉住（可注入 now）。
+pub(crate) fn keeper_log_line(
+    device: &str,
+    port: u16,
+    event: &str,
+    body: &str,
+    now: u64,
+) -> Option<String> {
+    let key = (device.to_string(), port, event.to_string());
+    let mut g = KEEPER_LOG_THROTTLE.lock().unwrap_or_else(|e| e.into_inner());
+    // 防无限增长：超过 300 个 key 时清掉已过窗的条目。
+    if g.len() > 300 {
+        g.retain(|_, (t, _)| now.saturating_sub(*t) < KEEPER_LOG_WINDOW_MS);
+    }
+    let (emit, report) = keeper_log_decision(now, g.get(&key).copied(), KEEPER_LOG_WINDOW_MS);
+    if !emit {
+        // 被压掉：只累加计数，保留上一次打印时刻（窗口从"上次真的打出来"起算）。
+        if let Some(e) = g.get_mut(&key) {
+            e.1 = e.1.saturating_add(1);
+        } else {
+            g.insert(key, (now, 1));
+        }
+        return None;
+    }
+    g.insert(key, (now, 0));
+    Some(format!("{body} suppressed={report}"))
+}
+
+/// 打一条 keeper 诊断行（节流 + 毫秒时间戳）。`body` 必须是"不含尾部 suppressed"的原正文。
+#[cfg(feature = "gui")]
+pub(crate) fn keeper_log(device: &str, port: u16, event: &str, body: &str) {
+    if let Some(line) = keeper_log_line(device, port, event, body, now_ms()) {
+        crate::p2p_tunnel::elog!("[vnet-keeper] {line}");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // L1-L4 netstate 快照（诊断/API 面）
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -654,6 +928,10 @@ pub fn netstate_snapshot() -> serde_json::Value {
                 "lastSuccessMs": l.last_success_ms,
                 "lastFailMs": l.last_fail_ms,
                 "failReason": l.fail_reason,
+                // 离线设备重建退避（2026-11-11 §2）：0 = 不在退避
+                "backoffMs": rebuild_backoff_info(&l.key.device, l.key.port, now).0,
+                "nextRetryAtMs": rebuild_backoff_info(&l.key.device, l.key.port, now).1,
+                "consecutiveFailures": rebuild_backoff_info(&l.key.device, l.key.port, now).2,
             })
         })
         .collect();
@@ -716,6 +994,9 @@ pub fn start_vnet_keeper() {
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            // 本拍时间基准：退避阶梯/节流都以它为准（同拍内所有判定用同一个 now，
+            // 避免"先 now 后 now_ms"造成同一拍判定不一致）。
+            let tick_now = now_ms();
             let kept = crate::dsh_share::vnet_load_kept();
             let kept_n = kept.len();
             for item in &kept {
@@ -733,12 +1014,22 @@ pub fn start_vnet_keeper() {
                     crate::p2p_tunnel::tunnel_fail_clear(&device, port);
                     crate::vnet_forward::route_close(&device, port);
                     lease_event_source(&device, port, |k| crate::vnet_lease::lease_upstream_fail(&k, "conn-fail-streak>=3"));
-                    eprintln!("[vnet-keeper] {device}:{port} 连续连接失败 → 强制重建隧道");
+                    // 真实连接连败 = 最硬的"对端不可达"证据 → 升一级离线退避，
+                    // 免得下一拍又重建（1992 次热循环的燃料就是这一条）。
+                    rebuild_backoff_note_failure(&device, port, tick_now, "conn-fail-streak>=3");
+                    keeper_log(
+                        &device,
+                        port,
+                        "conn-fail-streak",
+                        &format!("{device}:{port} 连续连接失败 → 强制重建隧道（并升级离线退避）"),
+                    );
                     continue;
                 }
                 // I7 口径：listener 真活（accept 任务在跑）才算"隧道在"——死条目
                 // （socket 已拆但 TUNNELS 还留着）视同缺失，走同口重建。
                 if let Some(cur) = crate::vnet_forward::route_live_local_port(&device, port) {
+                    // 路由仍活着：给"稳定存活"一条清零退避的路（恢复一次成功即清零）。
+                    rebuild_backoff_note_live(&device, port, tick_now);
                     if let Some(lp) = kept_local.filter(|p| *p > 0) {
                         if cur != lp {
                             // 2026-11-06 真案：想要的固定口被本进程另一个子系统占着
@@ -751,8 +1042,33 @@ pub fn start_vnet_keeper() {
                             // 原来这里「约定口空闲就 close→下一拍重绑」= 自找的 close↔重建循环
                             // （笔记本蜂窝下每拍都判漂移，实测 :56497→:64979→:55445 循环）。
                             // 现在：**一律收编现状**（kept 记录跟随实际口），不主动 close。
-                            eprintln!(
-                                "[vnet-keeper] 固定口漂移 → 收编现状 :{cur}（不 close，避免重建循环）：{device}:{port}"
+                            //
+                            // 2026-11-11 修正（笔记本 301 次「固定口漂移 → 收编现状」）：
+                            // 收编只对"进程已经跑起来、约定口被别的稳定占用者占着"成立。
+                            // **启动宽限期内**（进程刚起来 3.5s）约定口绑不上多半是旧实例
+                            // 残留/TIME_WAIT——此时收编等于把用户约定的口永久改掉
+                            // （实测 vnet-forwards.json 的 mtime 长时间不动 = 收编没落地），
+                            // 必须先按约定口收回来：close 现有（新口）路由 → 按约定口重建，
+                            // 重建内部会先退避重试约定口 3.5s，超时才换口。每个 route
+                            // 整段宽限期只收一次，绝不构成 close↔重建循环。
+                            if crate::vnet_forward::startup_grace_active(
+                                crate::vnet_forward::process_uptime_ms(),
+                            ) && startup_reclaim_once(&device, port)
+                            {
+                                crate::p2p_tunnel::elog!(
+                                    "[vnet-keeper] event=startup-fixed-port-reclaim route={device}:{port} 现监听 :{cur} ≠ 约定 :{lp} → 启动宽限期内按约定口重建（不收编、不写 kept）"
+                                );
+                                crate::vnet_forward::route_close(&device, port);
+                                spawn_rebuild(opening.clone(), device.clone(), port, kept_local, None);
+                                continue;
+                            }
+                            keeper_log(
+                                &device,
+                                port,
+                                "port-drift-adopt",
+                                &format!(
+                                    "固定口漂移 → 收编现状 :{cur}（不 close，避免重建循环）：{device}:{port}"
+                                ),
                             );
                             crate::dsh_share::vnet_keep_upsert(&device, port, Some(cur), None);
                             continue;
@@ -765,6 +1081,27 @@ pub fn start_vnet_keeper() {
                 // I7 缺失分支：listener 实际不存在 → 先如实清观测（false/false），
                 // 再按固定口重建；否则旧 listenerPresent=true 永不清除。
                 observe_listener_missing(&device, port);
+                // ── 离线退避（2026-11-11 事故 §2）──
+                // 退避期内**跳过重建与探活**：对端永久离线时 vnet 建链照样 Ok，
+                // 不设闸就是每 250ms 一次"建→拆"（实测 1992 次）。
+                if rebuild_backoff_active(&device, port, tick_now) {
+                    continue;
+                }
+                // 抖动判定：上一次重建成功（或进程内首次）后不足 10s 又缺失 =
+                // 对端不可达 / 刚建就被拆 → 升一级退避并等下一级到点。
+                if rebuild_backoff_note_missing(&device, port, tick_now) {
+                    let (wait_ms, next_at_ms, level) = rebuild_backoff_info(&device, port, tick_now);
+                    keeper_log(
+                        &device,
+                        port,
+                        "backoff-flap",
+                        &format!(
+                            "{device}:{port} 重建后 <{}s 又缺失 → 离线退避第 {level} 级，等 {wait_ms}ms（nextRetryAtMs={next_at_ms}）",
+                            REBUILD_FLAP_WINDOW_MS / 1000
+                        ),
+                    );
+                    continue;
+                }
                 spawn_rebuild(opening.clone(), device.clone(), port, kept_local, None);
             }
             // ── 非 kept 的租约（env/open / rdp 卡）：同口重建 + 状态机推进 ──
@@ -782,11 +1119,19 @@ pub fn start_vnet_keeper() {
                 let cur = crate::vnet_forward::route_live_local_port(&rec.key.device, rec.key.port);
                 match cur {
                     Some(p) if p == rec.local_port => {
+                        // 路由活且口=租约口：稳定存活可清零离线退避
+                        rebuild_backoff_note_live(&rec.key.device, rec.key.port, tick_now);
                         // 隧道在且口=租约口：健康推进 + 观测
                         if crate::p2p_tunnel::tunnel_fail_streak(&rec.key.device, rec.key.port) >= 3 {
                             crate::p2p_tunnel::tunnel_fail_clear(&rec.key.device, rec.key.port);
                             crate::vnet_forward::route_close(&rec.key.device, rec.key.port);
                             crate::vnet_lease::lease_upstream_fail(&rec.key, "conn-fail-streak>=3（重建同口）");
+                            rebuild_backoff_note_failure(
+                                &rec.key.device,
+                                rec.key.port,
+                                tick_now,
+                                "conn-fail-streak>=3",
+                            );
                             continue;
                         }
                         // listenerPresent = 实测（本进程 accept 任务在跑），不再硬编码 true：
@@ -803,9 +1148,14 @@ pub fn start_vnet_keeper() {
                     Some(p) => {
                         // 旧实现主动 close 再重绑会制造端口 churn。这里只复用活路由；
                         // lease.local_port 可能是浏览器入口而非 raw 口，绝不能按 route 强写。
-                        eprintln!(
-                            "[vnet-keeper] event=live-route-reused route={}:{} 现监听 :{p}，租约坐标 :{} 保持（不 close）",
-                            rec.key.device, rec.key.port, rec.local_port
+                        keeper_log(
+                            &rec.key.device,
+                            rec.key.port,
+                            "live-route-reused",
+                            &format!(
+                                "event=live-route-reused route={}:{} 现监听 :{p}，租约坐标 :{} 保持（不 close）",
+                                rec.key.device, rec.key.port, rec.local_port
+                            ),
                         );
                         lease_observe_source(&rec.key.device, rec.key.port, p);
                     }
@@ -813,6 +1163,26 @@ pub fn start_vnet_keeper() {
                         // 隧道缺失：先如实清 listener 观测（同 kept 缺失分支口径），
                         // 再按租约口重建（bind 失败 = 明确报错进 fail_reason）
                         observe_listener_missing(&rec.key.device, rec.key.port);
+                        // 离线退避：退避期内跳过重建与探活（同 kept 分支）
+                        if rebuild_backoff_active(&rec.key.device, rec.key.port, tick_now) {
+                            continue;
+                        }
+                        if rebuild_backoff_note_missing(&rec.key.device, rec.key.port, tick_now) {
+                            let (wait_ms, next_at_ms, level) =
+                                rebuild_backoff_info(&rec.key.device, rec.key.port, tick_now);
+                            keeper_log(
+                                &rec.key.device,
+                                rec.key.port,
+                                "backoff-flap",
+                                &format!(
+                                    "{}:{} 重建后 <{}s 又缺失 → 离线退避第 {level} 级，等 {wait_ms}ms（nextRetryAtMs={next_at_ms}）",
+                                    rec.key.device,
+                                    rec.key.port,
+                                    REBUILD_FLAP_WINDOW_MS / 1000
+                                ),
+                            );
+                            continue;
+                        }
                         spawn_rebuild(
                             opening.clone(),
                             rec.key.device.clone(),
@@ -838,6 +1208,12 @@ pub fn start_vnet_keeper() {
                             continue;
                         }
                         if !upstream_probe_eligible(rec.key.kind.as_str()) {
+                            continue;
+                        }
+                        // 离线退避期内**不探活**（2026-11-11 事故 §2：对端永久离线时
+                        // 探活必然失败，只会烧 relay 并制造假会话）。退避到点后由 keeper
+                        // 重建 → 下一轮探活自然恢复；探活一旦通过即清零退避。
+                        if rebuild_backoff_active(&rec.key.device, rec.key.port, now) {
                             continue;
                         }
                         // 2026-11-09 负缓存自锁根修：租约记的口已死（隧道被拆/漂移，
@@ -891,13 +1267,20 @@ pub fn start_vnet_keeper() {
                         let ks = lease_key_string(&k);
                         if ok {
                             streaks.lock().unwrap().remove(&ks);
+                            // 探活通过 = 最硬的"恢复一次成功" → 清零离线退避
+                            crate::vnet_lease::rebuild_backoff_reset(&k.device, k.port);
                             crate::vnet_lease::lease_upstream_ok(&k);
                             return;
                         }
                         let n = { let mut g = streaks.lock().unwrap(); let n = g.entry(ks).or_insert(0); *n += 1; *n };
-                        eprintln!(
-                            "[vnet-keeper] 上游探活失败 kind={} local={}（连续 {n}）：标 degraded",
-                            k.kind, lp
+                        keeper_log(
+                            &k.device,
+                            k.port,
+                            "probe-fail",
+                            &format!(
+                                "上游探活失败 kind={} local={}（连续 {n}）：标 degraded",
+                                k.kind, lp
+                            ),
                         );
                         crate::vnet_lease::lease_upstream_fail(&k, "upstream-probe-fail");
                         // **黑洞回退**：vnet 管的隧道连续 2 次探活失败 = "path 升到 P2P 但对端收不到"
@@ -913,9 +1296,14 @@ pub fn start_vnet_keeper() {
                             let (path, _) = crate::vnet_forward::vnet_path_info(&k.device, k.port)
                                 .map(|(p, a)| (p, a))
                                 .unwrap_or_else(|| ("-".into(), String::new()));
-                            eprintln!(
-                                "[vnet-keeper] vnet 隧道数据黑洞（path={path}，连续 {n} 次探活失败）→ 拆除并回退 legacy 中继，120s 后再试直连：{}#{}",
-                                k.device, k.port
+                            keeper_log(
+                                &k.device,
+                                k.port,
+                                "blackhole",
+                                &format!(
+                                    "vnet 隧道数据黑洞（path={path}，连续 {n} 次探活失败）→ 拆除并回退 legacy 中继，120s 后再试直连：{}#{}",
+                                    k.device, k.port
+                                ),
                             );
                             crate::vnet_forward::force_vnet_backoff(&k.device, k.port, 30_000);
                             crate::vnet_forward::route_close(&k.device, k.port);
@@ -953,6 +1341,21 @@ fn lease_observe_source(device: &str, port: u16, _cur: u16) {
     });
 }
 
+/// 启动宽限期内的"按约定固定口收回"只允许每 route 试一次（进程内）。
+///
+/// 为什么必须有这个上限：约定口若被**另一个稳定占用者**（本进程卡片 listener /
+/// 别的进程）长期占着，宽限期内每拍 close→重建就是新的 close↔重建互踩
+/// （2026-11-06 真案）。一次之后无论成败都回到"收编现状"，与旧行为一致。
+#[cfg(feature = "gui")]
+fn startup_reclaim_once(device: &str, port: u16) -> bool {
+    static TRIED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    TRIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(format!("{device}#{port}"))
+}
+
 #[cfg(feature = "gui")]
 fn spawn_rebuild(
     opening: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -986,15 +1389,28 @@ fn spawn_rebuild(
         // 用户本次显式换口，只有前者允许在 stop + AddrInUse 后迁移。
         match crate::vnet_forward::route_open(&device, port, None).await {
             Ok(local) => {
-                eprintln!("[vnet-keeper] 转发重建成功 {device}:{port} → 127.0.0.1:{local}");
+                // 重建 Ok **不等于**对端可达（中继注册成功也会 Ok）——只记"最近成功时刻"，
+                // 不清零退避（清零点见 rebuild_backoff_note_rebuild_ok 的注释）。
+                rebuild_backoff_note_rebuild_ok(&device, port, now_ms());
+                keeper_log(
+                    &device,
+                    port,
+                    "rebuild-ok",
+                    &format!("转发重建成功 {device}:{port} → 127.0.0.1:{local}"),
+                );
                 crate::startup_trace::mark_detail(
                     "keeper-rebuild-ok",
                     &format!("device={device} port={port} local={local}"),
                 );
                 if let Some(lp) = kept_local.filter(|p| *p > 0) {
                     if local != lp {
-                        eprintln!(
-                            "[vnet-keeper] event=kept-port-adopted route={device}:{port} 原约定 :{lp} 实际 :{local}（仅 stop + EADDRINUSE 换口路径允许；下一拍收编 kept 记录）"
+                        keeper_log(
+                            &device,
+                            port,
+                            "kept-port-adopted",
+                            &format!(
+                                "event=kept-port-adopted route={device}:{port} 原约定 :{lp} 实际 :{local}（仅 stop + EADDRINUSE 换口路径允许；下一拍收编 kept 记录）"
+                            ),
                         );
                     }
                 }
@@ -1013,7 +1429,18 @@ fn spawn_rebuild(
                 }
             }
             Err(e) => {
-                eprintln!("[vnet-keeper] 转发重建失败 {device}:{port}：{e}");
+                // 重建失败：**只有"新证据"才升级离线退避**。
+                // 若失败原因是 vnet 自己的 60s 负缓存还没到点（`VNET_FAIL_UNTIL`），
+                // 那不是新的不可达证据——升级会把一次 60s 负缓存放大成 10min 静默。
+                if !crate::vnet_forward::vnet_backoff_active(&device, port) {
+                    rebuild_backoff_note_failure(&device, port, now_ms(), "rebuild-err");
+                }
+                keeper_log(
+                    &device,
+                    port,
+                    "rebuild-fail",
+                    &format!("转发重建失败 {device}:{port}：{e}"),
+                );
                 match lease_key {
                     Some(k) => crate::vnet_lease::lease_probe_fail(&k, e.as_str()),
                     None => lease_event_source(&device, port, |k| crate::vnet_lease::lease_probe_fail(&k, e.as_str())),
@@ -1330,5 +1757,213 @@ mod tests {
             0,
             "租约口同样禁止写成 0"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2026-11-11 RDP 三连断事故回归（§2 离线退避 / §3 启动宽限 / §4 节流）
+    // 每个测试用独立 DID，避免与并行测试共用节流/退避表键。
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// §2 阶梯：必须是 1s → 5s → 30s → 2min → 10min，单调不减且封顶 10min。
+    ///
+    /// 这些数字不是"看起来合理"：5s = 探活周期、30s = 黑洞负缓存、2min = "120s
+    /// 后再试直连"、10min = `vnet_forward::VNET_DEVICE_BACKOFF_MS`。改阶梯必须同步改
+    /// 本测试与那段注释（否则等于偷改契约）。
+    #[test]
+    fn offline_rebuild_backoff_ladder_is_monotonic_and_capped() {
+        assert_eq!(
+            rebuild_backoff_ladder(),
+            vec![1_000, 5_000, 30_000, 120_000, 600_000],
+            "阶梯 = 1s→5s→30s→2min→10min（§2 原文）"
+        );
+        let mut prev = 0u64;
+        for level in 1..=8u32 {
+            let delay = rebuild_backoff_delay_ms(level);
+            assert!(delay >= prev, "阶梯必须单调不减：level={level} delay={delay}");
+            prev = delay;
+        }
+        assert_eq!(rebuild_backoff_delay_ms(5), 600_000);
+        assert_eq!(
+            rebuild_backoff_delay_ms(50),
+            600_000,
+            "超过阶梯一律封顶 10min（不许回绕、不许归零=热点重试）"
+        );
+        assert_eq!(rebuild_backoff_delay_ms(0), 1_000, "0 级按第 1 级算");
+    }
+
+    /// §2 行为：连续失败逐级升级；退避期内 active（keeper 据此跳过重建与探活）；
+    /// 一次成功（探活通过 / 稳定存活 / 显式开卡）**立即清零**。
+    #[test]
+    fn offline_peer_backoff_escalates_and_single_success_resets() {
+        let (dev, port) = ("did:myco:z6Mkmx14-offline", 9100u16);
+        let mut now = 10_000u64;
+        rebuild_backoff_note_failure(dev, port, now, "rebuild-err");
+        assert!(rebuild_backoff_active(dev, port, now), "失败当拍即进入退避");
+        assert!(!rebuild_backoff_active(dev, port, now + 1_000), "1s 到点即可再试");
+        assert_eq!(rebuild_backoff_info(dev, port, now), (1_000, now + 1_000, 1));
+        for (want_wait, want_level) in [(5_000u64, 2u32), (30_000, 3), (120_000, 4), (600_000, 5)] {
+            now = rebuild_backoff_info(dev, port, now).1; // 走到点那一刻再失败
+            rebuild_backoff_note_failure(dev, port, now, "rebuild-err");
+            let (wait, next_at, level) = rebuild_backoff_info(dev, port, now);
+            assert_eq!((wait, level), (want_wait, want_level), "阶梯第 {want_level} 级");
+            assert_eq!(next_at, now + want_wait);
+            assert!(rebuild_backoff_active(dev, port, now));
+        }
+        // 封顶后再失败仍是 10min（1992 次热循环的抑制点）
+        now = rebuild_backoff_info(dev, port, now).1;
+        rebuild_backoff_note_failure(dev, port, now, "rebuild-err");
+        assert_eq!(rebuild_backoff_info(dev, port, now).0, 600_000);
+        // 诊断面：退避中的条目必须在快照里可见（API backoffMs/nextRetryAtMs 的数据源）
+        let views = rebuild_backoff_views(now);
+        let row = views
+            .iter()
+            .find(|(d, p, ..)| d == dev && *p == port)
+            .expect("退避条目必须出现在诊断快照里");
+        assert_eq!(row.5, 6, "连续失败次数");
+        assert_eq!(row.2, 600_000, "backoffMs");
+        assert!(row.6.contains("rebuild-err"), "reason 透出：{}", row.6);
+        // 一次成功 → 清零
+        rebuild_backoff_reset(dev, port);
+        assert!(!rebuild_backoff_active(dev, port, now));
+        assert_eq!(rebuild_backoff_info(dev, port, now), (0, 0, 0), "清零后 API 全 0");
+        assert!(rebuild_backoff_views(now).iter().all(|(d, p, ..)| !(d == dev && *p == port)));
+    }
+
+    /// §2 关键不变量：**重建返回 Ok 不算恢复**。
+    ///
+    /// 事故里的 1992 次循环每次重建都 Ok（中继注册成功 ≠ 对端可达）。若这里清零，
+    /// 退避永远停在 1s，修复等于没做——本测试就是这条不变量的闸。
+    #[test]
+    fn rebuild_ok_never_clears_backoff_by_itself() {
+        let (dev, port) = ("did:myco:flap-rebuild-ok", 61205u16);
+        let now = 5_000u64;
+        rebuild_backoff_note_failure(dev, port, now, "rebuild-err");
+        rebuild_backoff_note_failure(dev, port, now, "rebuild-err");
+        assert_eq!(rebuild_backoff_info(dev, port, now).2, 2);
+        rebuild_backoff_note_rebuild_ok(dev, port, now);
+        assert!(
+            rebuild_backoff_active(dev, port, now),
+            "重建 Ok 不得清零退避（否则 1992 次热循环原地复现）"
+        );
+        assert_eq!(rebuild_backoff_info(dev, port, now).2, 2, "退避级数不被重建 Ok 重置");
+        // 稳定存活 ≥30s 才算真恢复（有滞后，但不会被"建了就拆"骗过）
+        assert!(
+            !rebuild_backoff_note_live(dev, port, now + REBUILD_STABLE_RESET_MS - 1),
+            "不足 30s 不算稳定，不清零"
+        );
+        assert!(
+            rebuild_backoff_note_live(dev, port, now + REBUILD_STABLE_RESET_MS),
+            "连续存活 ≥30s → 清零"
+        );
+        assert!(!rebuild_backoff_active(dev, port, now + REBUILD_STABLE_RESET_MS));
+    }
+
+    /// §2 抖动窗口：重建成功后 <10s 又缺失 = 抖动（升级）；≥10s 才缺失 = 真又坏一次（不升级）。
+    #[test]
+    fn missing_within_flap_window_escalates_but_later_missing_does_not() {
+        let (dev, port) = ("did:myco:flap-window", 3389u16);
+        // 从没成功过（last_ok=0）→ 首次缺失不算抖动
+        assert!(!rebuild_backoff_note_missing(dev, port, 1_000));
+        assert_eq!(rebuild_backoff_info(dev, port, 1_000).2, 0);
+        // 刚重建（Ok）→ 5s 后缺失 = 抖动 → 升到第 1 级
+        rebuild_backoff_note_rebuild_ok(dev, port, 1_000);
+        assert!(rebuild_backoff_note_missing(dev, port, 6_000));
+        assert_eq!(rebuild_backoff_info(dev, port, 6_000).2, 1);
+        // 又重建（Ok）→ 10s 后才缺失 = 不是抖动（不升级）
+        rebuild_backoff_note_rebuild_ok(dev, port, 20_000);
+        assert!(!rebuild_backoff_note_missing(dev, port, 20_000 + REBUILD_FLAP_WINDOW_MS));
+        assert_eq!(rebuild_backoff_info(dev, port, 30_000).2, 1, "超窗缺失不升级");
+    }
+
+    /// §2 用户显式开卡是"新证据"：必须清掉后台离线退避，否则用户点卡片会被退避挡住。
+    ///
+    /// **本测试自足**（2026-11-11 复查）：只用自己那把唯一的 DID 键，
+    /// 不调用任何"清空全局表"的钩子——否则并行跑时会抹掉别的退避测试的中间态
+    /// （过滤跑红/全量跑绿那种假阴性的来源之一）。
+    #[test]
+    fn explicit_lease_open_clears_offline_backoff() {
+        let _g = crate::test_env_lock::test_env_lock();
+        test_reset_lease_table();
+        let _ = std::fs::remove_file(leases_path());
+        let k = key("sh-backoff-open");
+        let now = now_ms();
+        rebuild_backoff_reset(&k.device, k.port); // 只清本测试自己的键
+        rebuild_backoff_note_failure(&k.device, k.port, now, "rebuild-err");
+        assert!(rebuild_backoff_active(&k.device, k.port, now), "前置：已在退避");
+        lease_open(&k, 24602).expect("显式开卡");
+        assert!(
+            !rebuild_backoff_active(&k.device, k.port, now),
+            "显式开卡必须清零后台退避（用户请求优先）"
+        );
+        assert_eq!(rebuild_backoff_info(&k.device, k.port, now), (0, 0, 0));
+    }
+
+    /// §4 节流：同一 (device, port, event) 10s 内只打一条，其余并入 `suppressed=N`。
+    #[test]
+    fn keeper_log_throttles_per_event_and_reports_suppressed() {
+        let (dev, port, event) = ("did:myco:throttle-a", 23389u16, "port-drift-adopt");
+        let t0 = 1_000_000u64;
+        let first = keeper_log_line(dev, port, event, "固定口漂移 → 收编现状 :23389", t0)
+            .expect("首条必须打");
+        assert_eq!(first, "固定口漂移 → 收编现状 :23389 suppressed=0");
+        // 10s 内的 3 条被压掉
+        for i in 1..=3u64 {
+            assert!(
+                keeper_log_line(dev, port, event, "固定口漂移 → 收编现状 :23389", t0 + i * 100).is_none(),
+                "窗口内第 {i} 条必须被抑制"
+            );
+        }
+        // 到点放行，且把压掉的 3 条计数带上
+        let second = keeper_log_line(
+            dev,
+            port,
+            event,
+            "固定口漂移 → 收编现状 :23389",
+            t0 + KEEPER_LOG_WINDOW_MS,
+        )
+        .expect("10s 后必须放行");
+        assert_eq!(second, "固定口漂移 → 收编现状 :23389 suppressed=3");
+        // 放行后计数归零
+        let third = keeper_log_line(
+            dev,
+            port,
+            event,
+            "固定口漂移 → 收编现状 :23389",
+            t0 + 2 * KEEPER_LOG_WINDOW_MS,
+        )
+        .expect("再过 10s 仍放行");
+        assert_eq!(third, "固定口漂移 → 收编现状 :23389 suppressed=0");
+    }
+
+    /// §4 节流键 = (device, port, event)：三者任一不同都必须独立计数，不能互相压掉。
+    #[test]
+    fn keeper_log_throttle_key_is_device_port_event() {
+        let t0 = 2_000_000u64;
+        let (d1, d2) = ("did:myco:throttle-b", "did:myco:throttle-c");
+        assert!(keeper_log_line(d1, 13911, "probe-fail", "x", t0).is_some());
+        // 同 key 第二次 → 抑制
+        assert!(keeper_log_line(d1, 13911, "probe-fail", "x", t0 + 1).is_none());
+        // 换 event / 换 port / 换 device → 各自首条放行
+        assert!(keeper_log_line(d1, 13911, "rebuild-ok", "x", t0 + 2).is_some());
+        assert!(keeper_log_line(d1, 13912, "probe-fail", "x", t0 + 3).is_some());
+        assert!(keeper_log_line(d2, 13911, "probe-fail", "x", t0 + 4).is_some());
+        // 纯判定核（可注入 now/窗口，不碰全局表）：第三个返回值 = 本条该报的 suppressed
+        assert_eq!(keeper_log_decision(100, None, 10_000), (true, 0));
+        assert_eq!(keeper_log_decision(100, Some((50, 0)), 10_000), (false, 0), "窗口内不打印");
+        assert_eq!(keeper_log_decision(100, Some((50, 7)), 10_000), (false, 0), "窗口内不累报");
+        assert_eq!(
+            keeper_log_decision(10_050, Some((50, 7)), 10_000),
+            (true, 7),
+            "到点放行且报出被压掉的 7 条"
+        );
+    }
+
+    /// §3 keeper 侧闸门：宽限期内"按约定口收回"每 route 只允许一次（防 close↔重建互踩）。
+    #[test]
+    fn startup_reclaim_runs_at_most_once_per_route() {
+        let (dev, port) = ("did:myco:reclaim-once", 23389u16);
+        assert!(startup_reclaim_once(dev, port), "首次允许收回");
+        assert!(!startup_reclaim_once(dev, port), "同一 route 第二次必须拒绝");
+        assert!(startup_reclaim_once(dev, port + 1), "不同 route 各自独立");
     }
 }

@@ -5,7 +5,31 @@
 
 use crate::vnet::crypto::SessionCrypto;
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+
+/// 解析 relay 地址（2026-11-13 开源 Issue #2 P0：域名形态地址全拒）。
+///
+/// 旧实现 `addr.parse::<SocketAddr>()` 只认 `IP:PORT`；mac 用户配
+/// `myco.youling.cc:28322` → "Invalid relay address" → 消息功能全断。
+///
+/// 解析顺序：
+/// 1. `SocketAddr::parse` 快路径（`1.2.3.4:5678` / `[::1]:5678`，零开销）
+/// 2. 失败则按 `(host, port)` 做 DNS 解析（`myco.youling.cc:28322`）
+///    —— `to_socket_addrs()` 内部处理 `host:port` 字符串形态
+pub fn resolve_relay_addr(addr: &str) -> anyhow::Result<SocketAddr> {
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    // to_socket_addrs 接受 "host:port" 字符串并做 DNS
+    match addr.to_socket_addrs() {
+        Ok(mut iter) => iter
+            .next()
+            .ok_or_else(|| anyhow::anyhow!(
+                "Invalid relay address '{}': DNS resolved no addresses", addr)),
+        Err(e) => anyhow::bail!(
+            "Invalid relay address '{}': {} (expected IP:PORT or host:port)", addr, e),
+    }
+}
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -392,6 +416,17 @@ impl Clone for RelayClient {
     }
 }
 
+/// 静默开关（CLI 的 `probe-relay --json` 用）：只影响提示性 println，不影响协议行为。
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设置静默（true = 不打印注册成功等提示，便于 JSON 输出）
+pub fn set_quiet(v: bool) {
+    QUIET.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn quiet() -> bool {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
 impl RelayClient {
     pub fn new(relay_addr: &str, my_peer_id: u32) -> anyhow::Result<Self> {
         Self::with_crypto(relay_addr, my_peer_id, None, None)
@@ -404,8 +439,7 @@ impl RelayClient {
         crypto: Option<crate::vnet::crypto::SessionCrypto>,
         secret: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let addr: SocketAddr = relay_addr.parse()
-            .map_err(|_| anyhow::anyhow!("Invalid relay address: {}", relay_addr))?;
+        let addr = resolve_relay_addr(relay_addr)?;
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_nonblocking(true)?;
         apply_tunable_buffers(&socket);
@@ -428,6 +462,20 @@ impl RelayClient {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         Some(Duration::from_millis(now.saturating_sub(ms)))
+    }
+
+    /// 到 relay 的**实际本地源地址**（OS 路由选择结果）。
+    ///
+    /// 2026-11-13 换网自愈根因：原换网检测靠 `/proc/net/route` 判接口类型，
+    /// 但 **Android SELinux 屏蔽 /proc/net/** → 恒为 Unknown → 换网完全不可见
+    /// （WiFi→蜂窝后 relay peer 表仍是旧源地址，全黑洞，库无任何死判定）。
+    /// `connect()` 只做路由查找不发包（UDP 无握手），`local_addr()` 直接给出
+    /// 内核此刻会选的源地址——跨平台、免 /proc、免权限，是最可靠的变化信号。
+    /// 返回 None = 当前无路由到 relay（这本身也是"网络断了"的强信号）。
+    pub fn local_src_addr(&self) -> Option<std::net::SocketAddr> {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        probe.connect(self.relay_addr).ok()?;
+        probe.local_addr().ok()
     }
 
     fn mark_relay_rx(&self) {
@@ -556,7 +604,9 @@ impl RelayClient {
                 Ok((len, _)) => {
                     if let Some((PacketType::RegisterAck, _, _)) = parse_packet(&buf[..len]) {
                         self.socket.set_nonblocking(true).ok();
-                        println!("Registered to relay {} as peer {}", self.relay_addr, self.my_peer_id);
+                        if !quiet() {
+            println!("Registered to relay {} as peer {}", self.relay_addr, self.my_peer_id);
+        }
                         return Ok(());
                     }
                 }
@@ -952,6 +1002,7 @@ pub fn clear_peer_candidates_override() {
     override_map().lock().unwrap().clear();
 }
 
+/// 静默开关（CLI 的 `probe-relay --json` 用）：只影响提示性 println，不影响协议行为。
 impl RelayClient {
     /// 记录本机额外候选（LAN 地址等）。C 中继协议只存一个 v4/v6 槽，
     /// 追加候选由 myco 层经 take_announced_extras 读取后发布进 presence。
@@ -1063,5 +1114,32 @@ mod tests {
         let restored = crate::vnet::netstatus::NetStatus::parse_announce_extra(&extra, 0);
         assert!(restored.is_some(), "roundtrip 后的画像应可解析");
         assert_eq!(restored.unwrap().version, 3);
+    }
+
+    /// 开源 Issue #2（2026-11-13 P0）：域名形态 relay 地址必须可解析
+    #[test]
+    fn test_resolve_relay_addr_ip_forms() {
+        // IPv4 快路径
+        assert!(resolve_relay_addr("127.0.0.1:28322").is_ok());
+        assert!(resolve_relay_addr("8.8.8.8:53").is_ok());
+        // IPv6 字面量
+        assert!(resolve_relay_addr("[::1]:28322").is_ok());
+        assert!(resolve_relay_addr("[3fff:390::1]:28322").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_relay_addr_domain() {
+        // 域名形态：localhost 无需外网 DNS
+        let result = resolve_relay_addr("localhost:28322");
+        assert!(result.is_ok(), "localhost must resolve: {:?}", result.err());
+        let sa = result.unwrap();
+        assert_eq!(sa.port(), 28322);
+    }
+
+    #[test]
+    fn test_resolve_relay_addr_invalid() {
+        assert!(resolve_relay_addr("not an address at all").is_err());
+        assert!(resolve_relay_addr("").is_err());
+        assert!(resolve_relay_addr("1.2.3.4").is_err()); // 缺端口
     }
 }

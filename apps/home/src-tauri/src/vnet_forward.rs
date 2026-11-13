@@ -65,6 +65,65 @@ fn multi_server_peer_id_for(device_did: &str) -> u32 {
     hash32(&format!("vnet-peer{device_did}:server:multi-forward-v1"))
 }
 
+// ── 客户端拨号口径：multi 还是 per-port（2026-11-12 手机 5555 真案）──────────────
+//
+// 事故：PC 对手机 `POST /api/vnet/forward {port:5555}` 返回 ok，日志
+// `[vnet-mf] …:5555 → :15556（sharedConnection=true）`，但 adb connect 15556 恒 offline；
+// 同时 `[A_lookup_peer] peer=2270166732 no_answer`，而 2270166732 =
+// `hash32("vnet-peer{did}:server:multi-forward-v1")` —— PC 拨了**手机从未注册**的 multi peer。
+//
+// 根因三层（缺一不会发生）：
+// ① `start_vnet_forward_selected` 只看**进程级** `MYCO_VNET_MULTI_FORWARD`，
+//    `target_port` 仅进 ForwardSpec，**不参与 peer 选择**；
+// ② 本该兜底的 `mf_caps_check(remote_net_status)` 在 `version==0`（还没收到对端 NetStatus
+//    公告）时直接放行（legacy compat），而手机 JNI 是单口 server、**从不公告** ⇒ 检查恒跳过；
+// ③ peer id 必须在建 Connection 之前决定 ⇒ "先连上再问 caps"这条路走不通，只能靠设备类判。
+//
+// 修法（最小、确定性、零额外延迟）：**multi 只给能跑 multi 的设备类**。
+// 手机/平板（JNI 单口 server；契约 ADB-SHARE-TASK.md「PC 按 `:server:<port>` 找手机」）
+// 恒走 per-port；其余维持现行为（未知/拿不到 kind 也维持 multi，不扩大改动面）。
+
+/// 设备 kind 是否属于"只有单口 vnet server"的移动端（JNI，无 multi FFI）。
+pub(crate) fn is_mobile_only_kind(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "phone" | "tablet" | "android" | "ios"
+    )
+}
+
+/// **端口语义兜底**：契约上只有手机能当这些端口的单口 server。
+///
+/// 为什么必须有（2026-11-12 复核）：`cached_device_kind` 是 presence 缓存，**冷缓存**
+/// （进程刚起、presence 还没拉到）返回 `None` ⇒ kind 未知 ⇒ 退回 multi ⇒ 手机上 5555
+/// 的黑洞原样复现。出包重启后立刻验收必然撞上这个窗口。5555 是当前唯一"对端必是单口
+/// server"的口（ADB，见 ADB-SHARE-TASK.md），按端口语义兜底不会误伤 PC↔PC。
+const SINGLE_PORT_ONLY_TARGET_PORTS: &[u16] = &[5555];
+
+/// 该 target 端口是否"对端一定是单口 server"（与 kind 无关的硬语义）。
+pub(crate) fn is_single_port_only_target(port: u16) -> bool {
+    SINGLE_PORT_ONLY_TARGET_PORTS.contains(&port)
+}
+
+/// peer 选择口径（纯函数，单测直击）：`true` = 拨 multi，`false` = 拨 per-port。
+///
+/// 三条同时成立才走 multi：① 全局开关开；② 设备类不是移动端单口；③ 端口语义不是单口。
+pub(crate) fn forward_use_multi(multi_enabled: bool, mobile_only: bool, target_port: u16) -> bool {
+    multi_enabled && !mobile_only && !is_single_port_only_target(target_port)
+}
+
+/// 按口径算该拨的 peer id（纯函数，单测直击）。
+///
+/// 这是唯一一处把「设备类 × 全局开关 × 端口语义」翻译成 peer id 的地方——回归测试对它
+/// 锁死公式，避免再次出现"5555 也走 multi"的走样。
+pub(crate) fn forward_peer_id_for(device: &str, port: u16, multi_enabled: bool, kind: Option<&str>) -> u32 {
+    let mobile_only = kind.map(is_mobile_only_kind).unwrap_or(false);
+    if forward_use_multi(multi_enabled, mobile_only, port) {
+        multi_server_peer_id_for(device)
+    } else {
+        server_peer_id_for(device, port)
+    }
+}
+
 #[derive(Clone)]
 struct SharedVnetConnection {
     conn: Arc<crate::vnet::Connection>,
@@ -237,7 +296,7 @@ fn client_peer_id_for(
         Some((port, seq)) if *port == local_port => *seq,
         // 明确换口：seq+1（新口必须配新 id，防止 relay 旧映射串流）。
         Some((port, seq)) => {
-            eprintln!(
+            crate::p2p_tunnel::elog!(
                 "[vnet-forward] client peer seq 换口递增：{target_did}:{target_port} 口 {port}→{local_port}"
             );
             *port = local_port;
@@ -309,7 +368,7 @@ impl VnetForwardHandle {
         let open_lock = multi_forward_lock(&self.target_did);
         let _open = open_lock.lock().unwrap();
         if let Err(e) = c.remove_forward(self.local_port) {
-            eprintln!("[vnet-mf] remove_forward :{} 失败：{e:#}", self.local_port);
+            crate::p2p_tunnel::elog!("[vnet-mf] remove_forward :{} 失败：{e:#}", self.local_port);
         }
         if c.forwards().is_empty() {
             c.stop();
@@ -475,6 +534,72 @@ fn rebind_allowed(
         && matches!(error, StartForwardError::AddrInUse(_))
 }
 
+// ── 启动固定口宽限（2026-11-11 RDP 三连断事故 §3）──────────────────────────────
+//
+// 事故：笔记本在 20:54/20:58 两次重启后，keeper 每拍判「固定口漂移」并把实际口
+// **收编现状**写回 kept（实测 301 次），用户约定的固定口（如 :23389）根本没被
+// 恢复；`%APPDATA%\youling\vnet-forwards.json` 的 mtime 长时间不动 = 收编多数
+// 没有落盘生效。
+//
+// 根因不在"收编"分支本身，而在它上游：进程刚起来时约定口可能还绑不上
+// （旧实例 listener 残留 / socket 释放竞态），`route_open` 遇到一次 EADDRINUSE
+// 就线性换到下一个稳定口 → keeper 下一拍看到"活路由口 ≠ 约定口" → 收编。
+//
+// 修法两道闸（缺一不可）：
+// 1. 本文件：**启动宽限期内**固定口 bind 失败时，先在约定口上退避重试，超时才换口；
+// 2. `vnet_lease` keeper：宽限期内看到"活路由口 ≠ 约定口"**不写 kept 记录**，
+//    而是 close + 按约定口重建一次（每 route 整段宽限期只试一次）。
+//
+// 数值依据（不是"看起来合理"）：
+// · ≥3s：用户定调的「从 myco 启动到刷新重连好 ≤3s」是既有契约（见
+//   `p2p_tunnel::restore_remembered_tunnels` 文档注释原文），宽限期必须覆盖它；
+// · <5s：keeper 探活周期 `vnet_lease::UPSTREAM_PROBE_INTERVAL_MS = 5s`——宽限期
+//   一旦超过一个探活周期，首轮健康判定会被整体推后、观察窗口变形；
+// · 取自表 500+750+1000+1250 = 3500ms，落在 [3s,5s]；首跳 500ms 的依据是
+//   `Connection::stop()` 的既有契约"accept 循环约 20ms 内退出并释放端口"
+//   （见本文件 route_open_inner 里 stopped_port_pending 的 20ms 注释），
+//   500ms 足够覆盖两轮完整释放；后三跳收紧到 1.25s，总预算不越过探活周期。
+pub(crate) const STARTUP_FIXED_PORT_RETRY_DELAYS_MS: [u64; 4] = [500, 750, 1_000, 1_250];
+
+/// 启动宽限期总长 = 重试表之和（3500ms）。
+pub(crate) fn startup_grace_ms() -> u64 {
+    STARTUP_FIXED_PORT_RETRY_DELAYS_MS.iter().sum()
+}
+
+/// 进程启动时刻的兜底（`startup_trace` 未 init 时用：测试/CLI 变体）。
+static PROCESS_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// 进程 uptime（ms）。优先用 `startup_trace` 的 t=0（`main()` 第一行 init 的真
+/// 进程起点），否则退化为本模块首次调用时刻——两条都比"当前时刻"更接近真相。
+pub(crate) fn process_uptime_ms() -> u64 {
+    let traced = crate::startup_trace::elapsed_ms();
+    if traced > 0 {
+        return u64::try_from(traced).unwrap_or(u64::MAX);
+    }
+    PROCESS_STARTED
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// 是否处于启动宽限期（固定口 bind 失败时先重试、不换口）。
+pub(crate) fn startup_grace_active(uptime_ms: u64) -> bool {
+    uptime_ms < startup_grace_ms()
+}
+
+/// 第 `attempt`（0 起）次"约定口重试"前该等多久；`None` = 宽限期已过或次数用尽 → 换口。
+pub(crate) fn startup_fixed_port_retry_delay(uptime_ms: u64, attempt: usize) -> Option<u64> {
+    if !startup_grace_active(uptime_ms) {
+        return None;
+    }
+    STARTUP_FIXED_PORT_RETRY_DELAYS_MS.get(attempt).copied()
+}
+
+/// keeper 用：宽限期内是否该"按约定口收回"（true）而不是"收编现状"（false）。
+pub(crate) fn startup_reclaim_allowed(uptime_ms: u64, already_tried: bool) -> bool {
+    !already_tried && startup_grace_active(uptime_ms)
+}
+
 // 选口 + 写回首选口必须在同一临界区，避免两个新 route 同时派生到同口。
 static LOCAL_PORT_ALLOC: Mutex<()> = Mutex::new(());
 
@@ -563,7 +688,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn vnet_backoff_active(device: &str, target_port: u16) -> bool {
+/// vnet 负缓存是否生效（`(device,port)` 或设备级）。
+///
+/// `pub(crate)`：keeper 的离线退避要能分辨"这次重建失败是**新证据**（对端不可达 → 升级退避）
+/// 还是只是我们自己的 60s 负缓存还没到点（不该升级，否则一次 60s 负缓存会被放大成 10min 静默）"。
+pub(crate) fn vnet_backoff_active(device: &str, target_port: u16) -> bool {
     let now = now_ms();
     let m = VNET_FAIL_UNTIL.lock().unwrap();
     // 设备级优先（没跑 vnet server 的设备整设备停 10 分钟）
@@ -591,7 +720,7 @@ fn vnet_device_blackhole(device: &str, port: u16) -> bool {
             .unwrap()
             .insert(vnet_key(device, 0), now + VNET_DEVICE_BACKOFF_MS);
         let ports: Vec<String> = e.0.iter().map(|p| p.to_string()).collect();
-        eprintln!(
+        crate::p2p_tunnel::elog!(
             "[vnet-route] {device} 已有 {} 个不同端口数据黑洞（{ports:?}，对端多半没跑 vnet server）→ 整设备 {}s 内不再建新 vnet 隧道",
             e.0.len(), VNET_DEVICE_BACKOFF_MS / 1000
         );
@@ -632,9 +761,24 @@ fn start_vnet_forward_selected(entry: VnetForwardEntry) -> Result<u16, StartForw
     if let Err(e) = ensure_peer_identity() {
         return Err(StartForwardError::Other(e));
     }
-    if multi_forward_enabled() {
+    // 2026-11-12 手机 5555 真案：multi 只给能跑 multi 的设备类；手机/平板（JNI 单口 server）
+    // 恒走 per-port（`:server:<port>`）。kind 取同步缓存（presence 刷新时落表），
+    // **冷缓存/未知时还有端口语义兜底**（5555 恒 per-port），否则重启后第一次验收又撞黑洞。
+    let kind = crate::p2p_client::cached_device_kind(&entry.target_device_did);
+    let mobile_only = kind.as_deref().map(is_mobile_only_kind).unwrap_or(false);
+    let port_only = is_single_port_only_target(entry.target_port);
+    if forward_use_multi(multi_forward_enabled(), mobile_only, entry.target_port) {
         start_vnet_forward_multi(entry)
     } else {
+        if mobile_only || port_only {
+            crate::p2p_tunnel::elog!(
+                "[vnet-mf] multi 不适用（kind={} single-port-port={}）→ 改用 per-port peer :server:{}：…{}",
+                kind.as_deref().unwrap_or("<unknown>"),
+                port_only,
+                entry.target_port,
+                &entry.target_device_did[entry.target_device_did.len().saturating_sub(12)..]
+            );
+        }
         start_vnet_forward_inner(entry)
     }
 }
@@ -702,7 +846,7 @@ fn start_vnet_forward_inner(entry: VnetForwardEntry) -> Result<u16, StartForward
             preferred_p2p_port(),
         )
         .map_err(|e| {
-            eprintln!("[vnet-forward] Connection 注册失败（{relay}, peer={client_peer_id:#010x}）: {e}");
+            crate::p2p_tunnel::elog!("[vnet-forward] Connection 注册失败（{relay}, peer={client_peer_id:#010x}）: {e}");
             StartForwardError::Other(format!("vnet Connection 注册失败：{e}"))
         })?,
     );
@@ -743,7 +887,7 @@ fn start_vnet_forward_inner(entry: VnetForwardEntry) -> Result<u16, StartForward
         .spawn(move || {
             let _alive = AcceptAliveGuard(accept_alive_thread);
             if let Err(e) = accept_conn.start_client(local_port) {
-                eprintln!("[vnet-forward] start_client({local_port}) 退出：{e}");
+                crate::p2p_tunnel::elog!("[vnet-forward] start_client({local_port}) 退出：{e}");
             }
         })
     {
@@ -753,7 +897,7 @@ fn start_vnet_forward_inner(entry: VnetForwardEntry) -> Result<u16, StartForward
         )));
     }
 
-    eprintln!(
+    crate::p2p_tunnel::elog!(
         "[vnet-forward] 本地 :{local_port} → 对端 …{did_tail}/{server_peer_id:#010x}:{target_port} 已启动（relay={relay}, client={client_peer_id:#010x}）"
     );
 
@@ -777,7 +921,7 @@ fn start_vnet_forward_inner(entry: VnetForwardEntry) -> Result<u16, StartForward
         while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        eprintln!("[vnet-forward] :{local_port} 已停止");
+        crate::p2p_tunnel::elog!("[vnet-forward] :{local_port} 已停止");
     });
 
     Ok(local_port)
@@ -838,7 +982,9 @@ fn start_vnet_forward_multi(entry: VnetForwardEntry) -> Result<u16, StartForward
                 })?,
             );
             conn.enable_multi_forward();
-            conn.start_multi_forward().map_err(|e| {
+            // 2026-11-12 vendored 同步改名：start_multi_forward → start_client_multi
+            // （apps/vnet 356a63db 的命名，语义一致：只起后台线程不建 legacy listener）。
+            conn.start_client_multi().map_err(|e| {
                 conn.stop();
                 StartForwardError::Other(format!("vnet multi-forward 后台启动失败：{e}"))
             })?;
@@ -899,9 +1045,9 @@ fn start_vnet_forward_multi(entry: VnetForwardEntry) -> Result<u16, StartForward
         while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
-        eprintln!("[vnet-mf] :{local_port} 已移除");
+        crate::p2p_tunnel::elog!("[vnet-mf] :{local_port} 已移除");
     });
-    eprintln!(
+    crate::p2p_tunnel::elog!(
         "[vnet-mf] {device}:{target_port} → :{local_port}（sharedConnection=true, forwards={}）",
         shared.conn.forwards().len()
     );
@@ -1068,7 +1214,7 @@ async fn route_open_inner(
         None
     };
     if allow_pins && preferred_local == Some(0) {
-        eprintln!(
+        crate::p2p_tunnel::elog!(
             "[vnet-route] event=invalid-local-port {device}:{target_port} requested=0 action=stable-derive"
         );
     }
@@ -1093,7 +1239,7 @@ async fn route_open_inner(
     if let Some(lp) = route_live_local_port(device, target_port) {
         if let Some(p) = existing_local {
             if p != lp {
-                eprintln!(
+                crate::p2p_tunnel::elog!(
                     "[vnet-route] {device}:{target_port} 已有活隧道 :{lp}，复用（忽略请求口 {p}）"
                 );
             }
@@ -1102,7 +1248,7 @@ async fn route_open_inner(
     }
     // 死条目先 stop 再重建；registered_local 已在上一步保存，所以 stop 不会把口忘掉。
     if registered_local.is_some() {
-        eprintln!("[vnet-route] {device}:{target_port} 旧 vnet 条目已死 → stop 后同口重建");
+        crate::p2p_tunnel::elog!("[vnet-route] {device}:{target_port} 旧 vnet 条目已死 → stop 后同口重建");
         stop_vnet_forward(device, target_port);
     }
 
@@ -1171,6 +1317,17 @@ async fn route_open_inner(
     // 只有继承/派生的隐式口在同步 bind 明确 AddrInUse 后才线性换口。
     let mut rebind_count = 0u16;
     let mut stopped_port_pending = registered_local;
+    // 是不是"隐式约定的固定口"（kept/lease/上次登记口）：只有它值得在启动宽限期内
+    // 死等。两个明确排除：
+    // · 派生口（无 pin）不是契约，绑不上就换；
+    // · **显式指定**口（env_open / keep 的 localPort 参数）保持既有契约「占用即 Err」，
+    //   用户当场要结果，不能替他把请求挂 3.5s（那条路径没有"漂移收编"问题）。
+    let pin_local = if allow_pins && explicit_local.is_none() {
+        existing_local
+    } else {
+        None
+    };
+    let mut startup_retries = 0usize;
     let res = loop {
         let entry = VnetForwardEntry {
             local_port,
@@ -1186,19 +1343,38 @@ async fn route_open_inner(
                     "vnet 建链任务异常：{e}"
                 )))
             });
-        match attempt {
-            Err(e)
-                if matches!(&e, StartForwardError::AddrInUse(_))
-                    && stopped_port_pending == Some(local_port) =>
-            {
-                // vnet Connection::stop 的既有契约是 accept 循环约 20ms 内退出。
-                // 给旧 listener 一次释放窗口；否则会把自身停止中的端口误判成外部占用。
-                stopped_port_pending = None;
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // ① 自身 stop 的释放窗口（既有契约：accept 循环约 20ms 内退出）。
+        // 先吃掉这一种，别把它算成"外部占用"消耗宽限次数。
+        if matches!(&attempt, Err(StartForwardError::AddrInUse(_)))
+            && stopped_port_pending == Some(local_port)
+        {
+            stopped_port_pending = None;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            continue;
+        }
+        // ② 启动宽限（2026-11-11 §3）：进程刚起来时约定口可能还绑不上（旧实例残留 /
+        //    释放竞态）。此时**先在约定口上退避重试**，别一次 EADDRINUSE 就换口——
+        //    换了口 keeper 下一拍就会把"漂移"收编进 kept（笔记本实测 301 次）。
+        //    预算 3500ms（见 STARTUP_FIXED_PORT_RETRY_DELAYS_MS 的数值依据），用尽
+        //    或宽限期已过才继续走下面的换口/失败路径。
+        if let Err(StartForwardError::AddrInUse(message)) = &attempt {
+            if pin_local.is_some() {
+                if let Some(delay) = startup_fixed_port_retry_delay(process_uptime_ms(), startup_retries)
+                {
+                    startup_retries += 1;
+                    crate::p2p_tunnel::elog!(
+                        "[vnet-route] event=startup-port-grace route={device}:{target_port} 约定口 :{local_port} 仍被占（{message}）→ {delay}ms 后重试（宽限期第 {startup_retries}/{} 次，总预算 {}ms）",
+                        STARTUP_FIXED_PORT_RETRY_DELAYS_MS.len(),
+                        startup_grace_ms()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
             }
-            Err(e)
-                if rebind_count < STABLE_LOCAL_PORT_SPAN
-                    && rebind_allowed(allow_pins, explicit_local, &e) =>
+        }
+        match attempt {
+            Err(e) if rebind_count < STABLE_LOCAL_PORT_SPAN
+                && rebind_allowed(allow_pins, explicit_local, &e) =>
             {
                 let next = {
                     let _allocation = LOCAL_PORT_ALLOC.lock().unwrap();
@@ -1222,7 +1398,7 @@ async fn route_open_inner(
                         )));
                     }
                 };
-                eprintln!(
+                crate::p2p_tunnel::elog!(
                     "[vnet-route] event=local-port-rebind reason=EADDRINUSE route={device}:{target_port} old={local_port} new={next} failedConnectionStopped=true"
                 );
                 crate::vnet_lease::lease_rebind_after_addr_in_use(
@@ -1250,7 +1426,7 @@ async fn route_open_inner(
                 .lock()
                 .unwrap()
                 .insert(key, now_ms() + VNET_FAIL_BACKOFF_MS);
-            eprintln!(
+            crate::p2p_tunnel::elog!(
                 "[vnet-route] vnet 失败（{e}）：{device}:{target_port}（{VNET_FAIL_BACKOFF_MS}ms 后重试，不回落 legacy）"
             );
             Err(e)
@@ -1263,7 +1439,7 @@ pub fn route_close(device: &str, target_port: u16) {
     let had_vnet = stop_vnet_forward(device, target_port);
     let _ = crate::p2p_tunnel::tunnel_close(device, target_port);
     if had_vnet {
-        eprintln!("[vnet-route] close {device}:{target_port}");
+        crate::p2p_tunnel::elog!("[vnet-route] close {device}:{target_port}");
     }
 }
 
@@ -1293,7 +1469,7 @@ pub fn route_live_local_port(device: &str, target_port: u16) -> Option<u16> {
         if alive {
             return Some(lp);
         }
-        eprintln!(
+        crate::p2p_tunnel::elog!(
             "[vnet-route] {device}:{target_port} 本地口 :{lp} 已死（acceptAlive=false，视同隧道缺失）"
         );
     }
@@ -1317,7 +1493,7 @@ pub fn route_in_use(device: &str, target_port: u16, idle_ms: u64) -> bool {
 /// tunnel_acquire 调用：建隧道，返回本地口（不要求固定本地口）。
 pub async fn vnet_tunnel_open(device: &str, target_port: u16) -> Result<u16, String> {
     let lp = route_open(device, target_port, None).await?;
-    eprintln!("[vnet-forward] tunnel_open {device}:{target_port} → 本地 :{lp}");
+    crate::p2p_tunnel::elog!("[vnet-forward] tunnel_open {device}:{target_port} → 本地 :{lp}");
     Ok(lp)
 }
 
@@ -1376,24 +1552,66 @@ pub fn start_vnet_server(target_port: u16) -> Result<(), String> {
                 secret_str,
                 preferred_p2p_port(),
             ) {
-                Ok(_running) => eprintln!("[vnet-server] :{target_port} 正常退出"),
-                Err(e) => eprintln!("[vnet-server] :{target_port} 异常退出：{e}"),
+                Ok(_running) => crate::p2p_tunnel::elog!("[vnet-server] :{target_port} 正常退出"),
+                Err(e) => crate::p2p_tunnel::elog!("[vnet-server] :{target_port} 异常退出：{e}"),
             }
         })
         .map_err(|e| format!("vnet server 线程启动失败：{e}"))?;
 
     VNET_SERVERS.lock().unwrap().insert(target_port, handle);
-    eprintln!(
+    crate::p2p_tunnel::elog!(
         "[vnet-server] :{target_port} 已启动（peer_id={peer_id:#010x}, relay={relay_display}, multiForward={multi}；multi 的其它 target 由 VNET_TARGET_PORTS 白名单显式授权）"
     );
+    // 2026-11-12 真案（手机→PC 3389 黑洞）沉淀：把 server 侧**实际生效的 target 白名单**
+    // 一行打进 stderr（带时间戳）。事故当天排查走了弯路——判定逻辑
+    // （`vnet/connection.rs::mf_target_allowed` = `--target-port` ∪ `VNET_TARGET_PORTS`，
+    // 启动时 OnceLock 读一次）与**每次拨号明细**（`[srv] STREAM_OPEN … -> 127.0.0.1:<target> OK/FAIL`）
+    // 都只走 `tracelog!`→`println!`（**stdout**：`%TEMP%\myco-stdout.log`），grep stderr 一片空，
+    // 于是被误读成"server 从未拨号"。这一行 + 下面这句指路，把这个案子压到一次 grep。
+    crate::p2p_tunnel::elog!(
+        "[vnet-server] target 白名单（multi-forward）：{}；拨号明细在 stdout 的 `[srv] STREAM_OPEN … -> 127.0.0.1:<target> OK/FAIL` 与 `MF_TARGET_DENIED`（Windows: %TEMP%\\myco-stdout.log）",
+        multi_forward_targets_summary(target_port, std::env::var("VNET_TARGET_PORTS").ok().as_deref())
+    );
     Ok(())
+}
+
+/// multi-forward **实际生效**的 target 白名单摘要（纯函数，单测直击）。
+///
+/// 口径与 `vnet/connection.rs::mf_target_allowed` 一致：
+/// `default_port`（本 server 的 `--target-port`）∪ `VNET_TARGET_PORTS`（逗号分隔，启动时读一次）。
+/// 唯一有意的差异：**0 被剔除**——它不是合法 target（拨 `127.0.0.1:0` 必失败），
+/// 摘要里列进 `allowed` 只会误导读日志的人（vnet 侧解析不过滤 0，但永远拨不通）。
+/// 目的：一行回答"3389 到底允不允许"，不必再去翻环境变量/加打印。
+pub(crate) fn multi_forward_targets_summary(default_target: u16, env_raw: Option<&str>) -> String {
+    let mut extra: Vec<u16> = env_raw
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse::<u16>().ok())
+                .filter(|p| *p != 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    extra.sort_unstable();
+    extra.dedup();
+    let env_disp = match env_raw.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => "<unset>".to_string(),
+    };
+    let mut allowed = extra.clone();
+    if default_target != 0 && !allowed.contains(&default_target) {
+        allowed.push(default_target);
+        allowed.sort_unstable();
+    }
+    format!(
+        "default={default_target} VNET_TARGET_PORTS={env_disp} extra={extra:?} allowed={allowed:?}"
+    )
 }
 
 /// 停止全部 vnet 服务端
 pub fn stop_vnet_servers() {
     let mut m = VNET_SERVERS.lock().unwrap();
     m.clear();
-    eprintln!("[vnet-server] 全部停止（进程退出时生效）");
+    crate::p2p_tunnel::elog!("[vnet-server] 全部停止（进程退出时生效）");
 }
 
 /// 列出运行中的 vnet 服务端口
@@ -1427,7 +1645,7 @@ pub fn start_vnet_servers_for_allowed() -> Vec<u16> {
         return match start_vnet_server(default_target) {
             Ok(()) => vec![default_target],
             Err(e) => {
-                eprintln!("[vnet-server] multi-forward default :{default_target} 启动失败：{e}");
+                crate::p2p_tunnel::elog!("[vnet-server] multi-forward default :{default_target} 启动失败：{e}");
                 Vec::new()
             }
         };
@@ -1436,10 +1654,10 @@ pub fn start_vnet_servers_for_allowed() -> Vec<u16> {
     for p in ports {
         match start_vnet_server(p) {
             Ok(()) => started.push(p),
-            Err(e) => eprintln!("[vnet-server] :{p} 启动失败：{e}"),
+            Err(e) => crate::p2p_tunnel::elog!("[vnet-server] :{p} 启动失败：{e}"),
         }
     }
-    eprintln!(
+    crate::p2p_tunnel::elog!(
         "[vnet-server] 按白名单全量启动：{:?}（共 {}）",
         started,
         started.len()
@@ -2068,6 +2286,215 @@ mod blackhole_tests {
         assert!(vnet_backoff_active(&dev, 9100), "设备级生效后任意新端口被拒");
         VNET_DEVICE_BLACKHOLES.lock().unwrap().remove(&dev);
         VNET_FAIL_UNTIL.lock().unwrap().remove(&vnet_key(&dev, 0));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 启动固定口宽限（2026-11-11 RDP 三连断事故 §3）—— 纯函数契约测试
+//
+// 事故：笔记本重启后 301 次「固定口漂移 → 收编现状」。上游第一因是约定口
+// 刚起来绑不上（旧实例残留 / 释放竞态）→ 一次 EADDRINUSE 就换口 → keeper 下
+// 一拍把"漂移"当事实收编。这里钉住两道闸的数值与边界。
+// ═══════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod startup_grace_tests {
+    use super::*;
+
+    /// 宽限期必须落在 [3s, 5s]：下界 = "从 myco 启动到刷新重连好 ≤3s" 的既有契约，
+    /// 上界 = keeper 探活周期（5s）。两个数任何一个变了，先改契约再来改这里。
+    #[test]
+    fn startup_grace_window_stays_between_three_and_five_seconds() {
+        let total = startup_grace_ms();
+        assert_eq!(total, 3_500, "宽限期 = 重试表之和 500+750+1000+1250");
+        assert!(
+            (3_000..=5_000).contains(&total),
+            "宽限期必须 ≥3s（重启重连契约）且 ≤5s（探活周期）：{total}"
+        );
+        assert_eq!(STARTUP_FIXED_PORT_RETRY_DELAYS_MS.iter().sum::<u64>(), total);
+        // 每一跳单调不减：不许"先等 2s 再等 100ms"这种抖动
+        let mut prev = 0u64;
+        for d in STARTUP_FIXED_PORT_RETRY_DELAYS_MS {
+            assert!(d >= prev, "重试间隔必须单调不减：{STARTUP_FIXED_PORT_RETRY_DELAYS_MS:?}");
+            prev = d;
+        }
+        assert!(startup_grace_active(0), "进程刚起来就在宽限期内");
+        assert!(startup_grace_active(total - 1), "宽限期最后一毫秒仍有效");
+        assert!(!startup_grace_active(total), "宽限期到点即失效");
+        assert!(!startup_grace_active(60_000));
+    }
+
+    /// 宽限期内：约定口连续 4 次 EADDRINUSE 都"再等等"（绝不换口）；
+    /// 第 5 次才允许换口。宽限期外一次都不等（恢复旧行为）。
+    #[test]
+    fn fixed_port_retries_only_inside_grace_and_only_four_times() {
+        for attempt in 0..STARTUP_FIXED_PORT_RETRY_DELAYS_MS.len() {
+            assert_eq!(
+                startup_fixed_port_retry_delay(0, attempt),
+                Some(STARTUP_FIXED_PORT_RETRY_DELAYS_MS[attempt]),
+                "宽限期内第 {attempt} 跳必须重试约定口（不换口）"
+            );
+        }
+        assert_eq!(
+            startup_fixed_port_retry_delay(0, STARTUP_FIXED_PORT_RETRY_DELAYS_MS.len()),
+            None,
+            "宽限期内重试次数用尽 → 允许换口"
+        );
+        assert_eq!(startup_fixed_port_retry_delay(0, 99), None);
+        // 宽限期外（例如用户 30s 后自己开卡）：不等待，直接换口/如实报错
+        for attempt in 0..STARTUP_FIXED_PORT_RETRY_DELAYS_MS.len() {
+            assert_eq!(
+                startup_fixed_port_retry_delay(30_000, attempt),
+                None,
+                "宽限期外不得为固定口拖时间"
+            );
+        }
+    }
+
+    /// keeper 侧闸门：宽限期内 + 该 route 还没试过 → 按约定口收回；
+    /// 否则（宽限期外 / 已试过）→ 回到收编现状。
+    #[test]
+    fn reclaim_gate_is_grace_bounded_and_try_once() {
+        assert!(startup_reclaim_allowed(0, false));
+        assert!(startup_reclaim_allowed(startup_grace_ms() - 1, false));
+        assert!(
+            !startup_reclaim_allowed(0, true),
+            "同一 route 整段宽限期只收一次（防 close↔重建互踩）"
+        );
+        assert!(
+            !startup_reclaim_allowed(startup_grace_ms(), false),
+            "宽限期外不再收回，回到收编现状"
+        );
+        assert!(!startup_reclaim_allowed(60_000, false));
+    }
+
+    /// uptime 必须单调不减（来源是 `startup_trace` 的 t=0，不受系统时钟调整影响）。
+    #[test]
+    fn process_uptime_is_monotonic() {
+        let a = process_uptime_ms();
+        let b = process_uptime_ms();
+        assert!(b >= a, "uptime 必须单调：{a} → {b}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2026-11-12 手机 5555 真案：客户端拨号口径（multi vs per-port）
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 现场 DID（手机）与两个公式值必须对得上——回归锁死「拨错 peer id」这个走样点。
+    #[test]
+    fn phone_5555_dials_per_port_peer_not_multi() {
+        let phone = "did:myco:z6MknpnC";
+        // 公式自检：multi 与 per-port 是两个不同 peer id（混用即黑洞）
+        assert_ne!(server_peer_id_for(phone, 5555), multi_server_peer_id_for(phone));
+        // 手机（单口 server）→ 必须 per-port
+        for kind in ["phone", "tablet", "android", "ios", " Phone "] {
+            assert_eq!(
+                forward_peer_id_for(phone, 5555, true, Some(kind)),
+                server_peer_id_for(phone, 5555),
+                "kind={kind} 必须拨 :server:5555"
+            );
+        }
+        // **冷缓存兜底**（2026-11-12 复核）：kind 未知 + 5555 → 仍必须 per-port，
+        // 否则进程刚起、presence 还没拉到时第一次验收又撞黑洞。
+        assert_eq!(
+            forward_peer_id_for(phone, 5555, true, None),
+            server_peer_id_for(phone, 5555),
+            "kind 未知 + 5555（单口语义）必须 per-port"
+        );
+        // 非移动端 / 未知 kind 且非单口端口 → 维持现行为（multi）
+        assert_eq!(
+            forward_peer_id_for(phone, 13911, true, Some("pc")),
+            multi_server_peer_id_for(phone),
+            "pc 维持 multi（不改变 PC↔PC 现状）"
+        );
+        assert_eq!(
+            forward_peer_id_for(phone, 13911, true, None),
+            multi_server_peer_id_for(phone),
+            "拿不到 kind + 非单口端口 = 未知 → 维持现行为"
+        );
+        // multi 总开关关掉时，任何设备都 per-port
+        for kind in [Some("pc"), Some("phone"), None] {
+            assert_eq!(
+                forward_peer_id_for(phone, 13911, false, kind),
+                server_peer_id_for(phone, 13911),
+                "MYCO_VNET_MULTI_FORWARD 未开 → per-port（kind={kind:?}）"
+            );
+        }
+    }
+
+    /// 非 5555 的目标（PC 侧 15200/13911/9100 等）行为不变：kind=pc/未知 仍走 multi。
+    #[test]
+    fn pc_targets_keep_multi_peer_selection() {
+        let pc = "did:myco:z6MkuyFr";
+        for port in [15200u16, 13911, 9100, 3389] {
+            assert_eq!(
+                forward_peer_id_for(pc, port, true, Some("pc")),
+                multi_server_peer_id_for(pc),
+                "PC 目标 :{port} 维持 multi"
+            );
+            // kind 未知也维持 multi（老客户端不报 kind），但这些端口不是"单口语义"
+            assert_eq!(forward_peer_id_for(pc, port, true, None), multi_server_peer_id_for(pc));
+        }
+    }
+
+    /// kind 分类边界 + 端口语义 + 口径函数三维。
+    #[test]
+    fn mobile_only_kind_classification() {
+        for k in ["phone", "PHONE", "tablet", "android", "ios", " phone "] {
+            assert!(is_mobile_only_kind(k), "{k} 应判为移动端单口");
+        }
+        for k in ["pc", "desktop", "laptop", "", "unknown", "server"] {
+            assert!(!is_mobile_only_kind(k), "{k} 不应判为移动端单口");
+        }
+        // 端口语义：目前只有 ADB 5555 是"对端必单口"
+        assert!(is_single_port_only_target(5555));
+        for p in [15200u16, 13911, 9100, 3389, 22, 5037, 3103] {
+            assert!(!is_single_port_only_target(p), "{p} 不是单口语义端口");
+        }
+        // 口径函数：multi 开关 × 设备类 × 端口语义
+        assert!(forward_use_multi(true, false, 13911));
+        assert!(!forward_use_multi(true, true, 13911), "移动端恒 per-port");
+        assert!(!forward_use_multi(true, false, 5555), "5555 恒 per-port（冷缓存兜底）");
+        assert!(!forward_use_multi(false, false, 13911));
+        assert!(!forward_use_multi(false, true, 5555));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2026-11-12 真案（手机→PC 3389 黑洞）：server 侧 target 白名单摘要
+    //
+    // 事故里"3389 不拨"的第一层判据就是"它在不在 allowed 里"。口径必须与
+    // `vnet/connection.rs::mf_target_allowed`（default ∪ VNET_TARGET_PORTS）逐字一致，
+    // 否则这行日志会把人带偏——比没有日志更糟。
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// 现场环境：`VNET_TARGET_PORTS=15200,13911,3389,9100`，server 的 default=22。
+    #[test]
+    fn multi_forward_summary_lists_production_whitelist_including_3389() {
+        let s = multi_forward_targets_summary(22, Some("15200,13911,3389,9100"));
+        assert!(s.contains("default=22"), "{s}");
+        assert!(s.contains("VNET_TARGET_PORTS=15200,13911,3389,9100"), "原样透出：{s}");
+        assert!(s.contains("extra=[3389, 9100, 13911, 15200]"), "解析+排序+去重：{s}");
+        assert!(s.contains("allowed=[22, 3389, 9100, 13911, 15200]"), "default 并入且去重：{s}");
+        // 关键断言：3389 必须在 allowed 里 —— 若这行显示不在，才轮到"白名单拒"这条线索
+        assert!(s.contains("3389"), "3389 必须出现在摘要里：{s}");
+    }
+
+    /// 未设/空/含垃圾项：不能把"没配"误报成"配了"。
+    #[test]
+    fn multi_forward_summary_handles_unset_and_malformed_env() {
+        assert!(
+            multi_forward_targets_summary(9100, None).contains("VNET_TARGET_PORTS=<unset>"),
+            "未设必须显式标 <unset>"
+        );
+        let empty = multi_forward_targets_summary(9100, Some("   "));
+        assert!(empty.contains("extra=[]"), "{empty}");
+        assert!(empty.contains("allowed=[9100]"), "只有 default：{empty}");
+        // 垃圾项（非数字/0/超范围）一律丢弃，不能变成"允许 0 号端口"
+        let junk = multi_forward_targets_summary(22, Some("abc, 3389 ,,0,70000,13911"));
+        assert!(junk.contains("extra=[3389, 13911]"), "只留合法项：{junk}");
+        assert!(!junk.contains("[0"), "0 不得入白名单：{junk}");
+        // default 已在 extra 里 → 不重复
+        let dup = multi_forward_targets_summary(3389, Some("3389"));
+        assert!(dup.contains("allowed=[3389]"), "去重：{dup}");
     }
 }
 

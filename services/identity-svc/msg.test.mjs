@@ -2,11 +2,15 @@
 // 路由处理函数直调（send 捕获，照 delegation.test.mjs 风格）；验签注入 stub
 // ——本测只测信箱逻辑（路由/限流/扇出/ACK 语义），签名链路由 presence 同款 authedDid 覆盖。
 // 文件级副作用：msg-inbox.json 会写真实文件（模块内常量路径），已入 .gitignore；测试尾清空。
+// 2026-11-12 开源整改：模块支持 MSG_INBOX_PATH 覆盖，单测改指临时目录，不再污染仓内工作树。
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { rmSync } from 'node:fs'
+import { rmSync, mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { base58Encode, didFromPublicKey } from './identity/did.mjs'
 
+process.env.MSG_INBOX_PATH = join(mkdtempSync(join(tmpdir(), 'myco-inbox-test-')), 'msg-inbox.json')
 const { handleMsgPost, MSG_ROUTES, __test } = await import('./msg.mjs')
 
 // 固定种子真算 did（2026-10-10 canonical-only 收敛：账号 did 也须 canonical z 形态——

@@ -426,6 +426,44 @@ const tests = [
   }],
 ];
 
+tests.push(
+  ["策略持久化：推一条 → 落盘 → 新 store 加载后仍生效（重启不丢授权）", async () => {
+    const { PolicyStore } = await import("../src/policy-proxy.js");
+    const { createHmac, randomBytes, randomUUID } = await import("node:crypto");
+    const { mkdtemp, readFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const key = randomBytes(32);
+    const dir = await mkdtemp(join(tmpdir(), "policy-persist-"));
+    const statePath = join(dir, "web-proxy-policy.json");
+    const now = () => 1_700_000_000_000;
+    const a = new PolicyStore({ now, statePath });
+    await a.load();
+    const body = { nonce: randomUUID(), ts: now(), viewerDid: "did:myco:PersistMe",
+      authz: { taskCaps: {}, taskVis: {}, grant: { owner: true }, viewerLabel: "设备·持久化·pppp" } };
+    body.sig = createHmac("sha256", key).update(canonicalBody(body)).digest("base64url");
+    assert.equal(a.apply(body, key).ok, true);
+    await new Promise((r) => setTimeout(r, 50)); // persist is fire-and-forget
+    const raw = JSON.parse(await readFile(statePath, "utf8"));
+    assert.ok(raw.viewers["did:myco:PersistMe"], "落盘应包含该 viewer");
+    // 新 store（模拟重启）加载后仍能查到策略
+    const b = new PolicyStore({ now, statePath });
+    const loaded = await b.load();
+    assert.equal(loaded, 1, "重启后应加载 1 条");
+    const entry = b.viewers.get("did:myco:PersistMe");
+    assert.equal(entry.kind, "engine");
+    assert.equal(entry.label, "设备·持久化·pppp");
+    assert.equal(entry.admin, false);
+    // closePort 撤销也要落盘
+    const closeBody = { nonce: randomUUID(), ts: now(), viewerDid: "did:myco:PersistMe", closePort: true };
+    closeBody.sig = createHmac("sha256", key).update(canonicalBody(closeBody)).digest("base64url");
+    a.apply(closeBody, key);
+    await new Promise((r) => setTimeout(r, 50));
+    const after = new PolicyStore({ now, statePath });
+    assert.equal(await after.load(), 0, "撤销后重启应加载 0 条");
+  }],
+);
+
 /* ────────────────────────── dual-mode runner ────────────────────────────── */
 
 if (process.env.VITEST !== undefined) {

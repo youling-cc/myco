@@ -13,6 +13,7 @@ import { TodoCard } from './TodoCard'
 import { YoulingLogin } from './YoulingLogin'
 // 第81轮：好友分享任务（peer 来源徽章）+ 任务分享源桥（渲染层只读）
 import { PeerTasksSection } from './FriendsPanel'
+import { AdbShareCard } from './AdbShareCard'
 import { setBoardTasks } from '../chat-store'
 // 第88轮：youling 平台 ENV 感知面（领取任务同步显示 + 我的能力值视图）
 import { fetchYoulingTasks, fetchMyResume, MODE_LABEL, ROLE_LABEL, fmtPct, type YoulingTask, type MyResume as MyResumeData, type AbilityRow, YoulingApiError } from '../youling-tasks'
@@ -276,6 +277,9 @@ export function TaskList({ transport, onPickSession, onDisconnect, onSettings }:
       <div className="ws-list">
         {/* PM 今日待办只读卡(纲领六;transport 不支持时静默不渲染) */}
         <TodoCard transport={transport} />
+        {/* 2026-11-11 手机当 vnet server 的「ADB 调试」卡（需求 ADB-SHARE-TASK.md）：
+            整卡点击开/关 5555 服务；首次开启自动建分享卡发设备群。 */}
+        <AdbShareCard />
         {/* 第81轮：好友分享的任务（peer 来源徽章行，本地库渲染；youling 任务零改动） */}
         <PeerTasksSection />
 

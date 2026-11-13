@@ -62,13 +62,8 @@ myco-terminal-proto = { path = "core/terminal-proto" }
 lto = true
 codegen-units = 1
 
-# Vendored forks of webrtc-rs: enables IPv6 host candidates (set_network_types
-# with Udp4/Udp6) and fixes ifaces feature for our P2P direct-connect paths.
-[patch.crates-io]
+# 閺堫剙婀?fork閿涙岸鐛欑拠?webrtc-rs 娑撹桨缍嶆稉宥嗘暪闂?IPv6 host 閸婃瑩鈧绱檌faces 閺嬫矮濡囩拠濠冩焽閿?[patch.crates-io]
 webrtc-util = { path = "patches/webrtc-util" }
 webrtc-ice = { path = "patches/webrtc-ice" }
-# Vendored zeromq fork: fixes todo!() panic on client disconnect in REP socket
-# (dead-peer removal; NoMessage semantics for control frames; queue-close
-# handling; unknown-send peer eviction) -- required for long-running agent
-# process stability.
-zeromq = { path = "patches/zeromq" }
+# 閺傤叀绻涢崡?todo!() panic 閺嶉€涙叏:rep.rs 鐎靛湱顏柨娆掝嚖鐢嗙儲鏉?閸樼喐娼冨?REP 瀵邦亞骞嗛埆?555 闂堟瑩绮径杈痪),
+# req.rs 閹貉冨煑鐢勫瘻閺冪姵绉烽幁顖濈箲閸?sub.rs 闂冪喎鍨崗鎶芥４鏉╂柨娲?NoMessage,pub.rs 閺堫亞鐓￠崣鎴︹偓渚€鏁婄拠顖濇丢濮濊顕粩?zeromq = { path = "patches/zeromq" }

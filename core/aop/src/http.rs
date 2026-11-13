@@ -5,9 +5,9 @@
 //! State 从 HttpServerState 收窄为 AopSessionManager 本体。
 //!
 //! 比 env 时代多出的三条**内部算子路由**(env 进程内直调变 HTTP):
-//!   POST /api/aop/create        AopSessionConfig → SessionInfo(action.rs 建会话)
-//!   POST /api/aop/destroy_task  {taskId} → bool(project.rs 重启/切 harness)
-//!   GET  /api/aop/events_snapshot 一次性快照(remote client 拉首帧用,不开 SSE)
+//!   POST /api/labs/create        AopSessionConfig → SessionInfo(action.rs 建会话)
+//!   POST /api/labs/destroy_task  {taskId} → bool(project.rs 重启/切 harness)
+//!   GET  /api/labs/events_snapshot 一次性快照(remote client 拉首帧用,不开 SSE)
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -70,19 +70,19 @@ pub fn router(mgr: AopSessionManager) -> Router {
     let state = Arc::new(mgr);
     Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/api/aop/message", post(handle_aop_message))
-        .route("/api/aop/stop", post(handle_aop_stop))
-        .route("/api/aop/list", get(handle_aop_list))
-        .route("/api/aop/history/:id", get(handle_aop_history))
-        .route("/api/aop/events", get(handle_aop_events))
-        .route("/api/aop/events_snapshot", get(handle_aop_events_snapshot))
-        .route("/api/aop/pause", post(handle_aop_pause))
-        .route("/api/aop/resume", post(handle_aop_resume))
-        .route("/api/aop/frames/:id", get(handle_aop_frames))
-        .route("/api/aop/human_submit", post(handle_aop_human_submit))
-        .route("/api/aop/dataset_toggle", post(handle_dataset_toggle))
-        .route("/api/aop/create", post(handle_aop_create))
-        .route("/api/aop/destroy_task", post(handle_aop_destroy_task))
+        .route("/api/labs/message", post(handle_aop_message))
+        .route("/api/labs/stop", post(handle_aop_stop))
+        .route("/api/labs/list", get(handle_aop_list))
+        .route("/api/labs/history/:id", get(handle_aop_history))
+        .route("/api/labs/events", get(handle_aop_events))
+        .route("/api/labs/events_snapshot", get(handle_aop_events_snapshot))
+        .route("/api/labs/pause", post(handle_aop_pause))
+        .route("/api/labs/resume", post(handle_aop_resume))
+        .route("/api/labs/frames/:id", get(handle_aop_frames))
+        .route("/api/labs/human_submit", post(handle_aop_human_submit))
+        .route("/api/labs/dataset_toggle", post(handle_dataset_toggle))
+        .route("/api/labs/create", post(handle_aop_create))
+        .route("/api/labs/destroy_task", post(handle_aop_destroy_task))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }

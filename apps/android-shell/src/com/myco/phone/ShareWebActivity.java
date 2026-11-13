@@ -124,10 +124,19 @@ public class ShareWebActivity extends Activity {
                 cm.registerNetworkCallback(new android.net.NetworkRequest.Builder().build(), netCb);
             }
         } catch (Exception ignored) { }
-        if (url0.startsWith("http://") && (url0.contains("mt=") || url0.contains("/gw/"))) {
-            // 带 mt（入门票）或 /gw/（网关路径）的 http URL 放行：
+        // 2026-11-12 设备域干净 URL：`http://<设备别名>.localhost:<口>/<分享别名>/`
+        // ——*.localhost 恒解析回环（本机隧道口），Host 只用于网关路由；与 mt//gw/
+        // 同一安全面（都是"只能打到自己机器的隧道口"），放行。
+        boolean deviceOrigin = false;
+        try {
+            java.net.URL u = new java.net.URL(url0);
+            deviceOrigin = u.getProtocol().equals("http")
+                && u.getHost() != null && u.getHost().endsWith(".localhost");
+        } catch (Exception ignored) { }
+        if (url0.startsWith("http://") && (url0.contains("mt=") || url0.contains("/gw/") || deviceOrigin)) {
+            // 带 mt（入门票）或 /gw/（网关路径）或设备域别名（.localhost）的 http URL 放行：
             // 覆盖 localhost 代理、LAN 直连、中继服务器三种场景。
-            // 不带 mt 的任意 URL 仍然拒绝（防被塞浏览器用）。
+            // 其它任意 URL 仍然拒绝（防被塞浏览器用）。
             web.loadUrl(url0);
         } else {
             bar.setText("打不开这个任务（地址不合法）");
@@ -232,6 +241,13 @@ public class ShareWebActivity extends Activity {
         s.setSupportZoom(false);
         s.setBuiltInZoomControls(false);
         s.setDisplayZoomControls(false);
+        // 2026-11-12 两段定案（撤 LOAD_NO_CACHE）：上午为「动态口变了→旧 URL 的 404
+        // 被 Chromium 按 URL 钉死」加过 NO_CACHE——但那把 /myco-assets 稳定前缀的
+        // 跨会话缓存也废了：DSH 页 ~11MB 资产每次全量重下（隧道 180KB/s ≈ 60s+）
+        // → 模块加载器超时 →「返回再开打不开」（13:40/13:51 真机两案，trajectory
+        // 模块 2.6MB 单发超线）。根因（动态口漂移）已由设备域固定口根治：URL 永不
+        // 变 ⇒ 404 钉死不可能发生 ⇒ 恢复默认缓存——首载后走缓存，返回再开与
+        // 二卡秒开都靠它（myco-assets 稳定前缀的设计初衷，见网关 public_router）。
         // 2026-10-12：控制台留证（白屏现场第一手日志落 gw-net.log；不带媒体授权）
         w.setWebChromeClient(new ShareChrome(this));
         w.setWebViewClient(new ShareSeen(this));

@@ -277,7 +277,13 @@ async function runCase(
       .filter((f) => f.localPort !== localPort),
     { localPort, device: PC_DID, port: targetPort, enabled: true },
   ])
+  // 2026-11-13：bootVnetForwards 不再恢复 mf 专属口（3389/13911 单一 owner 立法），
+  // 但它仍负责装 __mycoFwd 回调与启动非 mf 口——所以照跑，mf 专属口再单独
+  // addForward 起监听。测的流路径（startForward/onConn/onData 回程）不变。
   fwd.bootVnetForwards()
+  if (targetPort === 3389 || targetPort === 13911) {
+    fwd.addForward({ localPort, device: PC_DID, port: targetPort, enabled: true })
+  }
   const c = clientConnect(localPort)
   clientWrites(c)
   const received = await c.waitReceived(1500)

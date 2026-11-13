@@ -36,6 +36,8 @@ import {
 import { compressImage } from './ChatView'
 import { setOpenConv } from '../chat-notify'
 import { currentYoulingName, listPresence, fetchPresenceByRoot, ensureRootRoster, accountFormatLegacy, type PresenceNode } from '../identity'
+// 2026-11-11 本机「ADB 调试」卡的打开路由（手机当 vnet server，见 adb-share.ts）
+import { adbServerStart, ensureAdbCard, myDeviceDid } from '../adb-share'
 // 2026-10-05 复制可靠性加固 + 粘贴非法 DID 实时提示
 import { isValidDid, copyDidVerified, copyDidToastText } from '../didCheck'
 import { onP2pSyncProgress, onSendStateChange, sendTyping, clearTyping, ensureP2pLoops, syncNowThrottled, syncNowForConv, syncNowForConvThrottled } from '../p2p'
@@ -105,7 +107,7 @@ import { accountDidEq, convKey } from '../didUtil'
 // 而不是落到本机任务详情页（本机没有那张分享的注册表）。
 // 2026-10-09 第二程：设备群广播的卡**嵌在 payload.card**——UI 一律先摊平
 // （`flattenTaskSharePayload`），否则卡上没标题、也没有「打开」入口。
-import { prefetchTaskEntry, isShareCard, openTaskShare } from '../dsh-open-runtime'
+import { isShareCard, openTaskShare, ensureRdpForwardFor } from '../dsh-open-runtime'
 import { flattenTaskSharePayload, taskDispTitle } from '../chat-store'
 
 /** 三态灯。 */
@@ -850,8 +852,8 @@ function ChatScreen({ convId, title, isGroup, myName, onBack, onChanged, presenc
                   <TaskEnvList card={flatCard as Record<string, unknown>} enabled={m.dir !== 'out'} />
                   {shareOpenNote && shareOpenNote.msgId === m.msgId && shareOpenNote.text && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4, maxWidth: 238 }}>
-                      {/* 2026-10-11 用户报「连接过程中也不显示连接中」：取票→起本地口→
-                          race 候选腿的这几秒就是"连接过程"，把连接中徽标显式摆出来。 */}
+                      {/* 2026-10-11 用户报「连接过程中也不显示连接中」：起设备隧道→
+                          开页的这几秒就是"连接过程"，把连接中徽标显式摆出来。 */}
                       {shareOpenNote.text === '正在打开…' && <ConnBadge mode="connecting" />}
                       <span style={{ fontSize: 11.5, color: shareOpenNote.text === '正在打开…' ? '#7ea8d4' : '#b45309', lineHeight: 1.5 }}>{shareOpenNote.text}</span>
                     </div>
@@ -1640,7 +1642,7 @@ function chatPreviewOf(m: ChatMsg): string {
 export function PeerTasksSection() {
   const [, setTick] = useState(0)
   const [err, setErr] = useState<string | null>(null)
-  // §3.23：点列表里的分享卡 → 走 dsh-open-runtime 取票 + 隧道（点它 = 走 remoteOpen 那条链）
+  // §3.23：点列表里的分享卡 → 走 dsh-open-runtime 的 VNETP 直入 + 隧道（点它 = 打开分享页）
   const [openNote, setOpenNote] = useState<{ id: string; text: string; state?: EnvRowState } | null>(null)
   // 2026-10-11 任务卡改名：长按任务卡 → ActionSheet（仅 owner 可见「改名」）→ 改名弹层
   const [taskMenu, setTaskMenu] = useState<PeerTask | null>(null)
@@ -1654,25 +1656,23 @@ export function PeerTasksSection() {
     const t = setInterval(refresh, 5000) // 接受/完成后他端回执与本地变化都靠 tick 重读
     return () => clearInterval(t)
   }, [refresh])
-  // R10 预取票：本区块出现可打开的远端任务卡时，后台先取票（点卡时省一次往返）。
-  // 依赖 tasks.length 而非 tasks：内容变化靠 tick 刷新，长度变化才需要重新评估。
-  const taskCountForPrefetch = getBoardTasks().length
-  useEffect(() => {
-    for (const task of listTasks()) {
-      // env 卡不走取票/隧道（入口是固定口直连）——别为它预取分享票
-      if (declaredEnvsOfCard(task as unknown as Record<string, unknown>, task.action).length) continue
-      const card = taskShareCardOf(task)
-      if (card) prefetchTaskEntry(card as unknown as Record<string, unknown>)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [taskCountForPrefetch])
   // 批五（2026-09-29 用户实测）：shared（我分享出去的）也入列——此前整体过滤导致
   // 自己发的任务卡在「我的任务」看不到。自己的卡走 peerTaskView 创建者视角
   // （「我发起的 · 待接受/进行中」），不接受者视角的 一起做/开始/完成 按钮。
   const my = myAccountDid()
   const tasks = listTasks()
-  if (!tasks.length) return null
-  const views = tasks.map((t) => ({ t, v: peerTaskView(t, my) }))
+  // 2026-11-12 一处入口：本机的「ADB 调试」服务卡不进列表——它是发给**别的设备**
+  // 消费的（设备群 fan-out 会把卡回声给自己账号），手机上的唯一入口是页面顶部
+  // 那张专属开关卡（AdbShareCard：状态灯 + 开/关 + 建卡状态，点击同一组动作）。
+  // 只滤显示，卡数据不动；PC/笔记本端（chat_service 名册）不受影响——它们的
+  // 本机设备 did ≠ 卡上的 device，照常显示为可消费的 ADB 任务卡。
+  const myDev = myDeviceDid()
+  const visible = tasks.filter((t) => {
+    const envs = declaredEnvsOfCard(t as unknown as Record<string, unknown>, t.action)
+    return !envs.some((e) => e && e.kind === 'adb' && e.device && accountDidEq(e.device, myDev))
+  })
+  if (!visible.length) return null
+  const views = visible.map((t) => ({ t, v: peerTaskView(t, my) }))
   const pendingN = views.filter(({ v }) => !v.mine && v.statusKey === 'pending').length
   const stLabel: Record<string, string> = { pending: '待接受', todo: '待办', doing: '进行', done: '已完成' }
   const mineLabel: Record<string, string> = { pending: '待接受', doing: '进行中', done: '已完成' }
@@ -1682,16 +1682,55 @@ export function PeerTasksSection() {
   /** 列表行「打开」：**env 卡优先按环境直开**（2026-10-23 真机 bug）——
    *  有 env 时入口是环境本身（固定口 → RDP 复制地址/DSH 浏览器），**不走分享入口**
    *  （`/gw/<id>/app/` 会报 `no valid share cookie (open the share entry first)`）；
-   *  没有 env 的老卡保持原 `openTaskShare`（取票 → 本地端口 → 原生 WebView）。 */
+   *  没有 env 的老卡保持原 `openTaskShare`（VNETP 直入 → 原生 WebView）。
+   *
+   *  2026-11-11 两条新路由：
+   *  · **adb 卡（目标是本机设备）→ 开/关本机 vnet server（5555）**——手机是 server，
+   *    `__mycoVnet.add` 是"我去连别人"的方向，用反了；server 生命周期见 adb-share.ts。
+   *  · **DSH 卡带分享坐标 → openTaskShare（VNETP 直入）**——PC 网关入口 `/gw/<id>/`
+   *    经设备隧道 15200（VNETP/1 DID 认证口）免 mt 直入（2026-11-12 起唯一路径，
+   *    取票/mt 链已删；隧道不可用时如实报「连不上源设备」）。
+   *    RDP 是裸 TCP（3389 无票据概念），保持 env 直开不变。 */
   const openShare = (t: PeerTask) => {
     const envs = declaredEnvsOfCard(t as unknown as Record<string, unknown>, t.action)
     const env = primaryEnvOf(envs)
+    const shareCard = taskShareCardOf(t)
+    if (env && env.kind === 'adb' && env.device && accountDidEq(env.device, myDeviceDid())) {
+      // 本机 ADB 卡：server 开关（异步桥——libvnet 注册在 native 线程；重复点=幂等启动）
+      setOpenNote({ id: t.taskId, text: '正在启动 ADB 服务…' })
+      void adbServerStart().then((r) => {
+        if (r.ok) {
+          void ensureAdbCard().catch(() => undefined)
+          setOpenNote({ id: t.taskId, text: 'ADB 服务运行中 · 授权设备可经 vnet 隧道连接', state: 'ready' })
+        } else {
+          setOpenNote({ id: t.taskId, text: r.err || '启动失败，稍后再试' })
+        }
+      })
+      return
+    }
+    if (env && env.kind === 'dsh' && shareCard) {
+      setOpenNote({ id: t.taskId, text: '正在打开…' })
+      void openTaskShare(shareCard as unknown as Record<string, unknown>, {
+        onNote: (text) => setOpenNote({ id: t.taskId, text }),
+      }).then((r) => {
+        setOpenNote({ id: t.taskId, text: r.ok ? '' : r.message })
+      }).catch((e: unknown) => {
+        setOpenNote({ id: t.taskId, text: e instanceof Error ? e.message : '打不开这个任务，稍后再试' })
+      })
+      return
+    }
     if (env) {
       setOpenNote({ id: t.taskId, text: '正在连接…' })
-      void openTaskEnv(env, {
+      // RDP：先把「本机 → 该设备:3389」的设备级 vnet 隧道拉起来并回写本地口，
+      // 再交给 openTaskEnv 去算地址/复制/唤起远程桌面 App。不做这一步时卡片里写死的
+      // localPort(23389) 是 PC 侧口，手机上没人监听（2026-11-11 真机"复制失败"）。
+      const prep = env.kind === 'rdp' && env.device
+        ? ensureRdpForwardFor(env.device, env.localPort).catch(() => null)
+        : Promise.resolve(null)
+      void prep.then(() => openTaskEnv(env, {
         gate: envGateOf(t as unknown as Record<string, unknown>),
         onBuilding: (text) => setOpenNote({ id: t.taskId, text }),
-      }).then((r) => {
+      })).then((r) => {
         // 2026-10-23 用户反馈：RDP 复制成功提示曾被渲染成红色错误样式——note 带 state，
         // 渲染按语气上色（ready=绿 / building=蓝 / 其它=红），见 openNoteTone。
         setOpenNote({ id: t.taskId, text: r.note || stateText(r.state, env.kind), state: r.state })
@@ -1700,7 +1739,7 @@ export function PeerTasksSection() {
       })
       return
     }
-    const card = taskShareCardOf(t)
+    const card = shareCard
     if (!card) { setErr('这张任务卡缺少来源设备信息，打不开（可以让对方重新分享一次）'); return }
     setOpenNote({ id: t.taskId, text: '正在打开…' })
     void openTaskShare(card as unknown as Record<string, unknown>, {

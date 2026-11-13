@@ -113,6 +113,11 @@ tower-http = { version = "0.5", features = ["cors", "compression-gzip", "compres
 # 绗?4杞?P2P 鍙屾爤鐩戝惉锛歔::] + IPV6_V6ONLY=0锛圛Pv6 鐩磋繛涓?IPv4 LAN 鍚?socket 鏀讹級
 socket2 = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "stream", "rustls-tls", "gzip", "brotli", "deflate"] }
+# 2026-11-11 P0 安全修复（dsh_share 网关解压）：上游压缩响应（gzip/deflate/br）在
+# 可见性裁剪前必须先解压，否则 parse_upstream_json 失败 → 裁剪被静默跳过 = 越权泄漏。
+# 版本与 Cargo.lock 既有条目一致（reqwest/tower-http 传递依赖），离线零新增下载。
+flate2 = "1.1"
+brotli-decompressor = "6.2"
 ureq = { version = "2", features = ["json"] }
 url = "2"
 myco-core = { path = "../../../core/myco-core" }
@@ -147,7 +152,16 @@ winreg = "0.52"
 # 鍒嗕韩缃戝叧 reaper锛歄penProcess 鎺㈤拡鍒ゅ畾 pid 鐪熸锛堟壙 apps/env 鐨勫疄鐜帮級
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Power", "Win32_System_Threading"] }
 
+# 2026-11-13 CI fix (ubuntu E0433 libc): vendored vnet getifaddrs uses libc;
+# apps/vnet declares it but host workspace didn't (Android NDK cross-compile
+# masked this — libc was implicitly available there)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+# 2026-11-11 P0 回归测试：造真 brotli 夹具（解压端用 brotli-decompressor，压缩端
+# 造夹具用 brotli；lock 里已有 9.1.1，离线零新增下载）。
+brotli = "9.1"
 # presence 心跳循环虚拟时钟单测（2026-10-09 灭灯修复回归锁）：start_paused 需要
 # test-util（仅测试构建并入，release/发布构建不解析 dev-deps，不进产物）。
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "test-util"] }

@@ -1,25 +1,33 @@
 /**
- * dsh-open-runtime.ts — 「点卡就进」的**生产装配**：把 `dsh-open.ts` 的注入面接到
- * 真实的 identity / p2p / 原生壳上。
+ * dsh-open-runtime.ts — 「点卡就进」的**生产装配**：把分享卡打开接到真实的
+ * identity / 设备隧道 / 原生壳上。
  *
- * 为什么要单独一层：`dsh-open.ts` / `share-entry.ts` 是纯逻辑（单测跑在 node 环境，
- * 没有 localStorage / WebView），一旦在那里 `import './identity'` 就会把整套
- * localStorage 迁移与 noble sha512 注册拖进单测。**装配放这里，逻辑放那边**。
+ * 2026-11-12 起取票链（share-entry-request / mt 票 / 本地监听数据面 / 自动重试）
+ * **整链删除**：手机点 DSH 卡的唯一路径是——
+ *   ① `MycoShell.reuseSharePage` 复用仍活着的分享页（返回再开，<1s）；
+ *   ② 设备隧道 VNETP 直入：`ensureShareEntryForwardFor(源设备)`（本机→对端 15200，
+ *      VNETP/1 DID 认证口，免 mt 免客户端断言）→ `openShareInWebView(/gw/<id>/)`。
+ * 拿不到隧道口 → 如实说「连不上源设备」，**绝不回落 mt**（mt 会过期、13911 裸网关
+ * 无凭证必拒——真机 0.3.315 前的实测定案）。
+ *
+ * 为什么要单独一层：纯逻辑（`dsh-open.ts` / `share-entry.ts`）单测跑在 node 环境，
+ * 没有 localStorage / WebView；一旦在那里 `import './identity'` 就会把整套 localStorage
+ * 迁移与 noble sha512 注册拖进单测。**装配放这里，逻辑放那边**。
  *
  * 对外：
  *   · `openTaskShare(payload)` —— 给 UI（任务卡点击）用；
  *   · `window.MycoDshShare` —— 给 adb / EnvServer 的 `eval` 用（真机取证通道）。
  */
 
-import { currentIdentity, getRootIdentity, getAttestation, listPresence, signFriendHandshake, registerPresence, currentYoulingName, fetchPresenceByRoot, signAuthHeader, type PresenceAddrs } from './identity'
+import { currentIdentity, getRootIdentity, getAttestation, signFriendHandshake, registerPresence, signAuthHeader, type PresenceAddrs } from './identity'
 import { signWithDeviceKey } from './delegation'
-import { ingestWireMsg, p2pDeliverWithReply, setRelayDeliver, setRelayDeliverReply, peerDevicesOf } from './p2p'
+import { ingestWireMsg, setRelayDeliver, setRelayDeliverReply, setVnetP2pTunnel, peerDevicesOf } from './p2p'
 import { accountDidEq } from './didUtil'
 import { relayCandidate } from './p2p-tunnel'
-import { openSharedTask, prefetchShareEntry, makeSingleFlight, makeSerialQueue, openHttpTunnelSession, httpOverTunnel, type HttpTunnelSession, type OpenTaskDeps, type OpenTaskResult } from './dsh-open'
-import { OPEN_RETRY_DELAYS_MS, isTransientOpenFailure, retryNote, finalOpenNote, retryTransient, pickHealTargets, withSourceDevice, waitUntil, type SourceDeviceState } from './open-retry'
-import { removeTasksByShareId } from './chat-store'
-import { clearRelayFail, noteRelayFail, relayFailFromNative } from './relay-fail'
+import { makeSingleFlight, makeSerialQueue, openHttpTunnelSession, httpOverTunnel, type HttpTunnelSession } from './dsh-open'
+import { waitUntil } from './open-retry'
+import { noteRelayFail, relayFailFromNative } from './relay-fail'
+import { ensureVnetIdentity } from './vnet-identity'
 import { effectiveInboundPorts, verifyVnetPeerRoster } from './vnet-inbound'
 import {
   NativeProxyBridge,
@@ -28,18 +36,12 @@ import {
   nativeProxyDeps,
   nativeProxyGap,
   openShareInWebView,
-  startLocalListener,
-  stopLocalListener,
 } from './native-proxy'
 import {
-  entryControlEnvelope,
-  newControlMsgId,
   shareCardOf,
-  type ControlSendResult,
   type ShareCard,
-  type SourceAddrs,
 } from './share-entry'
-import { decideTunnelRoute, ReverseShareBridge, type NativeTapLike, type RouteDecision } from './p2p-tunnel'
+import { decideTunnelRoute, ReverseShareBridge, type NativeTapLike } from './p2p-tunnel'
 import { DEFAULT_GW_PORT } from './share-entry'
 import type { TunnelProxy } from './tunnel-session'
 
@@ -47,19 +49,14 @@ import type { TunnelProxy } from './tunnel-session'
 let live: { proxy: TunnelProxy; card: ShareCard; bridge: ReverseShareBridge | null } | null = null
 
 /**
- * 开卡在途护栏（2026-10-10 加固：**30s 超时自清**）。
+ * 开卡在途护栏（30s→75s 演化，2026-11-12 取票链删除后语义收窄）。
  *
  * 原实现 `opening` 变量一旦因链路挂起永远非 null，后续所有开卡都被
- * `if (opening) return opening` 挡住——用户看到"点卡再也没反应"。现在
- * 单槽护栏带超时：到点复位 + 收掉半截会话（`stopTaskShare`）+ 代际 +1
- * （还在跑的迟到开卡经 `shouldAbort` 在碰共享状态前自我了断）。
+ * `if (opening) return opening` 挡住——用户看到"点卡再也没反应"。单槽护栏带超时：
+ * 到点复位 + 代际 +1（还在跑的迟到开卡经 `shouldAbort` 语义在碰共享状态前自我了断）。
  *
- * 2026-10-12 30s→75s：**自动重试 + 旧卡自愈的总预算必须装进这道护栏**，
- * 否则护栏会在半路把 gen+1、还在跑的自愈一进 `openTaskShareOnce` 就被
- * shouldAbort 掐死（真机实测：死地址卡 4 趟 ×10s/趟 + 退避 6s ≈ 42s 就
- * 撞了 30s 上限，拿到一句"打开超时"而自愈从未跑到）。75s = 4 趟×10s +
- * 退避 6s + 自愈 3 台×~8s + 余量；超时兜底文案不变（真死链路 75s 也能
- * 收口，单飞不会被挂死的旧问题不受影响）。
+ * 75s 的预算依据：VNETP ensure（`SYNC_TUNNEL_ENSURE_TIMEOUT_MS`）最坏 35s（libvnet
+ * 注册重试在 native 线程）+ WebView 开页 + 余量；超时兜底文案如实报秒数。
  */
 const OPEN_TIMEOUT_MS = 75_000
 
@@ -197,26 +194,6 @@ function readLastShareSourceDevice(): string | null {
 }
 
 /**
- * 真机取证用的**寻址/端口覆盖**（只在显式设置时生效；生产路径一个字都不改）。
- *
- * 为什么需要它：手机上的端到端验证要用一台"源设备"配合，而 PC 侧跑的那个实例
- * 可能是旧构建（没有 `/p2p/tunnel` 路由）。把源设备地址与 p2p 数据面端口做成可覆盖，
- * 就能用一台**线协议等价**的对端做真机验证，而不必改一行生产逻辑。
- */
-export interface DebugOverride {
-  addrs?: SourceAddrs
-  /** 兜底传输要打的源设备 p2p 数据面端口（生产取 presence 上报的 `addrs.port`）。 */
-  p2pPort?: number
-}
-
-let debugOverride: DebugOverride | null = null
-
-/** 设置/清除真机取证覆盖（`null` = 清除）。 */
-export function setDebugOverride(o: DebugOverride | null): void {
-  debugOverride = o
-}
-
-/**
  * 本机隧道身份（账号/设备/签名）。身份未就绪 → null（上层给人话）。
  *
  * 账号 did 的三级兜底（**真机踩过**）：`vault.rootDid` → `attestation.rootDid` →
@@ -260,94 +237,19 @@ async function waitForIdentityReady(): Promise<ReturnType<typeof tunnelIdentity>
     console.log(`[dsh-open] 身份未就绪，等了 ${IDENTITY_WAIT_MS}ms 仍没好（冷启动/解冻）`)
     return null
   }
-  console.log(`[dsh-open] 身份未就绪，等了 ${waited}ms 才就绪（多半刚从后台解冻）——已放行取票`)
+  console.log(`[dsh-open] 身份未就绪，等了 ${waited}ms 才就绪（多半刚从后台解冻）——已放行开卡`)
   return tunnelIdentity()
-}
-
-/**
- * 源设备的寻址候选来源。
- *
- * 优先用 presence 的 `addrs`（`{lan/lanList, publicV4/publicV4List, reflexive/reflexiveList,
- * ipv6/ipv6List, port}`——与 PC 端 `LocalCandidates::addrs_json` 同形状）；
- * 找不到就 null（上层给人话"不在线"）。
- */
-export async function sourceAddrsOf(deviceDid: string): Promise<SourceAddrs | null> {
-  if (debugOverride?.addrs) return debugOverride.addrs
-  const list = await listPresence().catch(() => [])
-  const hit = list.find((p) => p.did === deviceDid)
-  if (!hit) return null
-  const a = (hit.addrs ?? {}) as unknown as SourceAddrs
-  const hasAny =
-    (a.lanList?.length ?? 0) +
-      (a.publicV4List?.length ?? 0) +
-      (a.reflexiveList?.length ?? 0) +
-      (a.ipv6List?.length ?? 0) >
-      0 || !!a.lan || !!a.publicV4 || !!a.reflexive || !!a.ipv6
-  return hasAny ? a : null
-}
-
-/**
- * **provider A**：把 `share-entry-request` 直推给源设备，并**读回响应体**。
- *
- * 手机推不到回包（没有入站监听能力），所以源设备把回包挂进 `POST /p2p/msg` 的
- * HTTP 响应体（`reply` 键）——这条连接本来就开着在等响应，一次往返拿到票。
- * 源设备是旧版本（没有 `reply`）→ `reply:null`，上层回落到既有 P2P 回推等待。
- */
-function makeSendControl(card: ShareCard) {
-  return async (kind: string, payload: Record<string, unknown>): Promise<ControlSendResult> => {
-    const now = Date.now()
-    const env = entryControlEnvelope(
-      {
-        account: getRootIdentity() ?? getAttestation()?.rootDid ?? currentIdentity()?.did ?? '',
-        device: currentIdentity()?.did ?? '',
-        name: currentYoulingName() || '好友',
-        deviceName: 'myco-phone',
-      },
-      card.sourceAccount,
-      kind,
-      payload,
-      newControlMsgId(now),
-      now,
-    )
-    const resp = await p2pDeliverWithReply(card.sourceAccount, env, card.sourceDevice)
-    if (!resp) return { delivered: false }
-    const reply = resp.reply
-    return {
-      delivered: true,
-      reply: reply && typeof reply === 'object' && !Array.isArray(reply) ? (reply as Record<string, unknown>) : null,
-    }
-  }
-}
-
-/** 组装生产依赖（可在测试里替换字段）。 */
-export function makeOpenTaskDeps(overrides: Partial<OpenTaskDeps> = {}): OpenTaskDeps {
-  const id = tunnelIdentity()
-  const { factory, bridge } = nativeProxyDeps()
-  const identity = id ?? { account: '', device: '', sign: async () => null }
-  return {
-    myAccount: id?.account ?? '',
-    myDevice: id?.device ?? '',
-    identity,
-    sourceAddrs: sourceAddrsOf,
-    startListener: startLocalListener,
-    stopListener: stopLocalListener,
-    openWebView: (url, title) => openShareInWebView(url, title),
-    factory,
-    bridge,
-    onLog: (l) => console.log(l),
-    p2pPort: debugOverride?.p2pPort,
-    ...overrides,
-  }
 }
 
 /**
  * 聊天投递的中继兜底装配（2026-10-12"直连优先、不通走中转"——与 DSH web 分享
  * 链路同构）。在 app 引导时调一次。
  *
- * 通路复用分享的隧道设施：`relayCandidate(对端设备did)`（8321 mux 的 WS 隧道）
- * + `tunnelHttpRequest`（一条隧道一次 HTTP，目标端口 **9100**——PC 侧隧道
- * 白名单 TUNNEL_DEFAULT_PORTS 本就含 9100"好友设备可经隧道调用我方 /p2p/* 数据面"，
- * 同账号隧道授权放行）——等于把 PC 的 p2p/msg 面从"仅直连"扩成"直连⊥中继"。
+ * 通路复用分享一族的隧道设施：`relayCandidate(对端设备did)`（8321 mux 的 WS 隧道）
+ * + `openHttpTunnelSession`/`httpOverTunnel`（可复用隧道会话，目标端口 **9100**——
+ * PC 侧隧道白名单 TUNNEL_DEFAULT_PORTS 本就含 9100"好友设备可经隧道调用我方
+ * /p2p/* 数据面"，同账号隧道授权放行）——等于把 PC 的 p2p/msg 面从"仅直连"
+ * 扩成"直连⊥中继"。
  *
  * 方向说明（诚实边界）：这只解决**手机 → 对端**（手机当 consumer）；反向
  * （PC → 手机）需要手机在云中继注册 provider（裸 TCP 长连+心跳——浏览器 JS
@@ -355,15 +257,178 @@ export function makeOpenTaskDeps(overrides: Partial<OpenTaskDeps> = {}): OpenTas
  */
 export function wireChatRelayFallback(): void {
   setRelayDeliver(async (accountDid, envelope) => {
-    // 聊天投递**不记**失败留痕（record:false）：那份留痕是给"点卡取票"的收摊文案用的，
-    // 聊天在后台悄悄失败一次就把取票的真因顶掉了，反而更难查。
+    // 聊天投递**不记**失败留痕（record:false）：留痕是给"同步回包收摊文案"用的，
+    // 聊天在后台悄悄失败一次会把真因顶掉，反而更难查。
     const r = await relayDeliverOnce(accountDid, envelope, undefined, { record: false })
     return r !== null
   })
-  // 2026-10-14 取票中继兜底（真机异网破案：点卡"源设备不在线"根因——取票只走
-  // 直推）。同一条帧内 HTTP，响应体的 reply（票据）一并带回。
+  // 2026-10-14 取票中继兜底（历史注：真机异网破案——控制消息只走直推的根修）。
+  // 取票链已于 2026-11-12 删除；这条 reply 通道现在的用户是分享权限管理
+  // （share-admin 经 p2pDeliverWithReply 读同步回包）。
   setRelayDeliverReply(async (accountDid, envelope, preferDevice) => relayDeliverOnce(accountDid, envelope, preferDevice))
+  // 2026-11-11 对账（/p2p/sync/digest|index|batch）的 vnet 隧道兜底：PC 切 vnet
+  // 传输模式后 p2p 数据面只绑 127.0.0.1:9100，手机直连必败 → 设备群 task-share
+  // 卡拉不到（任务卡列表空）。libvnet 通道是唯一活路（8321 mux 的 PC 侧
+  // relay_provider_start 已于 2026-11-06 退场为空壳，中继腿永远超时，不再兜底）。
+  // ensure 走**异步桥**（libvnet 注册重试在 native 线程，同步桥会冻住 WebView），
+  // 缓存 30s 减少注册往返；取不到口 → null（对账下一拍自愈重试）。
+  setVnetP2pTunnel((deviceDid) => ensureSyncTunnelFor(deviceDid))
 }
+
+/** 设备隧道端口映射缓存（`device|targetPort` → {localPort, at}）。30s 内复用；
+ *  下一拍 ensure 自愈重建（灭屏僵尸防御在 Java 侧）。 */
+const SYNC_TUNNEL_TTL_MS = 30_000
+const syncTunnelCache = new Map<string, { localPort: number; at: number }>()
+
+/** 本机→对端某端口：常用端口（对账/RDP；分享入口走 15200 的 VNETP 身份口）。 */
+export const DEVICE_PORT_SYNC = 9100
+export const DEVICE_PORT_RDP = 3389
+/**
+ * 设备隧道直入分享网关的口（2026-11-13 统一到 24011 public_router）。
+ *
+ * 演变：2026-11-12 手机走 15200（VNETP/1 身份口，免 mt）；但 11-13 干净 URL
+ * 改造后，**15200 的路由仍是老挂载语义**（`/dsh/` 会 302 到
+ * `/gw/<shareId>/app/`），而 24011（device-origin viewer / public_router 的
+ * Host 分发）直接服务 `/<shareAlias>/...`（真机对照：笔记本 24011 正常、
+ * 手机 15200 得到 /gw/ 老 URL）。三端统一 → 手机也走 24011。
+ *
+ * 24011 按 `Host: <deviceAlias>.localhost` 分发并直接出应用；
+ * `/dsh/api/...` 实测 200（含 session/modelCatalog）。VNETP 15200 保留兼容。
+ */
+export const DEVICE_PORT_VIEWER = 24011
+export const DEVICE_PORT_VNETP = 15200
+
+/**
+ * 设备域查看端固定本地口（2026-11-12 用户定调回归原架构：三端同一个干净链接）。
+ * 每个查看端给「对端设备的 15200」开一条**固定口**隧道；干净 URL
+ * `http://<deviceAlias>.localhost:<口>/<shareAlias>/` 骑在这条隧道上——
+ * 口永不变 ⇒ WebView 按 URL 缓存钉死死口的问题从根上消失（探活补丁随之删除）。
+ * 选 23912 而非 PC/笔记本的 23911：手机 app 自己把 23911 占了（MainActivity
+ * DSH_LOCAL_ORIGIN——应用内 DSH 浏览器的固定 origin），真机实测 bind 冲突。
+ */
+export const DEVICE_VIEWER_LOCAL_PORT = 23912
+
+/** 异步 ensure 的回调序号（window 临时回调名，用完即删）。 */
+let syncTunnelCbSeq = 0
+
+/** 异步桥单次等待上限：libvnet Connection 构造同步做 relay 注册重试（5 次
+ *  × 3s ACK + 退避）+ STUN ≈ 30s——vnet 侧修好前按最坏预算等，到点放弃
+ *  （结果回调迟到就丢弃，下一拍重试）。 */
+const SYNC_TUNNEL_ENSURE_TIMEOUT_MS = 35_000
+
+/**
+ * 确保「本机 → deviceDid:targetPort」有一个本地回环口，返回该口。
+ *
+ * 一条设备级 vnet 连接 + 每端口一条 add_forward（Java 侧 P2pSyncTunnel 管）。
+ * · 动态口模式（默认，聊天/对账 9100 等）：本地口由 Java 从 25910 起自动分配，
+ *   这里不写死端口——写死会和"同时接 DSH 与 RDP"打架（2026-11-11 单隧道实现
+ *   踩过：两端口抢同一口必失败）。
+ * · 固定口模式（opts.localPort，设备域查看端 15200→23911）：口永不变，URL 稳定
+ *   ⇒ 跳过 JS 缓存（省一层状态），幂等正确性由 Java probeLocal 保证（死口自动
+ *   evict+原口重建）。
+ */
+async function ensureDeviceForward(
+  deviceDid: string,
+  targetPort: number,
+  opts?: { localPort?: number },
+): Promise<number | null> {
+  const fixed = opts?.localPort ?? 0
+  const key = `${deviceDid}|${targetPort}`
+  if (fixed <= 0) {
+    const hit = syncTunnelCache.get(key)
+    if (hit && Date.now() - hit.at < SYNC_TUNNEL_TTL_MS) return hit.localPort
+  }
+  const id = tunnelIdentity()
+  if (!id) return null
+  // 异步桥（p2pTunnelEnsureAsync）：同步版会冻住 JS 线程（libvnet 注册重试
+  // 在调用线程跑 ~30s），真机事故实证——必须走后台线程 + 回调。
+  const shell = (window as unknown as {
+    MycoShell?: { p2pTunnelEnsureAsync?: (callbackJs: string, json: string) => void }
+  }).MycoShell
+  if (!shell || typeof shell.p2pTunnelEnsureAsync !== 'function') return null
+  // 起隧道前必须让 libvnet 拿到本机身份：PC 侧 MYCO_PEER_IDENTITY=1 后，未认证
+  // 的入站流一律 AUTH_REQUIRED 拒绝；不注入的表现就是"回环口能建、请求发出去
+  // 没下文"（10s 读超时 / unexpected end of stream）。见 vnet-identity.ts。
+  ensureVnetIdentity()
+  return new Promise<number | null>((resolve) => {
+    let settled = false
+    const finish = (port: number | null): void => {
+      if (settled) return
+      settled = true
+      try { delete (window as unknown as Record<string, unknown>)[cbName] } catch { /* ignore */ }
+      if (port && port > 0) {
+        syncTunnelCache.set(key, { localPort: port, at: Date.now() })
+        resolve(port)
+      } else {
+        console.log(`[p2p-sync] 设备隧道 ensure 失败（…${deviceDid.slice(-4)}:${targetPort}）`)
+        resolve(null)
+      }
+    }
+    const cbName = `__mycoSyncTunnelCb${++syncTunnelCbSeq}`
+    ;(window as unknown as Record<string, unknown>)[cbName] = (r: { ok?: boolean; localPort?: number }) => {
+      finish(r && r.ok === true && typeof r.localPort === 'number' ? r.localPort : null)
+    }
+    try {
+      // 必须**带接收者**调用：`const f = shell.p2pTunnelEnsureAsync; f(...)` 在
+      // Android WebView 上会抛 "Java bridge method can't be invoked on a
+      // non-injected object"（2026-11-11 真机实测，与本仓 task-open 那条
+      // openInBrowser 解绑坑同源）。解绑后 catch 里直接 finish(null)，界面上只看到
+      // "vnet 隧道 ensure 失败"，native 侧一行日志都没有——正是这个坑。
+      shell.p2pTunnelEnsureAsync!(cbName, JSON.stringify({
+        targetDevice: deviceDid,
+        targetPort,
+        // localPort>0 = 固定口（设备域查看端）；不传 = Java 自动分配（25910 起）
+        ...(fixed > 0 ? { localPort: fixed } : {}),
+        device: id.device,
+      }))
+    } catch {
+      finish(null)
+      return
+    }
+    setTimeout(() => finish(null), SYNC_TUNNEL_ENSURE_TIMEOUT_MS)
+  })
+}
+
+/** 对账专用：本机 → 对端 p2p 数据面(9100)。 */
+async function ensureSyncTunnelFor(deviceDid: string): Promise<number | null> {
+  return ensureDeviceForward(deviceDid, DEVICE_PORT_SYNC)
+}
+
+/**
+ * DSH 分享入口专用（2026-11-12）：本机 → 对端 **VNETP 身份口 15200**，走
+ * 设备域查看端固定口 23911。经此口的 HTTP 请求由网关按隧道对端 DID 认证
+ * （免 mt / 免客户端断言）。失败返回 null（调用方如实报「连不上源设备」）。
+ */
+export async function ensureShareEntryForwardFor(deviceDid: string): Promise<number | null> {
+  // 2026-11-13：三端统一走 24011（public_router Host 分发，干净路由直出）；
+  // 15200 的 VNETP 路由仍是老挂载（/dsh/ → 302 /gw/<id>/app/），不再作为入口。
+  return ensureDeviceForward(deviceDid, DEVICE_PORT_VIEWER, { localPort: DEVICE_VIEWER_LOCAL_PORT })
+}
+
+/**
+ * RDP 专用：本机 → 对端 3389，并把拿到的本地口落进 `myco.vnetForwards`，
+ * 这样 `rdpStatus()/pickRdpForward()` 立刻能给出 `127.0.0.1:<port>`。
+ *
+ * 2026-11-11 真案：卡片里写死的 `localPort:23389` 是 **PC 侧**口，手机上没有监听
+ * ——点卡只能弹"请在远程桌面 App 里连接"加一句"自动复制失败"。现在本地口由设备
+ * 隧道自动分配（25910 起），必须回写才认得到。
+ */
+export async function ensureRdpForwardFor(deviceDid: string, preferLocalPort?: number): Promise<number | null> {
+  // 固定口优先（2026-11-12 真机）：RDP 的本地口若每次重建都变（25910 起自动分配），
+  // 远程桌面 App 里存好的连接（127.0.0.1:23389）就永远指向死口——真机实测卡上写
+  // 23389、隧道却给 25912，用户点开 App 只能连旧的死口。卡的 `localPort` 就是
+  // 消费方该用的固定口（与 DSH 23911 同构：非 HTTP 每 (device,service) 固定本地口）。
+  const fixed = typeof preferLocalPort === 'number' && preferLocalPort > 0 ? preferLocalPort : 0
+  const lp = await ensureDeviceForward(deviceDid, DEVICE_PORT_RDP, fixed > 0 ? { localPort: fixed } : undefined)
+  // 2026-11-13 单一 owner 立法（真机 RED：RDP「反复失效」根因）：
+  // **不得**把 mf 的转发回写 `myco.vnetForwards`——那张表是 legacy
+  // tunnel-service 的恢复源（bootVnetForwards 每次启动逐条 startForward →
+  // Java ARM 抢绑 23389）。回写=每次点卡都给下次重启埋一颗抢口雷：
+  // legacy 数据面（rc=4 回落那套）赢了绑定就是黑洞。状态/地址消费方
+  // 一律读卡上的固定口（env.localPort=23389）或 mf 的 state()。
+  return lp
+}
+
 
 /**
  * 中继投递一次（定向源设备优先），成功返回响应体对象（含 reply），失败 null。
@@ -460,10 +525,17 @@ async function chatRelayPost(
     const tReq = Date.now()
     const resp = await httpOverTunnel(ent.session, req, { timeoutMs: 6000, host: '127.0.0.1', keepAlive: true })
     console.log('[chat-relay] ' + (reused ? '复用' : '新建') + ' POST ' + (Date.now() - tReq) + 'ms status=' + resp.status)
-    if (resp.status !== 200) throw new Error(`HTTP ${resp.status}`)
+    if (resp.status !== 200) {
+      // 2026-11-11 取证（DSH协议应用 要求）：失败分支记 status/content-type/
+      // content-encoding/body 头 200 字节（hex + utf8 双份）——区分"拿到 body
+      // 但解析挂了" vs "隧道层没响应"，定 chat 是否还有中继腿可走。
+      console.log('[chat-relay-forensic] ' + relayForensicOf(resp, req.path))
+      throw new Error(`HTTP ${resp.status}`)
+    }
     try {
       return JSON.parse(resp.body) as Record<string, unknown>
     } catch {
+      console.log('[chat-relay-forensic] parse-fail ' + relayForensicOf(resp, req.path))
       return null
     }
   } catch {
@@ -472,13 +544,35 @@ async function chatRelayPost(
   }
 }
 
-async function relayDeliverOnce(
-  accountDid: string,
+/** 2026-11-11 中继腿失败取证行（DSH协议应用 要求）：status / content-type /
+ *  content-encoding / body 头 200 字节的 hex + utf8 双份。纯函数（可单测）。 */
+export function relayForensicOf(
+  resp: { status: number; headers: Record<string, string>; body: string },
+  path: string,
+): string {
+  const head = (resp.body || '').slice(0, 200)
+  let hex = ''
+  for (let i = 0; i < head.length; i++) {
+    hex += head.charCodeAt(i).toString(16).padStart(2, '0')
+  }
+  const h = resp.headers || {}
+  return JSON.stringify({
+    path,
+    status: resp.status,
+    ct: h['content-type'] || h['Content-Type'] || '',
+    ce: h['content-encoding'] || h['Content-Encoding'] || '',
+    bodyLen: (resp.body || '').length,
+    utf8: head,
+    hex: hex.slice(0, 400),
+  })
+}
+
+async function relayDeliverOnce(  accountDid: string,
   envelope: Record<string, unknown>,
   preferDevice?: string,
   opts: { record?: boolean } = {},
 ): Promise<Record<string, unknown> | null> {
-  // 默认记（取票路径）；聊天投递显式关掉（见 wireChatRelayFallback 注释）。
+  // 默认记留痕（share-admin 的同步回包路径）；聊天投递显式关掉（见 wireChatRelayFallback 注释）。
   const record = opts.record !== false
   const note = (f: ReturnType<typeof relayFailFromNative>): void => {
     if (record) noteRelayFail(f)
@@ -554,13 +648,9 @@ export type OpenSummary =
   | { ok: true; url: string; localPort: number; ms: number; via: string }
   | { ok: false; message: string; reason?: string; attempts?: number }
 
-/** 开卡进度回调（UI 用它把"正在重试…"摆到卡片下面；不传就静默重试）。 */
+/** 开卡进度回调（保留给 openTaskShare 的既有调用方签名；VNETP 路径无中间进度）。 */
 export type OpenNoteFn = (text: string) => void
 export type OpenTaskShareOpts = { onNote?: OpenNoteFn }
-
-/** 「在浏览器中打开」用的 openWebView 覆盖（见 resolveShareUrlForBrowser；
- *  单飞护栏下无并发）。 */
-let webViewOverride: ((url: string, title: string) => boolean) | null = null
 
 // ══════════════════ 反向连接装配（2026-10-09：PC 主动连手机） ══════════════════
 //
@@ -596,21 +686,19 @@ export function reverseWantAddrs(ipv6: string[], listenPort: number, wantPort = 
   }
 }
 
-// ══ 会话期 addrs 刷新（2026-10-10 断线重连修复：IPv6 前缀轮换） ══
+// ══ 会话期 addrs 状态（2026-10-10 断线重连修复：IPv6 前缀轮换） ══
 //
 // 事实链：电信移动网络 IPv6 前缀一天轮换多次（471→473→…）；presence 的 addrs
-// 原本只在开卡（wrappedStart）时上报一次 → 轮换后服务器上的是过期地址 →
-// PC 拨旧地址必超时 → "刚才还通，后来又断了"。会话活着期间每 5s 重报最新
-// IPv6（经 presenceQueue 与 stopTaskShare 的清除严格有序）；PC 侧拨号循环
-// 1s 一拍重查 presence（无缓存）→ 新地址最迟 ~6s 进入拨号清单，已断的连接
-// 由浏览器重连驱动自然恢复。
-/** 会话监听端口（wrappedStart 记下——刷新 addrs 要带它；proxy 没有 localPort getter）。 */
+// 若只报一次 → 轮换后服务器上的是过期地址 → PC 拨旧地址必超时 → "刚才还通，
+// 后来又断了"。`refreshSessionAddrsNow`（反向桥 onHoldTimeout / 网络切换回调触发）
+// 与全时 `refreshPresenceAddrsNow` 共用这组状态重报最新 IPv6（经 presenceQueue
+// 与 stopTaskShare 的清除严格有序）。2026-11-12 取票链删除后分享会话不再置
+// `live`，这组状态由全时刷新继续维护（无会话时报地址、不带 wantReverse）。
+/** 会话监听端口（有分享会话时记录；无会话 = null → 上报不带 wantReverse）。 */
 let sessionListenPort: number | null = null
-/** 会话期 addrs 刷新循环句柄。 */
-let addrsRefreshTimer: ReturnType<typeof setInterval> | null = null
 /** 上次上报的 IPv6 集合指纹（轮换检测/日志）。 */
 let lastReportedIpv6Key = ''
-/** addrs 刷新自节流（5s 周期 + 事件触发的立即刷新共用，2s 内不重复入队）。 */
+/** addrs 刷新自节流（事件触发的立即刷新共用，2s 内不重复入队）。 */
 let lastAddrsRefreshAt = 0
 
 /** 立即重报一次最新 addrs（会话活着才做；节流 2s）。 */
@@ -632,152 +720,44 @@ function refreshSessionAddrsNow(): void {
   presenceQueue(() => registerPresence('myco-phone', 'active', reverseWantAddrs(ipv6, port)))
 }
 
-/** 起会话期 addrs 刷新循环（幂等）。 */
-function startAddrsRefresh(): void {
-  stopAddrsRefresh()
-  addrsRefreshTimer = setInterval(() => {
-    if (!live) {
-      stopAddrsRefresh()
-      return
-    }
-    refreshSessionAddrsNow()
-  }, 5_000)
-}
-
-/** 停会话期 addrs 刷新循环（stopTaskShare 调；幂等）。 */
-function stopAddrsRefresh(): void {
-  if (addrsRefreshTimer !== null) {
-    clearInterval(addrsRefreshTimer)
-    addrsRefreshTimer = null
-  }
-}
-
 /**
  * 「点卡就进」的生产入口。
  *
  * 双击/连点护栏（真机"双击后黑屏"排查项）：同一时刻只允许一条开卡在途——
- * 否则两次并发 `openTaskShare` 会互相 `stopTaskShare` 拆对方的端口/隧道，
- * 再叠出两个 ShareWebActivity。第二次点击直接复用第一次的 Promise。
- * 2026-10-10：护栏带 30s 超时自清（链路挂起不再永久挡门，见 openFlight 注释）。
+ * 否则两次并发 `openTaskShare` 会互相 `stopTaskShare` 拆对方的会话，再叠出两个
+ * ShareWebActivity。第二次点击直接复用第一次的 Promise。护栏带超时自清
+ * （链路挂起不再永久挡门，见 openFlight 注释）。
+ *
+ * 2026-11-12：取票重试外壳（retryTransient/旧卡自愈）随取票链删除——VNETP
+ * ensure 自带 30s 口子缓存 + 下一拍自愈重建，外层重试只会把同一个「连不上」
+ * 再说一遍。失败一律一次收摊、如实报因。
  *
  * @param raw 任务卡 payload（含 `shareId` + `sourceDevice`；好友任务卡没有这两项 → 拒绝）
  */
 export function openTaskShare(raw: Record<string, unknown>, opts: OpenTaskShareOpts = {}): Promise<OpenSummary> {
+  void opts // 保留签名兼容（FriendsPanel 传 onNote）；VNETP 路径无中间进度可报
   return openFlight(
-    () => openTaskShareWithRetry(raw, opts),
+    () => openTaskShareOnce(raw),
     () => {
-      // 超时复位：代际 +1（迟到开卡经 shouldAbort 自我了断）+ 收掉半截会话
+      // 超时复位：代际 +1 + 收掉半截会话（迟到开卡据此自我了断）
       openGen += 1
       stopTaskShare()
-      console.log('[dsh-open] 开卡 30s 未竟——已复位（可再点一次）')
-      return { ok: false, message: '打开超时（超过 30 秒），已重置——请再点一次试试', reason: 'offline' }
+      console.log('[dsh-open] 开卡 75s 未竟——已复位（可再点一次）')
+      return { ok: false, message: '打开超时（超过 75 秒），已重置——请再点一次试试', reason: 'offline' }
     },
   )
 }
 
 /**
- * 取票**带自动重试**的外壳（2026-10-12，用户报"显示在线却说设备不在线"那一轮）。
+ * 打开一张分享卡（单趟，无重试外壳）。
  *
- * 为什么在这层重试而不是在 dsh-open 内部重发一次请求：一次瞬时失败的物理原因有四种
- *   · 源设备进程刚重启（P2P 监听 + 云端中继注册一起消失几秒）
- *   · 中继里的注册还没回来（REGISTER 是长连接 + 30s 心跳）
- *   · 手机在切网（WiFi↔蜂窝，旧候选全废）
- *   · 反向隧道池还没热身
- * 这四种都要求**重建整条装配**（候选表/桥/本地端口/在飞请求），所以整趟 `…Once` 重跑，
- * 而不是只把某一条腿的 fetch 再发一遍。非瞬时失败（拒绝/过期/入口坏了）一次就收摊。
+ * 只有两条路：①复用仍活着的分享页；②设备隧道 VNETP 直入（同账号设备卡）。
+ * 其余情况（跨账号卡 / 隧道拿不到口 / 开页失败）一次收摊、如实报因——
+ * **绝不回落 mt**（mt 会过期、13911 裸网关无凭证必拒，0.3.315 真机定案）。
  */
-async function openTaskShareWithRetry(raw: Record<string, unknown>, opts: OpenTaskShareOpts): Promise<OpenSummary> {
-  const card = shareCardOf(raw)
-  const deviceName = card?.sourceDeviceName
-  const total = OPEN_RETRY_DELAYS_MS.length + 1
-  const { value: firstValue, attempts } = await retryTransient<OpenSummary>(
-    (attempt) => openTaskShareOnce(raw).then((r) => {
-      if (!r.ok) {
-        console.log(`[dsh-open] 第 ${attempt} 趟失败（${r.reason ?? '?'}：${r.message}）`)
-      }
-      return r
-    }),
-    {
-      delays: OPEN_RETRY_DELAYS_MS,
-      isTransient: (r) => (r.ok ? false : isTransientOpenFailure(r.reason)),
-      onRetry: (next, totalAttempts) => {
-        opts.onNote?.(retryNote(deviceName, next, totalAttempts))
-        console.log(`[dsh-open] 距下一趟（第 ${next}/${totalAttempts} 次）等 ${OPEN_RETRY_DELAYS_MS[next - 2]}ms`)
-      },
-    },
-  )
-  let last = firstValue
-  if (last.ok) return last
-  const { state: source, rows } = await sourceStateOf(card?.sourceDevice, card?.sourceAccount)
-  // ①-自愈（2026-10-12）：卡上的来源设备**已不在名册**（换过绑定/改名）→ 换一台在线的
-  // 同伴设备去问一遍。取票请求本身不带目标，托管的设备会应答、不托管的回"已经不在了"
-  // ——谁托管谁应答。只在"记录确已失效"这条路走，正常路径一个字不改。
-  if (source === 'gone' && isTransientOpenFailure(last.reason) && card) {
-    const myDev = tunnelIdentity()?.device ?? ''
-    for (const t of pickHealTargets(rows, card.sourceDevice, myDev)) {
-      const label = t.name && t.name.trim() ? t.name.trim() : `…${t.did.slice(-4)}`
-      opts.onNote?.(`原来源设备记录已失效，正在改问「${label}」…`)
-      console.log(`[dsh-open] 旧卡自愈：来源 ${card.sourceDevice.slice(-6)} 不在名册 → 改问 ${t.did.slice(-6)}`)
-      const healed = await openTaskShareOnce(withSourceDevice(raw, t.did, t.name))
-      if (healed.ok) return healed
-      last = healed
-    }
-  }
-  return {
-    ok: false,
-    reason: last.reason,
-    attempts,
-    message: finalOpenNote({ deviceName, message: last.message, reason: last.reason, attempts: Math.min(attempts, total), source }),
-  }
-}
-
-/** 名册缓存（15s）：只在失败收摊时查一次，正常路径零额外往返。 */
-let rosterAt = 0
-let rosterRows: { did: string; name?: string; online?: boolean; revoked?: boolean }[] | null = null
-
-/**
- * 源设备在**名册**里的状态（收摊文案 + 旧卡自愈用，2026-10-12）。
- *
- * 为什么只对"我自己账号的设备"下判断：名册（`/presence/by-root`）按**根账号**查，
- * 好友分享的卡不在我的名册里——那时"没查到"只说明我管不着，不说明记录失效，所以
- * 一律回 `unknown`（文案退回"暂时连不上"，自愈也不走），绝不乱下"已失效"的结论。
- *
- * 2026-10-12 二修（真机 E2E 抓的）：账号比较串不能只用 `getRootIdentity()`——
- * **成员设备**（设备钥+委任状路径，本机 DD9F 就是）的 vault 里没有 rootDid，返回
- * null → 全部判 unknown → 自愈永远不触发。改用与 `tunnelIdentity().account` 同源
- * 的回退链（root vault → attest 的 rootDid），并落一行判定日志（尾 4 对齐，方便
- * 对时间线；这行日志就是上一轮"自愈没触发"排障时缺失的眼睛）。
- */
-async function sourceStateOf(
-  deviceDid: string | undefined,
-  sourceAccount: string | undefined,
-): Promise<{ state: SourceDeviceState; rows: { did: string; name?: string; online?: boolean; revoked?: boolean }[] }> {
-  const did = (deviceDid || '').trim()
-  const me = getRootIdentity() || getAttestation()?.rootDid || ''
-  const src = (sourceAccount || '').trim()
-  if (!did || !me || src !== me) {
-    console.log(`[dsh-open] 名册判定跳过：me=${me ? '…' + me.slice(-4) : '无'} source=${src ? '…' + src.slice(-4) : '无'}`)
-    return { state: 'unknown', rows: [] }
-  }
-  try {
-    const now = Date.now()
-    if (!rosterRows || now - rosterAt > 15_000) {
-      rosterRows = await fetchPresenceByRoot(me)
-      rosterAt = now
-    }
-    const rows = rosterRows || []
-    const row = rows.find((r) => r.did === did)
-    const state: SourceDeviceState = !row ? 'gone' : row.online ? 'online' : 'offline'
-    console.log(`[dsh-open] 名册判定：…${did.slice(-4)}=${state}（名册 ${rows.length} 台，在线 ${rows.filter((r) => r.online).length}）`)
-    return { state, rows }
-  } catch (e) {
-    console.log(`[dsh-open] 名册查询失败（${e instanceof Error ? e.message : String(e)}）→ unknown`)
-    return { state: 'unknown', rows: [] }
-  }
-}
-
 async function openTaskShareOnce(raw: Record<string, unknown>): Promise<OpenSummary> {
-  // 2026-10-20（用户追加指标）：返回列表后再点同一张卡 → 直接复用仍活着的分享页（<1s）。
+  // ① 复用快径（2026-10-20 用户指标）：返回列表后再点同一张卡 → 直接复用仍活着的
+  //    分享页（<1s）。复用是纯优化：未命中/异常继续走 ②。
   try {
     const card = (raw && (raw.card || raw)) as Record<string, unknown>
     const shareId = typeof card.shareId === 'string' ? card.shareId : ''
@@ -786,30 +766,22 @@ async function openTaskShareOnce(raw: Record<string, unknown>): Promise<OpenSumm
       const reuseRes = bridge.reuseSharePage(shareId)
       if (reuseRes === 'OK') {
         console.log('[dsh-open] 复用已打开的分享页（返回再开）')
-        console.log('[dsh-open] 状态=open 已连接源设备（复用页面）')
         return { ok: true, url: 'reused', localPort: 0, ms: 0, via: 'reuse' }
       }
-      console.log('[dsh-open] 复用未命中: ' + reuseRes + '（走完整打开流程）')
-      if (reuseRes === 'STALE') console.log('[dsh-open] 旧页面隧道已死 → 走全新打开重建隧道')
+      if (reuseRes === 'STALE') console.log('[dsh-open] 旧页面隧道已死 → 走 VNETP 直入重建')
     }
   } catch {
-    /* 复用是纯优化：失败继续走完整打开流程 */
+    /* 复用未命中：继续 */
   }
-  const gen = openGen
   const card = shareCardOf(raw)
   if (!card) {
     return { ok: false, message: '这张卡没有可打开的分享信息（可以让对方重新分享一次）', reason: 'internal' }
   }
-  const gap = hasNativeProxy() ? null : nativeProxyGap()
-  if (gap) return { ok: false, message: gap, reason: 'unsupported' }
 
-  // 这一趟取票的中继腿失败留痕清空（每趟一份，收摊文案取"第一次"= 源设备那台）。
-  clearRelayFail()
-
-  // 身份就绪**等一下**再开卡（2026-10-16 真案）：app 从后台冻结被唤醒时 JS 已恢复但
-  // 身份还没加载完，此刻取票的签名过不了源设备那道闸——PC 侧连审计都没有（请求没走到
-  // 签票逻辑），用户只看到"在线但连不上"，四趟重试白等 40 多秒。等最多 6 秒（实测解冻
-  // 后约 5 秒就绪），比失败重试便宜得多；真等不到再如实说"身份没就绪"，不糊弄成"设备不在线"。
+  // ② VNETP 直入（2026-11-12 真机 03:00 真案起为**唯一**路径）：设备隧道 15200
+  //    （VNETP/1 DID 认证口）——网关按隧道对端 DID 认证，免取票/免 mt/免客户端断言。
+  //    先等身份就绪（冷启动/后台解冻时 JS 先恢复、身份后加载；与 ensure 同一份
+  //    签名材料），再判定账号归属：跨账号分享明确不支持（VNETP 口只对本账号设备放行）。
   const id = tunnelIdentity() ?? (await waitForIdentityReady())
   if (!id) {
     return {
@@ -818,143 +790,66 @@ async function openTaskShareOnce(raw: Record<string, unknown>): Promise<OpenSumm
       reason: 'unsupported',
     }
   }
-
-  // 桥先于一切 presence 上报建好（2026-10-10 openTaskShare 死锁修复）：PC 拨号
-  // 循环看到 wantReverse 就可能立刻拨过来，桥不存在 = 反向入站无人处理 = 取票
-  // fetch（走本地监听 → 桥 → 反向池）挂死 = openTaskShare 卡满 30s。原先桥在
-  // openSharedTask 之前才建（下方 shareBridgeFor 行），现在提前到这里 + 冷启动
-  // 预创建（installTaskShare）双保险；shareBridgeFor 幂等，同设备不重建。
-  ensureBridgeFor(card.sourceDevice)
+  const srcAcc = (card.sourceAccount || '').trim()
+  if (srcAcc !== '' && srcAcc !== id.account) {
+    console.log(`[dsh-open] 跨账号分享卡（me=…${id.account.slice(-4)} source=…${srcAcc.slice(-4)}）→ 不支持`)
+    return {
+      ok: false,
+      message: '暂只支持本账号设备的分享入口（跨账号分享请从 PC 端打开）',
+      reason: 'unsupported',
+    }
+  }
+  // 记下最近源设备（冷启动时 installTaskShare 据此预创建反向桥——入向 vnet 的闸门对齐）
   persistLastShareSourceDevice(card.sourceDevice)
-
-  // 上一次的会话先收掉（本地端口保留——`stopTaskShare` 头注释，origin 稳定是
-  // "第二次打开还能落回分享会话"的前提）。keepPresence：不要在这次收尾里清
-  // wantReverse——下面 wrappedStart 马上重报（端口不变），中间清一次会让 PC
-  // 拨号循环撤池一拍（饥饿窗口），见 stopTaskShare 尾注释。
-  stopTaskShare({ keepPresence: true })
-
-  // 反向桥：原生 tap ↔ TunnelProxy 之间的嗅探/池/胶合层（浏览器连接走直连照旧，
-  // PC 拨来的 /p2p/tunnel 入站走服务端角色；degraded 时浏览器连接改扣等反向隧道）。
-  // 2026-10-09：经 `sharedTap` 单槽取桥——旧桥不再与新桥双投原生事件（二开
-  // 会话为空的根因之一）；每次开卡从 auto 起步，上次 degraded 翻成的 reverse
-  // 不带到新会话。
-  const bridge = shareBridgeFor(card.sourceDevice)
-  bridge.setMode('auto')
-  let routeLogged = false
-  const logRouteOnce = (sourceReachable: boolean): void => {
-    if (routeLogged) return
-    routeLogged = true
-    const ipv6 = shellTunnelIpv6(shellTunnelState())
-    const d: RouteDecision = decideTunnelRoute({ sameSubnet: false, sourceReachable, selfInbound: ipv6.length > 0 }, card.sourceDeviceName ?? '对方设备')
-    console.log(`[dsh-open] 连接决策：${d.mode}${d.mode === 'none' ? `（${d.message}）` : `（${d.why}）`}`)
-  }
-  const wrappedStart = async (): Promise<number> => {
-    const port = await startLocalListener()
-    // 上报本机可达地址（反向连接的寻址源 + 意愿标记；服务器 addrs 粘性，离开时显式清。
-    // ⚠️ 必须经 presenceQueue 排队——与 stopTaskShare 的清除严格有序，乱序=意愿被抹=反向饥饿）
-    const ipv6 = shellTunnelIpv6(shellTunnelState())
-    sessionListenPort = port
-    lastReportedIpv6Key = ipv6.join(',')
-    lastAddrsRefreshAt = Date.now()
-    if (ipv6.length > 0) {
-      presenceQueue(() => registerPresence('myco-phone', 'active', reverseWantAddrs(ipv6, port)))
-    }
-    return port
-  }
-  const deps = makeOpenTaskDeps({
-    sendControl: makeSendControl(card),
-    bridge,
-    startListener: wrappedStart,
-    // 在途护栏超时复位后，这趟开卡若还在跑：在开 WebView 前自我了断（gen 已变）
-    shouldAbort: () => gen !== openGen,
-    // 2026-10-12「在浏览器中打开」：调用方注入 no-op 收地址（隧道照建、WebView 不开）
-    ...(webViewOverride ? { openWebView: webViewOverride } : {}),
-    // 预热全灭=直连大概率不通：开页面前就把桥翻 reverse——入口导航的首条
-    // 连接改扣住等反向隧道，不再按 auto 走直连死在不可达候选上（ERR_EMPTY_RESPONSE）
-    onDirectUnlikely: () => {
-      logRouteOnce(false)
-      bridge.setMode('reverse')
-    },
-    onStatus: (s) => {
-      if (s.state === 'degraded') {
-        logRouteOnce(false)
-        bridge.setMode('reverse')
-      } else if (s.state === 'open') {
-        logRouteOnce(true)
-      }
-    },
-  })
-  let res: OpenTaskResult
+  const t0 = Date.now()
+  let vport: number | null = null
   try {
-    res = await openSharedTask(card, deps)
+    vport = await ensureShareEntryForwardFor(card.sourceDevice)
   } catch (e) {
-    return { ok: false, message: e instanceof Error ? e.message : '打不开这个任务，稍后再试', reason: 'internal' }
+    console.log(`[dsh-open] VNETP ensure 异常（${e instanceof Error ? e.message : String(e)}）`)
+    vport = null
   }
-  // reason 必须透上去：上层据此决定"自动重试"还是"原样收摊"（见 open-retry.ts）
-  if (!res.ok) {
-    // 2026-10-20 僵尸卡自愈：源设备明确说"分享已不存在" → 删除本地任务卡，不再重试。
-    if (res.reason === 'gone') {
-      try {
-        const removed = removeTasksByShareId(card.shareId)
-        if (removed > 0) {
-          console.log(`[dsh-open] 僵尸卡已自动清理 shareId=${card.shareId}（${removed} 张）`)
-          // 2026-10-21 用户反馈：卡消失得悄无声息 → 弹提示（O07）
-          try {
-            window.dispatchEvent(new CustomEvent('myco:toast', {
-              detail: { text: '这个分享已停止，卡片已自动清理' },
-            }))
-          } catch {
-            /* 非浏览器环境（测试）忽略 */
-          }
-        }
-      } catch {
-        /* 清理失败不影响提示 */
-      }
-      return { ok: false, message: '这个分享已经停止（卡片已自动清理），不用再试', reason: 'gone' }
+  if (!vport || vport <= 0) {
+    console.log(`[dsh-open] VNETP ensure 失败（…${card.sourceDevice.slice(-4)}:15200）→ 如实报 unreachable（不回落 mt）`)
+    return {
+      ok: false,
+      message: '连不上源设备（设备隧道不可用），请确认对方设备在线后重试',
+      reason: 'unreachable',
     }
-    return { ok: false, message: res.message, reason: res.reason }
   }
-  live = { proxy: res.proxy, card, bridge }
-  // 会话期 addrs 刷新（IPv6 前缀轮换自愈）：每 5s 重报最新地址，PC 1s 一拍
-  // 重查 → 断线后新地址 ~6s 内进入拨号清单。
-  startAddrsRefresh()
-  // 让"页面在跑"这件事对 UI 可见（重连时状态会翻转；不带 addrs=粘性不动意愿标记，但同样排队保序）
-  presenceQueue(() => registerPresence('myco-phone'))
-  // connMode 指示器：不写 localStorage（跨 WebView 不同源，主 app file:// ≠ DSH 页 http://127.0.0.1:port）
-  // 改由 dsh-open.ts 在 URL fragment 传递 #mycoConn=relay|direct（与 PC 端同款）
-  return { ok: true, url: res.url, localPort: res.localPort, ms: res.ms, via: res.entry.via }
-}
-
-// ══════ R10 预取票（2026-10-20）══════
-// 任务列表可见时后台预取入口票（中继腿）；同一张卡 60s 内只试一次，失败静默。
-const lastPrefetchAt = new Map<string, number>()
-const prefetchInflight = new Set<string>()
-let prefetchBusy = false
-export function prefetchTaskEntry(card: Record<string, unknown>): void {
-  const shareId = typeof card.shareId === 'string' ? card.shareId : ''
-  const sourceDevice = typeof card.sourceDevice === 'string' ? card.sourceDevice : ''
-  if (!shareId || !sourceDevice) return
-  const now = Date.now()
-  const last = lastPrefetchAt.get(shareId) ?? 0
-  if (now - last < 20_000) return
-  // 2026-10-20 真案：启动时多处触发（3 个 timer + visibilitychange + 列表 effect）会同时
-  // 起几十条中继隧道，把首开拖到 8s。这里全局单飞 + 同卡 in-flight 去重。
-  if (prefetchBusy || prefetchInflight.has(shareId)) return
-  lastPrefetchAt.set(shareId, now)
-  prefetchInflight.add(shareId)
-  prefetchBusy = true
-  void (async () => {
-    try {
-      const id = tunnelIdentity() ?? (await waitForIdentityReady().catch(() => null))
-      if (!id) return
-      const deps = makeOpenTaskDeps({})
-      const entry = await prefetchShareEntry(card as never, deps)
-      if (entry) console.log(`[dsh-open] 预取票成功 shareId=${shareId}（点卡时直接用）`)
-    } finally {
-      prefetchInflight.delete(shareId)
-      prefetchBusy = false
+  // 干净 URL（2026-11-12 用户定调回归原架构：三端同一个干净简单链接）：
+  // 卡上 env 带源设备的 deviceAlias/shareAlias → `http://<alias>.localhost:<vport>/<share>/`
+  // （*.localhost 解析到回环，Host 随 URL 进隧道，网关按 Host+别名表归位）。
+  // 2026-11-13：**/gw/<id>/ 回落已删除**（用户立法：链接早换了，不留旧形态）。
+  // 老卡缺坐标 → 如实说「卡片缺少源设备坐标」，让用户重收新卡，不猜 URL。
+  // 注意从 raw（原始卡面）读 env——shareCardOf 归一化只保留坐标五字段，env 会丢。
+  const envSrc = (raw && ((raw as { card?: unknown }).card || raw)) as { env?: unknown[] }
+  const env0 = (Array.isArray(envSrc.env) ? (envSrc.env || [])[0] : undefined) as
+    | { deviceAlias?: unknown; shareAlias?: unknown }
+    | undefined
+  const da = String(env0?.deviceAlias ?? '').trim()
+  const sa = String(env0?.shareAlias ?? '').trim()
+  if (!da || !sa) {
+    console.log(`[dsh-open] 卡片缺 deviceAlias/shareAlias（旧形态卡，share=${card.shareId}）→ 要求重收新卡`)
+    return {
+      ok: false,
+      message: '这张卡是旧形态（缺源设备坐标），请让源设备重新分享一次',
+      reason: 'unsupported',
     }
-  })().catch(() => undefined)
+  }
+  const vurl = `http://${da}.localhost:${vport}/${sa}/`
+  const vtitle = (card.title || card.shareId || '分享').toString()
+  const opened = openShareInWebView(vurl, vtitle)
+  if (opened !== true) {
+    console.log('[dsh-open] VNETP 直入开页失败（' + String(opened).slice(0, 80) + '）')
+    return {
+      ok: false,
+      message: '打不开分享页（原生 WebView 不可用），请重开一次 myco 应用',
+      reason: 'unsupported',
+    }
+  }
+  console.log(`[dsh-open] VNETP 直入：${vurl}（${Date.now() - t0}ms，免取票）`)
+  return { ok: true, url: vurl, localPort: vport, ms: Date.now() - t0, via: 'vnetp-direct' }
 }
 
 /** 读原生隧道快照（拿本机 IPv6 用；不可用时空串）。 */
@@ -1033,8 +928,6 @@ if (typeof window !== 'undefined') {
  * 外部入站仍有 `GET /p2p/tunnel` 首行闸（TunnelProxyServer）。
  */
 export function stopTaskShare(opts: { keepPresence?: boolean } = {}): void {
-  // 会话期 addrs 刷新先停（keepPresence 路径下新开卡的 wrappedStart 会重启它）
-  stopAddrsRefresh()
   if (!live) return
   try {
     live.proxy.stop()
@@ -1093,11 +986,6 @@ export function installTaskShare(): void {
     stop: () => stopTaskShare(),
     state: () => taskShareState(),
     canOpen: (payload: Record<string, unknown>) => !!shareCardOf(payload),
-    /** 真机取证：覆盖源设备寻址与代取端口（`null` 清除）。 */
-    debug: (o: DebugOverride | null) => {
-      setDebugOverride(o)
-      return 'ok'
-    },
     /** 真机取证：本机身份摘要。 */
     whoami: () => {
       const id = tunnelIdentity()
@@ -1135,44 +1023,6 @@ export function installTaskShare(): void {
 /** 卡片里是否带分享信息（UI 决定"点开"走哪条路）。 */
 export function isShareCard(payload: Record<string, unknown> | null | undefined): boolean {
   return !!shareCardOf(payload)
-}
-
-/**
- * 任务卡「在浏览器中打开」（2026-10-12 用户要求）：**建好隧道拿地址，但不开
- * myco 自己的 WebView**——交给系统浏览器。好处：不占用 myco 内的会话/交互
- * （用户在浏览器里看 DSH 页，myco 还能正常点别的卡），断线也只是浏览器刷新。
- *
- * 复用完整开卡链（寻址→取票→建隧道→本地口），只把最后一步 openWebView 换成
- * 捕获地址；隧道就绪后浏览器才访问得了 127.0.0.1:<port>（这就是必须先跑流程
- * 的原因）。返回 url 供调用方交给 MycoShell.openInBrowser。
- * 单飞护栏（openFlight）保证同一时刻只有一个开卡在飞 → 覆盖变量无并发竞态。
- */
-export async function resolveShareUrlForBrowser(
-  raw: Record<string, unknown>,
-): Promise<{ ok: true; url: string } | { ok: false; message: string }> {
-  let captured = ''
-  webViewOverride = (url) => {
-    captured = url
-    return true
-  }
-  try {
-    const r = await openTaskShare(raw)
-    if (r.ok && (captured || r.url)) return { ok: true, url: captured || r.url }
-    return { ok: false, message: r.ok ? '没拿到地址' : r.message }
-  } finally {
-    webViewOverride = null
-  }
-}
-
-/** 交给系统浏览器（native 白名单 http(s)）。返回 native 的 OK/ERR 文本。 */
-export function openUrlInBrowser(url: string): string {
-  const shell = (window as unknown as { MycoShell?: { openInBrowser?: (u: string) => string } }).MycoShell
-  if (!shell?.openInBrowser) return 'ERR:当前外壳不支持（旧 APK）'
-  try {
-    return shell.openInBrowser(url)
-  } catch (e) {
-    return 'ERR:' + String(e)
-  }
 }
 
 // ══ 全时 presence addrs 刷新（2026-10-18，P3：网络切换后地址不再"粘死"） ══

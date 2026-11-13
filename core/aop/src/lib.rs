@@ -1,7 +1,7 @@
 //! AOP harness — env 内嵌的 AOP(面向智能体编程)会话运行时。
 //!
 //! chat-native:不依赖 terminal-agent、不启动任何终端进程。会话权威在本模块,
-//! 事件经 env HTTP SSE(:3002/api/aop/events)以兼容 ta ObservationEvent 的
+//! 事件经 env HTTP SSE(:3002/api/labs/events)以兼容 ta ObservationEvent 的
 //! 形状广播,前端 belief-store 直接融合 → 聊天气泡渲染零改。
 //!
 //! 阶段流(参考 aop-task-designer 的 /aop 方法论):

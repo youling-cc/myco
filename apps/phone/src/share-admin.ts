@@ -152,7 +152,7 @@ function pathSegments(cwd?: string | null): string[] {
     .filter((s) => s.length > 0 && !/^[A-Za-z]:$/.test(s))
 }
 
-/** 路径 → 「父目录/项目名」短名（如 `D:\Projects\AOP\myco` → `AOP/myco`）——手机 chip 用。 */
+/** 路径 → 「父目录/项目名」短名（如 `D:\Projects\labs\myco` → `AOP/myco`）——手机 chip 用。 */
 export function projectShortName(cwd?: string | null): string {
   const parts = pathSegments(cwd)
   return parts.slice(Math.max(0, parts.length - 2)).join('/')

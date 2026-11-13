@@ -158,11 +158,16 @@ async fn delegation_notify_full_path() {
     drop(hits);
 
     // ══ 场景②：成员在列但地址不可达 → false（不 panic/不 Err = 不挡主流程） ══
+    // 2026-11-12 根因修复：场景①的 presence 行在 2.5s TTL 缓存里，②不清缓存就会
+    // 拿①的旧地址（仍在监听的 mock p2p 口）打出 2xx ——「不可达应 false」被污染
+    // （0.01s 完成、零网络日志即此特征）。场景切换必须显式回源。
+    myco_home_lib::p2p_client::presence_cache_invalidate();
     *scenario.lock().unwrap() = "deadaddr";
     let ok = myco_home_lib::p2p_client::deliver_delegation_notify(&member_did, root_did, "Fan").await;
     assert!(!ok, "地址不可达应 false（信箱兜底）");
 
     // ══ 场景③：成员离线（presence 无此设备）→ false（deliverBox 信箱兜底） ══
+    myco_home_lib::p2p_client::presence_cache_invalidate();
     *scenario.lock().unwrap() = "offline";
     let ok = myco_home_lib::p2p_client::deliver_delegation_notify(&member_did, root_did, "Fan").await;
     assert!(!ok, "成员离线应 false（信箱兜底）");

@@ -1,6 +1,6 @@
 //! myco-core — myco 基础设施库(身份/LLM 服务商/配置/共用类型)。
 //!
-//! 所有 agent(myco/aop/youling)共用的基础设施:
+//! 所有 agent(myco/labs/youling)共用的基础设施:
 //!   - identity: myco 账号注册/登录/设备管理/委任状(原 soul_* 统一为 myco 账号)
 //!   - identity_store: 密钥存储(TPM>DPAPI>明文,用户无感)
 //!   - provider: LLM 服务商管理(认知层基础设施)

@@ -859,7 +859,7 @@ unsafe extern "system" fn full_client_proc(h: isize, msg: u32, wp: usize, lp: is
     }
 }
 
-/// DWM 小圆角(用户定稿 2026-08-19):Win11 DWMWCP_ROUND(系统 ~8px),方形直角
+/// DWM 小圆角(设计定稿 2026-08-19):Win11 DWMWCP_ROUND(系统 ~8px),方形直角
 /// 配窗间缝显"排管风",圆角让每窗像独立卡片,与"个体呼吸感"一气呵成。
 /// Win10 上该属性静默无效(无代价)。
 #[cfg(target_os = "windows")]

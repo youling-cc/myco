@@ -122,7 +122,7 @@ pub fn build_claude_args_ex(resume: bool, fork: bool, resume_session: Option<&st
 ///
 /// Claude stores per-project conversation transcripts under
 /// `~/.claude/projects/<encoded-path>/`. The encoder dashes EVERY
-/// non-alphanumeric char（本机实测：`D:\Projects\AOP\myco` → `D--Projects-AOP-myco`，
+/// non-alphanumeric char（本机实测：`D:\Projects\labs\myco` → `D--Projects-AOP-myco`，
 /// 含空格/点的路径如 `D--Projects-iroot---`）——只映射 `:'\`/` 会在带空格/点的
 /// 路径上永远找不到历史 → --continue 丢失。CJK 字符按同一规则也会被 dash 掉。
 /// We only add `--continue` when such history exists — otherwise

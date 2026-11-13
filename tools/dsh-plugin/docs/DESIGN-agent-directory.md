@@ -183,3 +183,17 @@ skill 文档明确标注：
 - **v2**：清单加入对方的在线会话实时状态（对方 myco 定期推送其活跃会话列表）
 - **v3**：AI 可主动发起分享/邀请协作（不仅仅是发消息）
 - **v4**：多人任务群（一条消息路由到多个协作者）
+
+
+### 跨账号投递的 `--session`（2026-11-11）
+
+`--to did:youling:<对方DID>` 只定位"这个人"；要投到"他那个会话"必须再给会话 id：
+
+```bash
+python send.py --to did:youling:<对方DID> --session session-<对端会话id> --stdin
+```
+
+- 信封字段：`sessionId` = 对端目标会话；`fromSessionId` = 我自己的会话（对端用它拼 `reply-to-session:`）
+- 缺省 `--session` → 网关回 `sessionId-required`（不投"最近活跃"、不自动建会话）
+- 跨账号消息头为三行：`[from: 名 · ⚡插队 · 时间]` / `reply-to: <fromDid>` / `reply-to-session: session-<我方会话>`，
+  前两行由 Rust `format_chat_header` 生成（逐字同源），第三行仅跨账号追加

@@ -114,8 +114,14 @@ export interface PeerDevice {
 
 /** presence → 某账号下可直连的在线 PC 设备（排除本机、有 addrs、kind=pc）。
  *  2026-10-07：presence 表的账号/设备 did 形态与调用方传入的 did 形态可能不同
- *  （同一把钥匙四形态）——**公钥级判等**，否则直推查不到设备（消息"全挂"）。 */
-export async function peerDevicesOf(accountDid: string): Promise<PeerDevice[]> {
+ *  （同一把钥匙四形态）——**公钥级判等**，否则直推查不到设备（消息"全挂"）。
+ *  2026-11-11：`opts.includeAddrless`（对账专用）——保留无直连地址的设备
+ *  （vnet 传输模式的 PC 可能不报可达 addrs），让中继兜底有机会接手；
+ *  deliver 路径不传 → 行为不变（无地址不直推）。 */
+export async function peerDevicesOf(
+  accountDid: string,
+  opts: { includeAddrless?: boolean } = {},
+): Promise<PeerDevice[]> {
   // task-42：identity 面 fetch 可能永久挂起 → 有界降级为「无直连设备」，
   // 让上层（取票/聊天/share-admin）立刻走 relay 兜底而不是无限等待。
   const list = await withTimeout(
@@ -131,7 +137,7 @@ export async function peerDevicesOf(accountDid: string): Promise<PeerDevice[]> {
       const addrs = p.addrs?.ipv6List?.length ? p.addrs.ipv6List : (p.addrs?.ipv6 ? [p.addrs.ipv6] : [])
       return { did: p.did, name: p.name || 'myco-pc', addrs, port: p.addrs?.port ?? 9100, state: (p as { state?: string }).state ?? null }
     })
-    .filter((d) => d.addrs.length > 0)
+    .filter((d) => opts.includeAddrless || d.addrs.length > 0)
 }
 
 function urlOf(dev: PeerDevice, addr: string, path: string): string {
@@ -200,6 +206,115 @@ let relayDeliverReply: RelayDeliverReplyFn | null = null
 /** 装配层注入取票中继兜底（传 null 卸载）。 */
 export function setRelayDeliverReply(fn: RelayDeliverReplyFn | null): void {
   relayDeliverReply = fn
+}
+
+// ── 2026-11-11 对账（sync digest/index/batch）的 vnet 隧道兜底 ────────────────
+// 真因（PC 切 vnet 传输模式后手机任务卡断流）：PC 的 p2p 数据面在 vnet 模式下
+// **只绑 127.0.0.1:9100**（p2p_server.rs bind_for_mode：vnet=IPv4 回环、legacy=[::]
+// 双栈）——手机按 presence addrs 直连 IPv6:9100 永远连不上，设备群 task-share
+// 卡再也拉不到（手机任务卡列表空）。
+//
+// 唯一活路是 vnet 本地回环隧道（libvnet，RDP/DSH 数据面同款，真机已验证）：
+// PC 侧按白名单全量起了 vnet server（含 9100，multiForward=false，
+// peer_id=SHA256("vnet-peer"||did||":server:"||9100)），手机起 client 到它，
+// 本地 25910 回环，这里直接 fetch http://127.0.0.1:<localPort><path>（PC 路由
+// CORS 全开 + X-Myco-Auth 验签与直连同款）。
+//
+// ⚠️ 2026-11-11 起不再走 8321 mux 中继兜底（原第三级）：p2p_tunnel.rs:6436
+// relay_provider_start() 已是空壳（2026-11-06 用户令：legacy 退场——云端中继
+// Provider 不再启动），PC 不在 8321 注册 provider，中继腿永远超时（实测
+// no-parsable-body + 每台设备白等 2.5s，纯拖慢对账）。依据：DSH协议应用
+// 2026-11-11 复核（全日志 0 条 [provider]）。
+export type VnetP2pTunnelFn = (deviceDid: string) => Promise<number | null>
+
+let vnetP2pTunnel: VnetP2pTunnelFn | null = null
+
+/** 装配层注入 vnet 对账隧道（传 null 卸载）。 */
+export function setVnetP2pTunnel(fn: VnetP2pTunnelFn | null): void {
+  vnetP2pTunnel = fn
+}
+
+/** 经 vnet 本地回环口 POST 对端 p2p 数据面（签名头与直连同款）。失败 null。
+ *
+ *  2026-11-11 真机实证：**不能用 JS fetch**。APK 里页面来自
+ *  `file:///android_asset/www/index.html`，源是 `null`；fetch 到
+ *  `http://127.0.0.1:25910` 属跨源 + 明文，WebView 直接判失败
+ *  （实测：TCP 连上又断，`TypeError: Failed to fetch`，PC 侧根本没收到请求）。
+ *  APK 内必须走 Java HTTP（`MycoShell.proxyPostAsync`，与既有
+ *  `chatRelayPost` 同一条腿，没有 CORS 概念）；浏览器/PWA 形态才用 fetch。
+ */
+async function p2pPostViaVnet(localPort: number, path: string, body: unknown): Promise<Record<string, unknown> | null> {
+  const raw = JSON.stringify(body)
+  let auth: string
+  try { auth = signAuthHeader(raw) } catch { return null }
+  const url = `http://127.0.0.1:${localPort}${path}`
+  const bridge = (window as unknown as { MycoShell?: { proxyPostAsync?: (...a: unknown[]) => void } }).MycoShell
+  if (bridge && typeof bridge.proxyPostAsync === 'function') {
+    const w = window as unknown as Record<string, unknown>
+    const cbName = '__p2pSyncCb' + Math.random().toString(36).slice(2)
+    const res = await new Promise<{ status?: number; body?: string } | null>((resolve) => {
+      const timer = setTimeout(() => { delete w[cbName]; resolve(null) }, P2P_TIMEOUT + 2000)
+      w[cbName] = (r: { status?: number; body?: string }) => {
+        clearTimeout(timer); delete w[cbName]; resolve(r || null)
+      }
+      try {
+        bridge.proxyPostAsync!('window.' + cbName, url, 'application/json', auth, raw)
+      } catch {
+        clearTimeout(timer); delete w[cbName]; resolve(null)
+      }
+    })
+    if (!res || !res.status || res.status < 200 || res.status >= 300 || typeof res.body !== 'string') {
+      // 非 2xx 必须留痕：只记"post-fail"会把 403（签名/授权）和超时混成一种现象。
+      noteSyncDiag('post-http', {
+        path, status: res ? res.status : -1,
+        body: res && typeof res.body === 'string' ? res.body.slice(0, 140) : '',
+      })
+      return null
+    }
+    try { return JSON.parse(res.body) as Record<string, unknown> } catch { return {} }
+  }
+  try {
+    const ctrl = new AbortController()
+    const t = setTimeout(() => ctrl.abort(), P2P_TIMEOUT)
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Myco-Auth': auth },
+      body: raw,
+      signal: ctrl.signal,
+    })
+    clearTimeout(t)
+    if (r.ok) return (await r.json().catch(() => ({}))) as Record<string, unknown>
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** 直连 + vnet 隧道兜底的 p2p POST（对账专用；deliver 路径各有自己的兜底，
+ *  不走这里）。设备无直连地址（addrs 空，PC 在 vnet 模式下 presence 可能不报
+ *  可达地址）时直接走 vnet——没有这层，syncWithAccount 连尝试都不会发生。 */
+async function p2pPostSync(dev: PeerDevice, path: string, body: unknown): Promise<Record<string, unknown> | null> {
+  const direct = dev.addrs.length > 0 ? await p2pPost(dev, path, body) : null
+  if (direct) {
+    noteSyncDiag('post', { path, via: 'direct', dev: dev.did.slice(-4) })
+    return direct
+  }
+  if (vnetP2pTunnel) {
+    try {
+      const localPort = await vnetP2pTunnel(dev.did)
+      noteSyncDiag('post', { path, via: 'vnet', dev: dev.did.slice(-4), port: localPort })
+      if (localPort && localPort > 0) {
+        const via = await p2pPostViaVnet(localPort, path, body)
+        if (via) return via
+        noteSyncDiag('post-fail', { path, via: 'vnet-post', dev: dev.did.slice(-4) })
+      }
+    } catch (e) {
+      noteSyncDiag('post-fail', { path, via: 'vnet-ensure', dev: dev.did.slice(-4), err: String(e) })
+    }
+  } else {
+    noteSyncDiag('post-fail', { path, via: 'none', dev: dev.did.slice(-4) })
+  }
+  return null
 }
 
 /** wire 信封（与 PC p2p_send_raw 同形）。 */
@@ -293,6 +408,38 @@ export async function p2pDeliver(accountDid: string, envelope: Record<string, un
       markRelayPreferred(accountDid)
       console.log(`[p2p] 中继送达（直推${skipDirect ? '已跳过' : '不可达'}，to=…${accountDid.slice(-6)}）`)
       return true
+    }
+    // 2026-11-12 vnet 兜底腿（真机 RED：ADB 任务卡在 outbox 卡了 2 小时）：
+    // PC 切 vnet 传输模式后 p2p 数据面只绑 127.0.0.1:9100 → 直连必败；8321 中继腿
+    // 在 PC 侧已退场为空壳（2026-11-06）永远超时——设备隧道是手机→PC 投递的
+    // 唯一活路。对账（p2pPostSync）早就有同款腿；deliver（chat/task-share）没有，
+    // 表现就是「手机建的卡永远到不了 PC」。includeAddrless：vnet 模式的 PC 在
+    // presence 里可能不报可达地址。
+    //
+    // ⚠ 逐台全发、不在首台成功后早退（2026-11-12 真机第二课）：deliver 的语义是
+    // 「任一送达=成功」，outbox 随即删消息——若 vnet 腿也在第一台（如笔记本老
+    // exe 秒回 ok）就早退，PC 永远收不到（实测：卡只到笔记本，PC 任务列表空）。
+    // 这里对**全部**在线 PC 设备各投一份，宁可重复（接收端 msgId/taskId 幂等），
+    // 不可漏投。
+    if (vnetP2pTunnel && !won) {
+      const devs = await peerDevicesOf(accountDid, { includeAddrless: true }).catch(() => [])
+      let anyOk = false
+      for (const d of devs) {
+        try {
+          const localPort = await vnetP2pTunnel(d.did)
+          if (localPort && localPort > 0) {
+            const r = await p2pPostViaVnet(localPort, '/p2p/msg', envelope)
+            if (r && r.ok) {
+              anyOk = true
+              noteSyncDiag('deliver-vnet-ok', {
+                dev: d.did.slice(-4), port: localPort,
+                kind: String((envelope as { kind?: string }).kind || ''),
+              })
+            }
+          }
+        } catch { /* 换下一台设备 */ }
+      }
+      if (anyOk) return true
     }
     return won
   }
@@ -468,9 +615,40 @@ async function flushOutboxAndNotify(account: string): Promise<void> {
 const inFlight = new Set<string>()
 
 /** 与某账号（好友/自己）的全部在线 PC 设备对账。返回新收条数。
- *  第95轮：发现对方在线（devs 非空）先补发本地待发队列，再对账。 */
+ *  第95轮：发现对方在线（devs 非空）先补发本地待发队列，再对账。
+ *  2026-11-11：对账设备清单带 includeAddrless（中继兜底可接管无直连地址的
+ *  设备——设备群 task-share 卡的拉取不再依赖双方可直连）。 */
+// ── 对账诊断环（2026-11-11 真机排障：任务卡拉不到时"到底走到哪一步"是黑盒）──
+// 只记事实、不参与业务；`window.__mycoSyncDiag()` 可随时读最近 40 条。
+// 起因：手机任务卡空了一整天，日志里只有最后一句 "vnet 隧道 ensure 失败"，
+// 分不清是"没设备/没地址/直连超时/隧道建不起来/对端没数据"。
+export type SyncDiagEntry = { ts: number; ev: string; [k: string]: unknown }
+const syncDiagRing: SyncDiagEntry[] = []
+
+export function noteSyncDiag(ev: string, kv?: Record<string, unknown>): void {
+  const e: SyncDiagEntry = { ts: Date.now(), ev, ...(kv ?? {}) }
+  syncDiagRing.push(e)
+  if (syncDiagRing.length > 40) syncDiagRing.shift()
+  try {
+    const w = window as unknown as Record<string, unknown>
+    w.__mycoSyncDiag = () => syncDiagRing.slice()
+  } catch {
+    /* 非浏览器环境（单测）忽略 */
+  }
+  try { console.log('[p2p-sync] ' + JSON.stringify(e)) } catch { /* ignore */ }
+}
+
 export async function syncWithAccount(accountDid: string): Promise<number> {
-  const devs = await peerDevicesOf(accountDid)
+  let devs: PeerDevice[] = []
+  try {
+    devs = await peerDevicesOf(accountDid, { includeAddrless: true })
+  } catch (e) {
+    // 阵容查询本身就是网络面（identity-svc 名册）：抛异常时原来被调用方
+    // `.catch(() => {})` 吞掉 → 界面上只是"卡不来"，日志一片空白。
+    noteSyncDiag('account-fail', { acc: accountDid.slice(-4), err: String(e) })
+    return 0
+  }
+  noteSyncDiag('account', { acc: accountDid.slice(-4), devs: devs.length, addrs: devs.map((d) => d.addrs.length) })
   if (devs.length > 0) await flushOutboxAndNotify(accountDid)
   let got = 0
   for (const d of devs) got += await syncWithDevice(d, accountDid).catch(() => 0)
@@ -548,8 +726,8 @@ async function syncWithDeviceInner(dev: PeerDevice, peerAccount: string): Promis
   // seedWireMsgSeenFromStorage —— 历史落错会话键的同一批 msgId 不再被当缺口重拉）
   try { seedWireMsgSeenFromStorage() } catch { /* best-effort：失败退回按会话预热 */ }
   const fromDevice = currentIdentity()?.did ?? ''
-  // ① digest
-  const resp = await p2pPost(dev, '/p2p/sync/digest', { from: my, fromDevice, convs: myDigestFor(my === '' ? '' : devDidToAccount(dev)) })
+  // ① digest（2026-11-11 起走 p2pPostSync：直连失败/无地址 → 中继兜底）
+  const resp = await p2pPostSync(dev, '/p2p/sync/digest', { from: my, fromDevice, convs: myDigestFor(my === '' ? '' : devDidToAccount(dev)) })
   if (!resp) return 0
   const peerConvs = (resp.convs ?? {}) as Record<string, { n: number; lastTs: number; F: string }>
   let totalGot = 0
@@ -570,7 +748,7 @@ async function syncWithDeviceInner(dev: PeerDevice, peerAccount: string): Promis
     // 上轮双方 F 都没变且 0 进展 → 本拍跳过（避免对"存不下的行"每拍空转两趟 HTTP）
     const memo = syncNoProgress.get(localConv)
     if (memo && memo.peerF === pd.F && memo.mineF === mine.F) continue
-    const idx = await p2pPost(dev, '/p2p/sync/index', { from: my, fromDevice, convId })
+    const idx = await p2pPostSync(dev, '/p2p/sync/index', { from: my, fromDevice, convId })
     if (!idx) continue
     const theirs = ((idx.ids ?? []) as [string, number][])
     const { push, pull: pullRaw } = diffIds(mine.ids, theirs)
@@ -600,7 +778,7 @@ async function syncWithDeviceInner(dev: PeerDevice, peerAccount: string): Promis
       }
     }
     for (const b of batches) {
-      const r = await p2pPost(dev, '/p2p/sync/batch', {
+      const r = await p2pPostSync(dev, '/p2p/sync/batch', {
         from: my, fromDevice, convId,
         msgs: b.msgs, want: b.want,
       })
@@ -715,9 +893,12 @@ let lastSyncAt = 0
  *  flushOutboxAndNotify 已覆盖在线场景；flushOutboxAll 是有待发时的兜底枚举）。 */
 function syncAllAccounts(): void {
   const my = myAccountDid()
+  const friends = listFriends().filter((f) => (f.status ?? 'ok') === 'ok').map((f) => f.did)
+  // 诊断：没有这句时「60s 环到底跑没跑、账号认没认出来」在真机上完全不可见
+  noteSyncDiag('all', { my: my ? my.slice(-4) : null, friends: friends.length })
   if (!my) return
   void flushOutboxAll().then((n) => { if (n > 0) emitSendStateChange() }).catch(() => {})
-  const accounts = listFriends().filter((f) => (f.status ?? 'ok') === 'ok').map((f) => f.did)
+  const accounts = friends
   accounts.push(my) // 自己的 PC 设备（多设备同步）
   for (const a of accounts) void syncWithAccount(a).catch(() => {})
 }
@@ -830,6 +1011,7 @@ export function kickOutboxRetryNow(): void {
 export function ensureP2pLoops(): void {
   if (loopsStarted) return
   loopsStarted = true
+  noteSyncDiag('loops-start', {})
   // presence state 上报（20s 周期兜底；typing/前后台切换走 reportPresenceNow 即时）
   void reportPresenceNow()
   setInterval(() => { void reportPresenceNow() }, 20_000)
