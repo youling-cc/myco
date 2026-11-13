@@ -3013,6 +3013,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "hyper-util",
+ "libc",
  "mdns-sd",
  "myco-core",
  "rand 0.9.5",

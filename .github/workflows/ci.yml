@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 24 # node:sqlite needs 22.5+ (local dev on 25)
+          node-version: 24        # node:sqlite 需 22.5+（本地开发 Node 25；20 无此内建模块）
       - run: cd services/identity-svc && npm install --no-audit --no-fund
       - run: cd services/identity-svc && node --test
 

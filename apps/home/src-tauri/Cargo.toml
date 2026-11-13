@@ -152,6 +152,12 @@ winreg = "0.52"
 # 鍒嗕韩缃戝叧 reaper锛歄penProcess 鎺㈤拡鍒ゅ畾 pid 鐪熸锛堟壙 apps/env 鐨勫疄鐜帮級
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Power", "Win32_System_Threading"] }
 
+# 2026-11-13 CI fix (ubuntu E0433 libc): vendored vnet getifaddrs uses libc;
+# apps/vnet declares it but host workspace didn't (Android NDK cross-compile
+# masked this — libc was implicitly available there)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # 2026-11-11 P0 回归测试：造真 brotli 夹具（解压端用 brotli-decompressor，压缩端
 # 造夹具用 brotli；lock 里已有 9.1.1，离线零新增下载）。
