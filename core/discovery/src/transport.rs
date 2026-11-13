@@ -15,12 +15,16 @@ use tracing::{debug, error, info};
 // 条件编译：Unix 平台使用 UnixStream
 // 2026-11-13 A1 后半修（开源 Issue #3）：cfg(unix) 块内用到的 IO trait 与 BytesMut
 // 缺 use 导入——Windows 不编译该块所以没暴露，ubuntu CI 挂的根因。
+// 第三轮补：Encoder/Decoder trait（AgentMessageCodec 的 encode/decode 方法在 trait 上，
+// trait 不 in scope 则方法不可见——Rust orphan rule）。
 #[cfg(unix)]
 use tokio::net::UnixStream;
 #[cfg(unix)]
 use bytes::BytesMut;
 #[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio_util::codec::{Decoder, Encoder};
 
 /// IPC (Unix Domain Socket) 连接器
 pub struct IpcConnector;
