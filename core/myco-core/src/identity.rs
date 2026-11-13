@@ -839,12 +839,12 @@ fn write_seed_dpapi(path: &std::path::Path, seed: &[u8; 32]) -> std::io::Result<
 
 /// 当前可用的 账号种子（缓存优先；无密码读盘；加密未解锁 → None）。
 pub fn cached_account_seed() -> Option<[u8; 32]> {
-    if let Some(s) = *SOUL_CACHE.lock().unwrap() {
+    if let Some(s) = *SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
         return Some(s);
     }
     let (raw, _enc) = stored_account_seed();
     if let Some(s) = raw {
-        *SOUL_CACHE.lock().unwrap() = Some(s);
+        *SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
         return Some(s);
     }
     None
@@ -956,7 +956,7 @@ static SOUL_NAME_CACHE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new
 /// （2026-10-06：冷启动缓存为空 + identity-svc 慢 → 整个快照等近 8s，
 /// 用户观感="打开 myco 后任务卡片好几秒才出来"）。拿不到就由调用方兜底。
 pub fn account_name_cached() -> Option<String> {
-    SOUL_NAME_CACHE.lock().unwrap().clone()
+    SOUL_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// 自己 账号的名字（云 /root/:did 解析，进程内缓存；查不到 None）。
@@ -983,20 +983,20 @@ pub async fn account_name() -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    *SOUL_NAME_CACHE.lock().unwrap() = Some(name.clone());
+    *SOUL_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.clone());
     Some(name)
 }
 
 /// 账号名缓存失效（改名/解绑后下次重新解析）。
 fn invalidate_account_name_cache() {
-    *SOUL_NAME_CACHE.lock().unwrap() = None;
+    *SOUL_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// 活动账号指向已变（import/switch/logout/unbind 共用纪律，单一源）：
 /// 种子缓存置空重载 + 账号名缓存失效。漏掉这步 = myco_get/account_name
 /// 在下一次自然失效前仍报旧账号（2026-10-01 实测：导入新账号后顶栏昵称 ~30s 不切）。
 fn reset_account_caches() {
-    *SOUL_CACHE.lock().unwrap() = None;
+    *SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     invalidate_account_name_cache();
     // 旧格式停试标记一并清（2026-10-07）：换账号=重新探测——新账号可能 canonical。
     ACCOUNT_FORMAT_LEGACY.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1028,7 +1028,7 @@ fn write_account_seed(did: &str, seed: &[u8; 32], password: &str) {
             let _ = std::fs::write(&path, serde_json::to_vec(&blob).unwrap_or_default());
         }
     }
-    *SOUL_CACHE.lock().unwrap() = Some(*seed);
+    *SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(*seed);
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1126,7 +1126,7 @@ pub async fn account_create_ex(name: Option<String>, password: Option<String>, p
     write_account_did_file(&root_did);
     write_account_seed(&root_did, &myco_seed, password.as_deref().unwrap_or(""));
     accounts_upsert(&root_did, &acct_name);
-    *SOUL_NAME_CACHE.lock().unwrap() = None; // 新账号名缓存失效（否则 account_get 显旧名）
+    *SOUL_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None; // 新账号名缓存失效（否则 account_get 显旧名）
     tracing::info!("[identity] 创建 Soul root_did={}", root_did);
 
     // 设备归属自愈（2026-10-06）：/root/create 正常会把首设备写进名册，但 409
@@ -1900,7 +1900,7 @@ static DEVICE_ENROLL_INFLIGHT: std::sync::Mutex<Vec<String>> = std::sync::Mutex:
 struct DeviceEnrollInflightGuard(String);
 impl Drop for DeviceEnrollInflightGuard {
     fn drop(&mut self) {
-        let mut inflight = DEVICE_ENROLL_INFLIGHT.lock().unwrap();
+        let mut inflight = DEVICE_ENROLL_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
         inflight.retain(|d| !account_did_eq(d, &self.0));
     }
 }
@@ -1932,7 +1932,7 @@ fn device_enroll_self_heal_spawn_at(base: &str, root_did: String) {
     let base = base.trim_end_matches('/').to_string();
     {
         // 查重与登记在同一把锁内（并发线程同刻调用也只留一份）
-        let mut inflight = DEVICE_ENROLL_INFLIGHT.lock().unwrap();
+        let mut inflight = DEVICE_ENROLL_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
         if inflight.iter().any(|d| account_did_eq(d, &root_did)) {
             return; // 同一账号的自愈已在飞——不叠加连接（不同账号放行并发）
         }
@@ -2204,7 +2204,7 @@ fn cloud_discovery_spawn_at(base: &str) {
 pub async fn account_status() -> Result<serde_json::Value, String> {
     let (raw, enc) = stored_account_seed();
     let has_soul = raw.is_some() || enc;
-    let cache_empty = SOUL_CACHE.lock().unwrap().is_none();
+    let cache_empty = SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()).is_none();
     // 名册自愈（2026-10-05 identity.db 覆盖事故立法）：顺带查服务端名册，
     // 仅 404 自动 /root/create 重建。后台任务、失败只 log——不影响本函数返回。
     roster_self_heal_spawn();
@@ -2243,7 +2243,7 @@ pub async fn account_unlock(password: String) -> Result<(), String> {
     }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
-    *SOUL_CACHE.lock().unwrap() = Some(seed);
+    *SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(seed);
     Ok(())
 }
 
@@ -2385,7 +2385,7 @@ pub async fn account_rename(name: String) -> Result<(), String> {
         .send().await.map_err(|e| format!("rename: {e}"))?;
     if !r.status().is_success() { return Err(format!("rename status={}", r.status())); }
     accounts_upsert(&root_did, &effective);
-    *SOUL_NAME_CACHE.lock().unwrap() = Some(effective);
+    *SOUL_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(effective);
     Ok(())
 }
 
@@ -2638,7 +2638,7 @@ mod tests {
     struct CfgGuard(std::string::String, std::sync::MutexGuard<'static, ()>);
     impl CfgGuard {
         fn new(tag: &str) -> Self {
-            let lock = CFG_LOCK.lock().unwrap();
+            let lock = CFG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!("myco-did-test-{}-{}", tag, std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -2738,7 +2738,7 @@ mod tests {
         write_account_seed("did:youling:B", &seed_b2, "");
         assert!(slot_a.is_file());
         assert_ne!(std::fs::read(&slot_b).unwrap(), vec![9u8; 32].as_slice(), "B 槽应被新种子覆盖");
-        *SOUL_CACHE.lock().unwrap() = None;
+        *SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         assert_eq!(cached_account_seed(), Some(seed_b2), "active=B 时读漏斗应读到 B 的新种子");
     }
 
@@ -2774,7 +2774,7 @@ mod tests {
 
         // ② account_unlock 全链（active 指向该槽，缓存清空=锁定态）
         std::fs::write(accounts_dir().join("active.txt"), "did:youling:IV").unwrap();
-        *SOUL_CACHE.lock().unwrap() = None;
+        *SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             account_unlock("对的就是这个密码".into()).await.expect("unlock 全链必须成功");
@@ -2851,7 +2851,7 @@ mod tests {
         assert!(!dir.join("session.json").is_file(), "session.json 应被删");
         assert!(!dir.join("agent-of.json").is_file(), "agent-of.json 应被删");
         // 注册标记复位（2026-10-09 L1：按 did 键控的集合——整机注销后应清空）
-        assert!(REGISTERED.lock().unwrap().is_empty(), "REGISTERED 应复位");
+        assert!(REGISTERED.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "REGISTERED 应复位");
         // 账号层不动
         assert!(accounts_dir().join("active.txt").is_file(), "active.txt 应保留");
         assert!(slot.is_file(), "账号种子槽应保留");
@@ -2876,8 +2876,8 @@ mod tests {
     async fn account_import_resets_account_caches_on_switch() {
         let _g = CfgGuard::new("import-cache");
         // 布置"登录旧账号后导入新账号"现场：两个缓存都持旧值
-        *SOUL_CACHE.lock().unwrap() = Some(pk(0x11));
-        *SOUL_NAME_CACHE.lock().unwrap() = Some("旧账号名".to_string());
+        *SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(pk(0x11));
+        *SOUL_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some("旧账号名".to_string());
         // BASE 是 OnceLock——本测试是测试二进制中唯一触网者，先设死端口再进 import
         std::env::set_var("MYCO_DID_BASE", "http://127.0.0.1:1");
         let seed = [0x5eu8; 32];
@@ -2891,11 +2891,11 @@ mod tests {
         assert_eq!(account_did().as_deref(), Some(want_did.as_str()));
         // 账号名缓存必须失效——否则 myco_get/account_name 仍报旧账号昵称（本修的根因）
         assert!(
-            SOUL_NAME_CACHE.lock().unwrap().is_none(),
+            SOUL_NAME_CACHE.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
             "导入切换后账号名缓存必须失效"
         );
         // 种子缓存置空重载（下次 cached_account_seed 从盘上读新账号）
-        assert!(SOUL_CACHE.lock().unwrap().is_none(), "导入切换后种子缓存必须重载");
+        assert!(SOUL_CACHE.lock().unwrap_or_else(|e| e.into_inner()).is_none(), "导入切换后种子缓存必须重载");
     }
 
     // ══ 名册自愈（2026-10-05 identity.db 覆盖事故立法）══
@@ -3310,7 +3310,7 @@ mod tests {
     /// 轮询等某账号自愈任务收尾（出在飞集合）——避免"上一条还在飞把下一条挡掉"的假绿。
     async fn wait_inflight_clear(did: &str) {
         for _ in 0..400 {
-            if !DEVICE_ENROLL_INFLIGHT.lock().unwrap().iter().any(|d| account_did_eq(d, did)) {
+            if !DEVICE_ENROLL_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| account_did_eq(d, did)) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3999,7 +3999,9 @@ mod tests {
         // 并行测试经 account_status 挂载的发现（死端口）可能短暂占用它，把本测试的
         // spawn 挤掉——等标记清零后重试（有界轮次），不 sleep 死等。
         let mut listed = false;
-        for _round in 0..10 {
+        // 2026-11-13 D 修（开源 Issue #3）：CI 慢机上 10 轮×2s=20s 可能不够
+        // （后台任务被并行测试抢 CPU），放宽到 20 轮×3s=60s + 加日志辅助诊断。
+        for _round in 0..20 {
             for _ in 0..200 {
                 if !CLOUD_DISCOVERY_INFLIGHT.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -4007,7 +4009,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             cloud_discovery_spawn_at(&base);
-            for _ in 0..100 {
+            for _ in 0..300 {
                 if accounts_load()
                     .iter()
                     .any(|a| a.get("did").and_then(|x| x.as_str()) == Some(cj_did.as_str()))
