@@ -5,7 +5,31 @@
 
 use crate::crypto::SessionCrypto;
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+
+/// 解析 relay 地址（2026-11-13 开源 Issue #2 P0：域名形态地址全拒）。
+///
+/// 旧实现 `addr.parse::<SocketAddr>()` 只认 `IP:PORT`；mac 用户配
+/// `myco.youling.cc:28322` → "Invalid relay address" → 消息功能全断。
+///
+/// 解析顺序：
+/// 1. `SocketAddr::parse` 快路径（`1.2.3.4:5678` / `[::1]:5678`，零开销）
+/// 2. 失败则按 `(host, port)` 做 DNS 解析（`myco.youling.cc:28322`）
+///    —— `to_socket_addrs()` 内部处理 `host:port` 字符串形态
+pub fn resolve_relay_addr(addr: &str) -> anyhow::Result<SocketAddr> {
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    // to_socket_addrs 接受 "host:port" 字符串并做 DNS
+    match addr.to_socket_addrs() {
+        Ok(mut iter) => iter
+            .next()
+            .ok_or_else(|| anyhow::anyhow!(
+                "Invalid relay address '{}': DNS resolved no addresses", addr)),
+        Err(e) => anyhow::bail!(
+            "Invalid relay address '{}': {} (expected IP:PORT or host:port)", addr, e),
+    }
+}
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -415,8 +439,7 @@ impl RelayClient {
         crypto: Option<crate::crypto::SessionCrypto>,
         secret: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let addr: SocketAddr = relay_addr.parse()
-            .map_err(|_| anyhow::anyhow!("Invalid relay address: {}", relay_addr))?;
+        let addr = resolve_relay_addr(relay_addr)?;
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_nonblocking(true)?;
         apply_tunable_buffers(&socket);
@@ -1091,5 +1114,32 @@ mod tests {
         let restored = crate::netstatus::NetStatus::parse_announce_extra(&extra, 0);
         assert!(restored.is_some(), "roundtrip 后的画像应可解析");
         assert_eq!(restored.unwrap().version, 3);
+    }
+
+    /// 开源 Issue #2（2026-11-13 P0）：域名形态 relay 地址必须可解析
+    #[test]
+    fn test_resolve_relay_addr_ip_forms() {
+        // IPv4 快路径
+        assert!(resolve_relay_addr("127.0.0.1:28322").is_ok());
+        assert!(resolve_relay_addr("8.8.8.8:53").is_ok());
+        // IPv6 字面量
+        assert!(resolve_relay_addr("[::1]:28322").is_ok());
+        assert!(resolve_relay_addr("[3fff:390::1]:28322").is_ok());
+    }
+
+    #[test]
+    fn test_resolve_relay_addr_domain() {
+        // 域名形态：localhost 无需外网 DNS
+        let result = resolve_relay_addr("localhost:28322");
+        assert!(result.is_ok(), "localhost must resolve: {:?}", result.err());
+        let sa = result.unwrap();
+        assert_eq!(sa.port(), 28322);
+    }
+
+    #[test]
+    fn test_resolve_relay_addr_invalid() {
+        assert!(resolve_relay_addr("not an address at all").is_err());
+        assert!(resolve_relay_addr("").is_err());
+        assert!(resolve_relay_addr("1.2.3.4").is_err()); // 缺端口
     }
 }
