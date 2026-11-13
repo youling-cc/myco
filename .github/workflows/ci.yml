@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 on:
   push:
@@ -66,4 +66,4 @@ jobs:
       - run: pnpm --dir apps/home/ui build
       - run: pnpm --dir apps/media/ui build
       - uses: dtolnay/rust-toolchain@stable
-      - run: cd apps/home/src-tauri && cargo test --workspace
+      - run: cd apps/home/src-tauri && cargo test --workspace --lib
