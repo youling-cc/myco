@@ -21,7 +21,12 @@ pub fn run() {
             // 本地 canvas 可不在场;授权由主机侧 authorized-dids enforced(deny 流程)。
             // 实测坑:setup 期直接 navigate 会被 webview 初始加载覆盖——等初始页就绪后
             // 再导航(1.5s 延迟;代价=跨机模式启动多一次整页重载,本机模式零影响)。
-            if let Ok(home) = std::env::var("USERPROFILE") {
+            // 2026-11-13 A2 修（开源 Issue #3）：USERPROFILE 仅 Windows 有，
+            // macOS/Linux 用 HOME——先试 USERPROFILE 再回落 HOME，跨机注入全平台可用。
+            let home_dir = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .ok();
+            if let Some(home) = home_dir {
                 let p = std::path::PathBuf::from(home).join(".myco").join("media-host.txt");
                 if let Ok(host) = std::fs::read_to_string(&p) {
                     let host = host.trim().to_string();
@@ -40,11 +45,16 @@ pub fn run() {
                     }
                 }
             }
+            // 2026-11-13 A2 修（开源 Issue #3）：hwnd() 仅 Windows 有（HWND 句柄），
+            // macOS/Linux 无此 API——cfg 门控，非 Windows 传 0。
+            #[cfg(windows)]
             let hwnd = app
                 .get_webview_window("main")
                 .and_then(|w| w.hwnd().ok())
                 .map(|h| h.0 as isize)
                 .unwrap_or(0);
+            #[cfg(not(windows))]
+            let hwnd: isize = 0;
             ui_embed_server::spawn_with_hwnd(app.handle().clone(), hwnd, PORT, ui_embed_server::UiAgentManifest {
                 did: DID, layer: "PA", consumes: CONSUMES, produces: PRODUCES,
                 // 远程桌面是内容大窗:理想 960(16:9 视频+控制条),封顶不限

@@ -25309,15 +25309,22 @@ async fn handle_dev_chat_send(Json(body): Json<serde_json::Value>) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if conv.is_empty() || text.trim().is_empty() {
+    // 2026-11-13：kind/payload 透传（dev 验收——图片消息 payload={name,mime,size,b64}，
+    // 与 GUI chat_send("image") 同一实现；不设则维持旧 text 行为，兼容）。
+    let kind = body
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text")
+        .to_string();
+    let payload = body.get("payload").cloned().unwrap_or(json!({ "text": text }));
+    if conv.is_empty() || (kind == "text" && text.trim().is_empty()) {
         return (StatusCode::BAD_REQUEST, "缺 conv 或 text").into_response();
     }
     let t0 = now_ms();
     let r = if conv.starts_with("grp-") {
         crate::chat_service::chat_send_group(conv.clone(), json!({ "text": text })).await
     } else {
-        crate::chat_service::chat_send(conv.clone(), "text".to_string(), json!({ "text": text }))
-            .await
+        crate::chat_service::chat_send(conv.clone(), kind, payload).await
     };
     match r {
         Ok(v) => {

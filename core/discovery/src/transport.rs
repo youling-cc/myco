@@ -141,14 +141,10 @@ impl IpcConnection {
 impl AgentConnection for IpcConnection {
     async fn invoke(&self, task: Task) -> Result<TaskResult, ConnectionError> {
         let start = Instant::now();
-        let task_id = uuid::Uuid::new_v4().to_string();
-
-        let request = AgentMessage::InvokeRequest {
-            task_id: task_id.clone(),
-            skill: task.skill,
-            input: task.input,
-            context: None,
-        };
+        // 2026-11-13 A1 修（开源 Issue #3）：对齐 codec.rs 新形状——
+        // Invoke { task: Task } 替代旧 InvokeRequest { task_id, skill, input, context }；
+        // InvokeResponse 不再带 task_id。
+        let request = AgentMessage::Invoke { task };
 
         // 发送请求
         self.send_message(&request).await?;
@@ -156,18 +152,11 @@ impl AgentConnection for IpcConnection {
         // 等待响应
         match self.recv_message().await? {
             AgentMessage::InvokeResponse {
-                task_id: resp_task_id,
                 success,
                 output,
                 error,
                 ..
             } => {
-                if resp_task_id != task_id {
-                    return Err(ConnectionError::ConnectFailed(
-                        "Task ID mismatch in response".to_string()
-                    ));
-                }
-
                 Ok(TaskResult {
                     output,
                     execution_time_ms: start.elapsed().as_millis() as u64,
