@@ -5,6 +5,10 @@ fn main() {
     // 冷启动 t=0（`MYCO_STARTUP_TRACE=1` 时后续每个节点写一行 stderr）。
     myco_home_lib::startup_trace::init();
     myco_home_lib::startup_trace::mark("main");
+    // 出厂默认配置：任何模块读 env 之前先补缺（显式 env/启动脚本永远优先）。
+    // 2026-11-12 真机事故：裸命令拉起 exe（没走 myco-start.cmd）→ 15200/24011
+    // 不监听、mf 白名单退回默认 22 → 手机 DSH/RDP 全断。从此裸跑=全量。
+    myco_home_lib::boot_config::apply_baked_defaults();
     let args: Vec<String> = std::env::args().collect();
 
     // ═══ CLI 入口分叉（feat/cli-suite）═══

@@ -85,6 +85,12 @@ export interface TaskEnv {
    * 安全：来自卡（可跨设备/转授）→ 打开前必须过 [`entryUrlOf`] 的白名单校验。
    */
   entryUrl?: string
+  /**
+   * 干净 URL 坐标（2026-11-13 卡即合约）：`http://<deviceAlias>.localhost:<口>/<shareAlias>/`
+   * ——别名随卡投递，打开侧不猜 URL。老卡缺这两个字段 → 如实报旧形态。
+   */
+  deviceAlias?: string
+  shareAlias?: string
 }
 
 export type EnvRowState = 'idle' | 'building' | 'ready' | 'offline' | 'no-service' | 'denied'
@@ -120,6 +126,8 @@ export function envsOfCard(card: Record<string, unknown> | null | undefined): Ta
         label: asString(e.label) || undefined,
         requires: (e.requires as { service?: string }) || undefined,
         entryUrl: asString(e.entryUrl) || undefined,
+        deviceAlias: asString(e.deviceAlias) || undefined,
+        shareAlias: asString(e.shareAlias) || undefined,
       })
     }
     return out

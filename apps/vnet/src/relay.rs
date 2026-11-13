@@ -441,6 +441,20 @@ impl RelayClient {
         Some(Duration::from_millis(now.saturating_sub(ms)))
     }
 
+    /// 到 relay 的**实际本地源地址**（OS 路由选择结果）。
+    ///
+    /// 2026-11-13 换网自愈根因：原换网检测靠 `/proc/net/route` 判接口类型，
+    /// 但 **Android SELinux 屏蔽 /proc/net/** → 恒为 Unknown → 换网完全不可见
+    /// （WiFi→蜂窝后 relay peer 表仍是旧源地址，全黑洞，库无任何死判定）。
+    /// `connect()` 只做路由查找不发包（UDP 无握手），`local_addr()` 直接给出
+    /// 内核此刻会选的源地址——跨平台、免 /proc、免权限，是最可靠的变化信号。
+    /// 返回 None = 当前无路由到 relay（这本身也是"网络断了"的强信号）。
+    pub fn local_src_addr(&self) -> Option<std::net::SocketAddr> {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        probe.connect(self.relay_addr).ok()?;
+        probe.local_addr().ok()
+    }
+
     fn mark_relay_rx(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;

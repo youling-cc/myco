@@ -392,6 +392,17 @@ impl Clone for RelayClient {
     }
 }
 
+/// 静默开关（CLI 的 `probe-relay --json` 用）：只影响提示性 println，不影响协议行为。
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设置静默（true = 不打印注册成功等提示，便于 JSON 输出）
+pub fn set_quiet(v: bool) {
+    QUIET.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn quiet() -> bool {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
 impl RelayClient {
     pub fn new(relay_addr: &str, my_peer_id: u32) -> anyhow::Result<Self> {
         Self::with_crypto(relay_addr, my_peer_id, None, None)
@@ -428,6 +439,20 @@ impl RelayClient {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
         Some(Duration::from_millis(now.saturating_sub(ms)))
+    }
+
+    /// 到 relay 的**实际本地源地址**（OS 路由选择结果）。
+    ///
+    /// 2026-11-13 换网自愈根因：原换网检测靠 `/proc/net/route` 判接口类型，
+    /// 但 **Android SELinux 屏蔽 /proc/net/** → 恒为 Unknown → 换网完全不可见
+    /// （WiFi→蜂窝后 relay peer 表仍是旧源地址，全黑洞，库无任何死判定）。
+    /// `connect()` 只做路由查找不发包（UDP 无握手），`local_addr()` 直接给出
+    /// 内核此刻会选的源地址——跨平台、免 /proc、免权限，是最可靠的变化信号。
+    /// 返回 None = 当前无路由到 relay（这本身也是"网络断了"的强信号）。
+    pub fn local_src_addr(&self) -> Option<std::net::SocketAddr> {
+        let probe = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        probe.connect(self.relay_addr).ok()?;
+        probe.local_addr().ok()
     }
 
     fn mark_relay_rx(&self) {
@@ -556,7 +581,9 @@ impl RelayClient {
                 Ok((len, _)) => {
                     if let Some((PacketType::RegisterAck, _, _)) = parse_packet(&buf[..len]) {
                         self.socket.set_nonblocking(true).ok();
-                        println!("Registered to relay {} as peer {}", self.relay_addr, self.my_peer_id);
+                        if !quiet() {
+            println!("Registered to relay {} as peer {}", self.relay_addr, self.my_peer_id);
+        }
                         return Ok(());
                     }
                 }
@@ -952,6 +979,7 @@ pub fn clear_peer_candidates_override() {
     override_map().lock().unwrap().clear();
 }
 
+/// 静默开关（CLI 的 `probe-relay --json` 用）：只影响提示性 println，不影响协议行为。
 impl RelayClient {
     /// 记录本机额外候选（LAN 地址等）。C 中继协议只存一个 v4/v6 槽，
     /// 追加候选由 myco 层经 take_announced_extras 读取后发布进 presence。

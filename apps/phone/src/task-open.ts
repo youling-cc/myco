@@ -237,7 +237,18 @@ async function resolveEnvEntryUrlWith(env: TaskEnv, d: EnvOpenDeps, vnetpPort: n
       }
     }
     if (port && port > 0) {
-      return { url: `http://127.0.0.1:${port}/gw/${sid}/`, fallbackNote: '', blockedNote: '' }
+      // 2026-11-13 卡即合约（与 openTaskShare 同口径）：唯一 URL 形态 =
+      // `http://<deviceAlias>.localhost:<口>/<shareAlias>/`（*.localhost 回环解析，
+      // Host 随 URL 进隧道，网关按 Host+别名表归位）。/gw/<id>/ 老形态已废
+      // （真机 RED 03:47：env 行点开 /gw/ URL，新网关按 Host 路由 → 404 空白）。
+      // 卡缺别名 → 如实报旧形态，不猜 URL。
+      const aliases = env as unknown as { deviceAlias?: string; shareAlias?: string }
+      const da = (aliases.deviceAlias || '').trim()
+      const sa = (aliases.shareAlias || '').trim()
+      if (!da || !sa) {
+        return { url: '', fallbackNote: '', blockedNote: '这张卡是旧形态（缺源设备坐标），请让源设备重新分享一次' }
+      }
+      return { url: `http://${da}.localhost:${port}/${sa}/`, fallbackNote: '', blockedNote: '' }
     }
     return { url: '', fallbackNote: '', blockedNote: '连不上源设备（设备隧道不可用），请稍后再试' }
   }

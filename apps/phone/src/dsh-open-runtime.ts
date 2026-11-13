@@ -284,13 +284,18 @@ const syncTunnelCache = new Map<string, { localPort: number; at: number }>()
 export const DEVICE_PORT_SYNC = 9100
 export const DEVICE_PORT_RDP = 3389
 /**
- * 2026-11-12：设备隧道直入分享网关的 **VNETP 身份口**（15200）。
+ * 设备隧道直入分享网关的口（2026-11-13 统一到 24011 public_router）。
  *
- * 真机实测：手机直连 13911（裸网关）→「此分享需要 DID 授权（无凭证）」——
- * mt 票会过期、且卡上的 entryUrl 端口是 PC 侧口；而 **15200 的 VNETP/1 监听
- * 会把隧道对端 DID 随流带上**（免 mt 免断言），同链路实测 DSH 页完整加载。
- * 手机点卡**只**走这条路（13911+mt 回落已删，隧道不可用就如实报错）。
+ * 演变：2026-11-12 手机走 15200（VNETP/1 身份口，免 mt）；但 11-13 干净 URL
+ * 改造后，**15200 的路由仍是老挂载语义**（`/dsh/` 会 302 到
+ * `/gw/<shareId>/app/`），而 24011（device-origin viewer / public_router 的
+ * Host 分发）直接服务 `/<shareAlias>/...`（真机对照：笔记本 24011 正常、
+ * 手机 15200 得到 /gw/ 老 URL）。三端统一 → 手机也走 24011。
+ *
+ * 24011 按 `Host: <deviceAlias>.localhost` 分发并直接出应用；
+ * `/dsh/api/...` 实测 200（含 session/modelCatalog）。VNETP 15200 保留兼容。
  */
+export const DEVICE_PORT_VIEWER = 24011
 export const DEVICE_PORT_VNETP = 15200
 
 /**
@@ -395,7 +400,9 @@ async function ensureSyncTunnelFor(deviceDid: string): Promise<number | null> {
  * （免 mt / 免客户端断言）。失败返回 null（调用方如实报「连不上源设备」）。
  */
 export async function ensureShareEntryForwardFor(deviceDid: string): Promise<number | null> {
-  return ensureDeviceForward(deviceDid, DEVICE_PORT_VNETP, { localPort: DEVICE_VIEWER_LOCAL_PORT })
+  // 2026-11-13：三端统一走 24011（public_router Host 分发，干净路由直出）；
+  // 15200 的 VNETP 路由仍是老挂载（/dsh/ → 302 /gw/<id>/app/），不再作为入口。
+  return ensureDeviceForward(deviceDid, DEVICE_PORT_VIEWER, { localPort: DEVICE_VIEWER_LOCAL_PORT })
 }
 
 /**
@@ -413,11 +420,12 @@ export async function ensureRdpForwardFor(deviceDid: string, preferLocalPort?: n
   // 消费方该用的固定口（与 DSH 23911 同构：非 HTTP 每 (device,service) 固定本地口）。
   const fixed = typeof preferLocalPort === 'number' && preferLocalPort > 0 ? preferLocalPort : 0
   const lp = await ensureDeviceForward(deviceDid, DEVICE_PORT_RDP, fixed > 0 ? { localPort: fixed } : undefined)
-  if (!lp) return null
-  try {
-    const { upsertLocalForward, RDP_TARGET_PORT } = await import('./remote-desktop')
-    upsertLocalForward({ device: deviceDid, port: RDP_TARGET_PORT, localPort: lp, enabled: true })
-  } catch { /* 落盘失败不影响本拍连接 */ }
+  // 2026-11-13 单一 owner 立法（真机 RED：RDP「反复失效」根因）：
+  // **不得**把 mf 的转发回写 `myco.vnetForwards`——那张表是 legacy
+  // tunnel-service 的恢复源（bootVnetForwards 每次启动逐条 startForward →
+  // Java ARM 抢绑 23389）。回写=每次点卡都给下次重启埋一颗抢口雷：
+  // legacy 数据面（rc=4 回落那套）赢了绑定就是黑洞。状态/地址消费方
+  // 一律读卡上的固定口（env.localPort=23389）或 mf 的 state()。
   return lp
 }
 
@@ -809,10 +817,11 @@ async function openTaskShareOnce(raw: Record<string, unknown>): Promise<OpenSumm
       reason: 'unreachable',
     }
   }
-  // 干净 URL 优先（2026-11-12 用户定调回归原架构：三端同一个干净简单链接）：
-  // 卡上 env 带源设备的 deviceAlias/shareAlias → `http://<alias>.localhost:23911/<share>/`
-  // （*.localhost 解析到回环，Host 随 URL 进隧道，网关按 Host+别名表归位并走标准
-  // /gw 鉴权链）。老卡没有坐标时回落 /gw/<id>/ 形态（功能等价，仅 URL 不够干净）。
+  // 干净 URL（2026-11-12 用户定调回归原架构：三端同一个干净简单链接）：
+  // 卡上 env 带源设备的 deviceAlias/shareAlias → `http://<alias>.localhost:<vport>/<share>/`
+  // （*.localhost 解析到回环，Host 随 URL 进隧道，网关按 Host+别名表归位）。
+  // 2026-11-13：**/gw/<id>/ 回落已删除**（用户立法：链接早换了，不留旧形态）。
+  // 老卡缺坐标 → 如实说「卡片缺少源设备坐标」，让用户重收新卡，不猜 URL。
   // 注意从 raw（原始卡面）读 env——shareCardOf 归一化只保留坐标五字段，env 会丢。
   const envSrc = (raw && ((raw as { card?: unknown }).card || raw)) as { env?: unknown[] }
   const env0 = (Array.isArray(envSrc.env) ? (envSrc.env || [])[0] : undefined) as
@@ -820,9 +829,15 @@ async function openTaskShareOnce(raw: Record<string, unknown>): Promise<OpenSumm
     | undefined
   const da = String(env0?.deviceAlias ?? '').trim()
   const sa = String(env0?.shareAlias ?? '').trim()
-  const vurl = da && sa
-    ? `http://${da}.localhost:${vport}/${sa}/`
-    : `http://127.0.0.1:${vport}/gw/${card.shareId}/`
+  if (!da || !sa) {
+    console.log(`[dsh-open] 卡片缺 deviceAlias/shareAlias（旧形态卡，share=${card.shareId}）→ 要求重收新卡`)
+    return {
+      ok: false,
+      message: '这张卡是旧形态（缺源设备坐标），请让源设备重新分享一次',
+      reason: 'unsupported',
+    }
+  }
+  const vurl = `http://${da}.localhost:${vport}/${sa}/`
   const vtitle = (card.title || card.shareId || '分享').toString()
   const opened = openShareInWebView(vurl, vtitle)
   if (opened !== true) {

@@ -77,6 +77,8 @@ function card(over: Record<string, unknown> = {}): Record<string, unknown> {
     sourceAccount: ident.account,
     sourceDeviceName: '办公室的电脑',
     title: 'DSH 分享',
+    // 2026-11-13 干净 URL 唯一形态：env 必带 deviceAlias/shareAlias（/gw/ 回落已删）。
+    env: [{ kind: 'dsh', deviceAlias: 'office-pc', shareAlias: 'main', device: 'did:myco:zPc' + devSeq, port: 13911 }],
     ...over,
   }
 }
@@ -104,20 +106,23 @@ describe('openTaskShare：VNETP 直入是唯一路径（2026-11-12 取票链删�
     expect(opened.calls).toEqual([]) // 复用 = 不再开新 WebView
   })
 
-  it('d) ensure 成功 → 打开 15200 直入口（无 mt 参数），via=vnetp-direct', async () => {
+  it('d) ensure 成功 → 打开干净 URL（<alias>.localhost，无 mt、无 /gw/ 形态），via=vnetp-direct', async () => {
     shell.reply = { ok: true, localPort: 25930 }
     const c = card()
     const r = await openTaskShare(c)
     expect(r.ok).toBe(true)
     if (!r.ok) throw new Error('unreachable')
-    expect(r.url).toBe(`http://127.0.0.1:25930/gw/${c.shareId}/`)
+    // 2026-11-13：唯一 URL 形态 = http://<deviceAlias>.localhost:<口>/<shareAlias>/
+    expect(r.url).toBe('http://office-pc.localhost:25930/main/')
+    expect(r.url).not.toContain('/gw/')
     expect(r.localPort).toBe(25930)
     expect(r.via).toBe('vnetp-direct')
     expect(r.url).not.toContain('mt=')
     expect(opened.calls).toEqual([`DSH 分享|${r.url}`])
-    // ensure 打的是 VNETP 身份口 15200，不是 13911 裸网关
+    // 2026-11-13 三端统一：ensure 打的是 24011（public_router Host 分发），
+    // 不是 15200 老 VNETP 挂载、也不是 13911 裸网关
     expect(shell.ensureCalls).toBe(1)
-    expect(shell.ensureJsons[0]).toContain('"targetPort":15200')
+    expect(shell.ensureJsons[0]).toContain('"targetPort":24011')
     expect(shell.ensureJsons[0]).not.toContain('13911')
   })
 
@@ -169,6 +174,17 @@ describe('openTaskShare：VNETP 直入是唯一路径（2026-11-12 取票链删�
     expect(r.reason).toBe('unsupported')
     expect(r.message).toContain('打不开分享页')
     expect(r.message).not.toContain('连不上源设备') // 页面层失败 ≠ 隧道层失败，不混话术
+  })
+
+  it('旧形态卡（env 缺 deviceAlias/shareAlias）→ 如实要求重收新卡，不猜 /gw/ URL（2026-11-13 回落已删）', async () => {
+    shell.reply = { ok: true, localPort: 25932 } // 隧道层必须成功——失败点在 URL 组装层
+    const r = await openTaskShare(card({ env: [{ kind: 'dsh', device: 'did:myco:zPcx', port: 13911 }] }))
+    expect(r.ok).toBe(false)
+    if (r.ok) throw new Error('unreachable')
+    expect(r.reason).toBe('unsupported')
+    expect(r.message).toContain('旧形态')
+    expect(opened.calls).toEqual([]) // 不开页
+    expect(shell.ensureCalls).toBe(1) // 隧道已 ensure（失败在 URL 组装层，不在隧道层）
   })
 
   it('b) 跨账号卡 → unsupported 明确话术，ensure 一律不发起', async () => {

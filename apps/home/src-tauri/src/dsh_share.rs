@@ -6025,9 +6025,27 @@ struct Shares {
     spawn_fail_at: Mutex<HashMap<String, u64>>,
 }
 
+/// 2026-11-13 卡驱动放行：活跃（非 suspend/closed）分享卡声明的目标端口 → vnet mf 白名单。
+/// 与静态 `VNET_TARGET_PORTS` 并集；默认拒绝语义保留（既不在 env 也不在卡上 → 拒）。
+/// 连接层已有 DID 认证兜底同账号，卡端口集即授权面——新服务端口随建卡即时生效。
+fn refresh_mf_card_ports(arr: &[Share]) {
+    let mut ports: Vec<u16> = arr
+        .iter()
+        .filter(|s| s.state != ST_SUSPENDED && s.state != ST_CLOSED)
+        .flat_map(|s| s.env.iter().map(|e| e.port))
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    crate::vnet::connection::set_mf_card_ports(ports);
+}
+
 fn save_registry(shares: &Shares) {
     // 注意锁释放纪律：调用方不得持有 shares.shares/instances 锁（std Mutex 不可重入）
     let arr = shares.shares.lock().unwrap().clone();
+    // 2026-11-13 卡驱动放行（用户立法「端口由任务卡决定」）：
+    // 注册表每次落盘 = 卡集合可能变了 → 把活跃卡声明的目标端口注入 vnet mf 白名单。
+    // 建卡/撤卡/暂停/恢复全部经过 save_registry，单点收口。
+    refresh_mf_card_ports(&arr);
     let insts = shares.instances.lock().unwrap().clone();
     let doc = json!({
         "shares": arr.iter().map(|s| json!({
@@ -6373,6 +6391,11 @@ fn load_registry(shares: &Shares) {
     };
     *shares.shares.lock().unwrap() = list;
     *shares.instances.lock().unwrap() = insts;
+    // 2026-11-13 卡驱动放行：启动加载后也注入一次（此后变更经 save_registry 单点收口）
+    {
+        let arr = shares.shares.lock().unwrap().clone();
+        refresh_mf_card_ports(&arr);
+    }
     if migrated > 0 {
         // 只做内存迁移并审计；**不在加载路径写盘**（task-35 ⑥：绝不因启动迁移写真实 registry）。
         eprintln!("[dsh-share] 设备级 P/A 内存迁移完成：{migrated} 个分享（下次用户操作落盘）");

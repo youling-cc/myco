@@ -236,14 +236,27 @@ describe('DSH / HTTP：分享入口只走 VNETP 直入；普通 http env 照旧�
     expect(r.state).toBe('ready')
   })
 
-  it('分享入口：ensure 拿到口 → 打开隧道口上的 /gw/<id>/（免 mt、免断言、不建 13911）', async () => {
+  it('分享入口：ensure 拿到口 → 打开干净 URL（<alias>.localhost，免 mt、免 /gw/ 形态、不建 13911）', async () => {
     const d = deps({ ensureEntryForward: async () => 25914 })
-    const r = await openTaskEnv({ ...DSH, entryUrl: GW_ENTRY }, { gate: 'ok', deps: d })
-    expect(d.calls.url).toEqual(['http://127.0.0.1:25914/gw/sh-pc-env-dsh/'])
+    const r = await openTaskEnv(
+      { ...DSH, entryUrl: GW_ENTRY, deviceAlias: 'office-pc', shareAlias: 'dsh' },
+      { gate: 'ok', deps: d },
+    )
+    expect(d.calls.url).toEqual(['http://office-pc.localhost:25914/dsh/'])
     expect(d.calls.url[0]).not.toContain('mt=')
+    expect(d.calls.url[0]).not.toContain('/gw/')
     expect(d.calls.add).toEqual([]) // 13911 通道在这条路径上用不到，不再白建
     expect(r.state).toBe('ready')
     expect(r.note).toContain('已在系统浏览器打开')
+  })
+
+  it('分享入口：卡缺别名（旧形态）→ 如实 blocked，不猜 /gw/ URL（2026-11-13 回落已删）', async () => {
+    const d = deps({ ensureEntryForward: async () => 25915 })
+    const r = await openTaskEnv({ ...DSH, entryUrl: GW_ENTRY }, { gate: 'ok', deps: d })
+    expect(r.state).toBe('idle')
+    expect(r.started).toBe(false)
+    expect(r.note).toContain('旧形态')
+    expect(d.calls.url).toEqual([]) // 不开页
   })
 
   it('分享入口：拿不到口 → 如实 blocked，绝不回落 mt、绝不开页、不复制半截地址', async () => {
@@ -276,9 +289,9 @@ describe('DSH / HTTP：分享入口只走 VNETP 直入；普通 http env 照旧�
 
   it('env.shareId 坐标同样走 VNETP（不只认 entryUrl 形态）', async () => {
     const d = deps({ ensureEntryForward: async () => 25916 })
-    const env = { ...DSH, shareId: 'sh-from-env' } as TaskEnv & { shareId: string }
+    const env = { ...DSH, shareId: 'sh-from-env', deviceAlias: 'office-pc', shareAlias: 'main' } as TaskEnv & { shareId: string }
     const r = await openTaskEnv(env, { gate: 'ok', deps: d })
-    expect(d.calls.url).toEqual(['http://127.0.0.1:25916/gw/sh-from-env/'])
+    expect(d.calls.url).toEqual(['http://office-pc.localhost:25916/main/'])
     expect(r.state).toBe('ready')
   })
 
@@ -297,10 +310,14 @@ describe('DSH / HTTP：分享入口只走 VNETP 直入；普通 http env 照旧�
       },
     }
     try {
-      const r = await openTaskEnv({ ...DSH, entryUrl: GW_ENTRY }, { gate: 'ok', deps: d })
+      const r = await openTaskEnv(
+        { ...DSH, entryUrl: GW_ENTRY, deviceAlias: 'office-pc', shareAlias: 'dsh' },
+        { gate: 'ok', deps: d },
+      )
       expect(inApp.url).toHaveLength(1)
-      expect(inApp.url[0]).toBe('http://127.0.0.1:25914/gw/sh-pc-env-dsh/')
+      expect(inApp.url[0]).toBe('http://office-pc.localhost:25914/dsh/')
       expect(inApp.url[0]).not.toContain('mycoClient=') // 断言 fragment 随取票链删除
+      expect(inApp.url[0]).not.toContain('/gw/') // 2026-11-13 老形态已删
       expect(inApp.guard.length).toBe(1) // 焦点守卫脚本随行（点会话不弹软键盘）
       expect(d.calls.url).toEqual([]) // 没有回落系统浏览器
       expect(r.state).toBe('ready')
@@ -391,10 +408,13 @@ describe('DSH / HTTP：分享入口只走 VNETP 直入；普通 http env 照旧�
     const r1 = await openTaskEnv(httpEnv, { gate: 'ok', deps: plain })
     expect(plain.calls.url).toEqual(['http://127.0.0.1:23912/'])
     expect(r1.state).toBe('ready')
-    // ② 有分享坐标（shareId）→ VNETP 直入
+    // ② 有分享坐标（shareId）→ VNETP 直入（干净 URL；缺别名 → 如实旧形态）
     const tun = deps({ ensureEntryForward: async () => 25917 })
-    const r2 = await openTaskEnv({ ...httpEnv, shareId: 'sh-http' } as TaskEnv, { gate: 'ok', deps: tun })
-    expect(tun.calls.url).toEqual(['http://127.0.0.1:25917/gw/sh-http/'])
+    const r2 = await openTaskEnv(
+      { ...httpEnv, shareId: 'sh-http', deviceAlias: 'office-pc', shareAlias: 'svc' } as TaskEnv,
+      { gate: 'ok', deps: tun },
+    )
+    expect(tun.calls.url).toEqual(['http://office-pc.localhost:25917/svc/'])
     expect(r2.state).toBe('ready')
   })
 })
@@ -404,13 +424,17 @@ describe('「↗ 浏览器」：复制地址 + 系统浏览器（主路径仍是
 
   it('分享入口：复制/打开的都是 VNETP 直入 URL（同一地址；不再建 13911 固定口）', async () => {
     const d = deps({ ensureEntryForward: async () => 25914 })
-    const r = await openTaskEnvExternal({ ...DSH, entryUrl: ENTRY }, { gate: 'ok', deps: d })
+    const r = await openTaskEnvExternal(
+      { ...DSH, entryUrl: ENTRY, deviceAlias: 'office-pc', shareAlias: 'dsh' },
+      { gate: 'ok', deps: d },
+    )
     expect(d.calls.copy).toHaveLength(1)
     expect(d.calls.url).toHaveLength(1)
     // 复制的那条 = 交给浏览器的那条（用户收藏的就是实际打开的地址）
     expect(d.calls.url[0]).toBe(d.calls.copy[0])
-    expect(d.calls.url[0]).toBe('http://127.0.0.1:25914/gw/sh-pc-env-dsh/')
+    expect(d.calls.url[0]).toBe('http://office-pc.localhost:25914/dsh/')
     expect(d.calls.url[0]).not.toContain('mt=')
+    expect(d.calls.url[0]).not.toContain('/gw/')
     // 分享入口在设备隧道上，13911 固定口不白建
     expect(d.calls.add).toEqual([])
     expect(r.state).toBe('ready')
@@ -478,15 +502,21 @@ describe('「↗ 浏览器」：复制地址 + 系统浏览器（主路径仍是
 
   it('同一张卡：主路径与「浏览器」解析出的 URL 逐字相同（共用一份解析，不漂移）', async () => {
     const main = deps({ ensureEntryForward: async () => 25914 })
-    const a = await openTaskEnv({ ...DSH, entryUrl: ENTRY }, { gate: 'ok', deps: main })
+    const a = await openTaskEnv(
+      { ...DSH, entryUrl: ENTRY, deviceAlias: 'office-pc', shareAlias: 'dsh' },
+      { gate: 'ok', deps: main },
+    )
     const ext = deps({ ensureEntryForward: async () => 25914 })
-    const b = await openTaskEnvExternal({ ...DSH, entryUrl: ENTRY }, { gate: 'ok', deps: ext })
+    const b = await openTaskEnvExternal(
+      { ...DSH, entryUrl: ENTRY, deviceAlias: 'office-pc', shareAlias: 'dsh' },
+      { gate: 'ok', deps: ext },
+    )
     expect(a.state).toBe('ready')
     expect(b.state).toBe('ready')
     expect(main.calls.url).toHaveLength(1)
     // VNETP URL 确定（无毫秒时间戳/签名），两条路径必须逐字相同
     expect(ext.calls.url[0]).toBe(main.calls.url[0])
-    expect(ext.calls.url[0]).toBe('http://127.0.0.1:25914/gw/sh-pc-env-dsh/')
+    expect(ext.calls.url[0]).toBe('http://office-pc.localhost:25914/dsh/')
     expect(ext.calls.copy).toHaveLength(1)
     expect(ext.calls.copy[0]).toBe(main.calls.url[0])
   })

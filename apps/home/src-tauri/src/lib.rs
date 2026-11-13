@@ -15,6 +15,10 @@ const ENV_API: &str = "http://127.0.0.1:3102";
 // watch_probe_at 产线路径（同 p2p_server/p2p_client 的可见性放开理由）。
 /// 委任状自动续约巡检（2026-10-11 分身静默过期缺口：本体巡签+分身续约请求）。
 pub mod delegation_renewal;
+
+/// 出厂默认配置（2026-11-12）：裸跑 exe 也必须全量工作——设备域/身份闸/
+/// multi-forward/VNETP 口/mf 白名单等不再依赖启动脚本的 set 行。
+pub mod boot_config;
 #[cfg(feature = "gui")]
 pub mod identity_service;
 #[cfg(feature = "gui")]

@@ -33,6 +33,14 @@ macro_rules! tracelog {
 /// 2026-11-09 DSH F2 实测暴露：path=P2P IPv6 且 pipe_v6 rtt=86ms，而 relay 只有 35ms，
 /// 防御没触发（relay 基线缺失），把用户切到一条慢 2.5× 的路径上。
 static RELAY_RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// 2026-11-13 DSH 审计：IPv6 探测发包成败计数（原来 `let _ = send_to` 静默吞）。
+// 作用：pipe_v6 req>0 但 rep=0 时区分「对端不应答」vs「本机发包即失败」。
+static V6_SEND_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static V6_SEND_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// 2026-11-13 DSH 判读需求：server 侧 per-path 收包字节计数。
+// 用途：两端「path 显示不一致」时用实际字节流归因——p2p_rx_bytes 涨 = 数据真走 P2P。
+static SRV_P2P_RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SRV_RELAY_RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 发布 relay RTT 基线（keepalive 线程调用）
 pub fn note_relay_rtt(ms: u64) {
@@ -921,6 +929,13 @@ fn mf_target_allowed(port: u16, default_port: u16) -> bool {
     if port == default_port {
         return true;
     }
+    // 2026-11-13 卡驱动放行（用户立法「端口由任务卡决定」）：宿主（dsh_share）经
+    // set_mf_card_ports 注入活跃卡声明的目标端口，与静态 env 白名单取并集。
+    // 连接层已有 DID 认证兜底同账号，卡端口集即授权面；默认拒绝不变。
+    // 注：vendored 同步会覆盖本块——改动需同步进 apps/vnet（见 mf_card_ports 段）。
+    if mf_card_ports_contains(port) {
+        return true;
+    }
     static EXTRA: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
     let extra = EXTRA.get_or_init(|| {
         std::env::var("VNET_TARGET_PORTS")
@@ -929,6 +944,25 @@ fn mf_target_allowed(port: u16, default_port: u16) -> bool {
             .unwrap_or_default()
     });
     extra.contains(&port)
+}
+
+/// 卡声明端口集（宿主注入；RwLock 而非 OnceLock——建卡/撤卡会变）。
+static MF_CARD_PORTS: std::sync::RwLock<Option<Vec<u16>>> = std::sync::RwLock::new(None);
+
+/// 宿主注入活跃分享卡声明的目标端口全集（dsh_share 在建卡/撤卡/启动时调）。
+pub fn set_mf_card_ports(ports: Vec<u16>) {
+    if let Ok(mut g) = MF_CARD_PORTS.write() {
+        *g = Some(ports);
+    }
+}
+
+fn mf_card_ports_contains(port: u16) -> bool {
+    if let Ok(g) = MF_CARD_PORTS.read() {
+        if let Some(v) = g.as_ref() {
+            return v.contains(&port);
+        }
+    }
+    false
 }
 
 // ── per-peer 身份（identity.rs 的 server 侧接线；task.md §11 H.3.1）──
@@ -2269,6 +2303,21 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
 
         self.threads_alive.fetch_add(1, Ordering::Relaxed);
         let ka_relay = self.relay.clone();
+        // 换网自愈（2026-11-13）：记住上一次到 relay 的实际源 **IP**（不比端口），
+        // 变化即触发重注册。探测 socket 每次 bind(0) 端口都不同，比 SocketAddr 会
+        // 每秒误判「变化」→ 每秒重注册（已踩）。
+        let ka_last_src: Arc<Mutex<Option<std::net::IpAddr>>> =
+            Arc::new(Mutex::new(self.relay.local_src_addr().map(|a| a.ip())));
+        // 死判定（网络切换后数据面黑洞的显式信号；上层据此重建，不再靠 listener 猜）
+        let ka_dead: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let ka_dead_reason: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let ka_dead_streak: Arc<std::sync::atomic::AtomicU32> =
+            Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // 给 punch 状态写入器的副本（keepalive 闭包会 move 原值，必须在 spawn 前克隆）
+        let dead_for_status = ka_dead.clone();
+        let dead_reason_for_status = ka_dead_reason.clone();
+        let last_src_for_status = ka_last_src.clone();
+        let relay_for_status2 = ka_relay.clone();
         let ka_relay_arq = self.relay_arq.clone();
         let ka_target = self.target_peer_id;
         let ka_run = self.running.clone();
@@ -2342,7 +2391,29 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
                     let old_v6 = ns.ipv6;
                     let new_v6: Option<std::net::SocketAddr> = get_my_ipv6();
                     let (new_if, new_cost) = probe_default_if_status();
-                    let changed = new_v6 != old_v6 || new_if != ns.if_type || new_cost != ns.if_cost;
+                    // 2026-11-13 换网自愈：`/proc/net/route` 在 Android 被 SELinux 屏蔽
+                    // → if_type/if_cost 恒 Unknown，换网完全不可见。改用「到 relay 的
+                    // 实际本地源地址」作为主信号：WiFi→蜂窝时源 IP 必变。
+                    // 两个细节（都踩过/防过）：
+                    //  1) 只比 **IP** 不比端口——探测 socket 每次 bind(0) 端口不同
+                    //  2) 瞬态 None（切换瞬间无路由）**不**当作变化：否则一次抖动
+                    //     触发两次无谓重注册。恢复后按 IP 比对，真变了才触发。
+                    let new_src_ip = ka_relay.local_src_addr().map(|a| a.ip());
+                    let src_changed = match new_src_ip {
+                        Some(ip) => {
+                            let mut last = ka_last_src.lock().unwrap();
+                            let changed = last.map_or(true, |old| old != ip);
+                            if changed {
+                                println!("  [NETSTAT] relay source IP changed: {:?} -> {}",
+                                    *last, ip);
+                                *last = Some(ip);
+                            }
+                            changed
+                        }
+                        None => false, // 瞬态无路由：等恢复后比对
+                    };
+                    let changed = new_v6 != old_v6 || new_if != ns.if_type || new_cost != ns.if_cost
+                        || src_changed;
                     if changed {
                         ns.ipv6 = new_v6;
                         ns.if_type = new_if;
@@ -2372,6 +2443,32 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
                         }
                     } else {
                         ns.sensed_at = std::time::Instant::now();
+                    }
+                    // ── 死判定（2026-11-13 换网自愈需求）──────────────────────
+                    // 上层不再靠 listener 探活猜：这里给出显式 dead 位。
+                    // 判据：有在途数据（expect_data）+ relay 长时间无任何回包。
+                    // 换网后 relay peer 表仍是旧源地址 → 我们发得出去但收不到 →
+                    // relay_silent 持续增长，正好就是「数据面黑洞」的机器可读信号。
+                    {
+                        let has_inflight = ka_relay_arq.lock().unwrap().expect_data();
+                        let silent_ms = ka_relay.relay_silent_for()
+                            .map(|d| d.as_millis() as u64).unwrap_or(0);
+                        const DEAD_AFTER_MS: u64 = 25_000;
+                        const ALIVE_BELOW_MS: u64 = 5_000;
+                        if has_inflight && silent_ms > DEAD_AFTER_MS {
+                            if !ka_dead.swap(true, Ordering::Relaxed) {
+                                let reason = format!(
+                                    "no relay reply for {}ms with in-flight data (network switched?)",
+                                    silent_ms);
+                                *ka_dead_reason.lock().unwrap() = reason.clone();
+                                println!("  [DEAD] {}", reason);
+                            }
+                        } else if silent_ms < ALIVE_BELOW_MS {
+                            if ka_dead.swap(false, Ordering::Relaxed) {
+                                *ka_dead_reason.lock().unwrap() = String::new();
+                                println!("  [DEAD] cleared (relay responding again)");
+                            }
+                        }
                     }
                 }
                 // 5s status write (always-on, even with NO_P2P)
@@ -2421,6 +2518,13 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
                     // 与探测循环里的完整版 status 同键（NO_P2P 模式也必须能看到这些）：
                     // 宿主靠 stop_calls/local_port 定位停端口问题，靠 forwards.* 对账转发表。
                     let mut body = body;
+                    // 死判定 + 换网源地址（2026-11-13 换网自愈：上层读这两个键决定重建）
+                    body.push_str(&format!("dead={}\ndead_reason={}\nrelay_silent_ms={}\nrelay_src={}\n",
+                        ka_dead.load(Ordering::Relaxed),
+                        ka_dead_reason.lock().unwrap().clone(),
+                        ka_relay.relay_silent_for().map(|d| d.as_millis() as u64).unwrap_or(0),
+                        ka_last_src.lock().unwrap()
+                            .map(|a| a.to_string()).unwrap_or_else(|| "-".to_string())));
                     // ARQ 可观测：重传/窗口满/最长间隙（RDP 指针卡顿诊断）
                     {
                         let raq = ka_relay_arq.lock().unwrap();
@@ -2447,6 +2551,15 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
                     body.push_str(&format!("mf_opened={}\nmf_last_open={}\n",
                         ka_mf_opened.load(Ordering::Relaxed),
                         *ka_mf_last_info.lock().unwrap()));
+                    // IPv6 探测发包成败（2026-11-13 DSH 审计：req>0 rep=0 归因）
+                    body.push_str(&format!("v6_send_ok={}\nv6_send_fail={}\n",
+                        V6_SEND_OK.load(Ordering::Relaxed),
+                        V6_SEND_FAIL.load(Ordering::Relaxed)));
+                    // 本机全局 v6 地址（判「发了但收不到 vs 有地址对端不应答」）
+                    {
+                        let (n, first) = local_v6_snapshot();
+                        body.push_str(&format!("v6_local_count={}\nv6_local_first={}\n", n, first));
+                    }
                     let _ = std::fs::write(status_file_path_for("client", ka_id), body);
                 }
                 {
@@ -2559,6 +2672,9 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
         let mf_opened_for_status = self.mf_opened.clone();
         let mf_last_info_for_status = self.mf_last_open_info.clone();
         let arq_for_status = self.relay_arq.clone();
+        // 死判定/换网源地址也必须在 punch 版里（否则 1s 一次的 punch 写会盖掉
+        // keepalive 版的 dead 键——同一个坑 2026-11-12 已经踩过一次）
+        // 副本已在 ka_dead 声明处克隆（keepalive 闭包 move 原值）。
         let local_ip_watch = Arc::new(Mutex::new(get_my_local_ipv4()));
         let switch_score_net = self.switch_score.clone();
         let path_switches_net = self.path_switches.clone();
@@ -2789,7 +2905,16 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
 
                 // ── IPv6 候选：只负责发探测（收包由上面的独立 v6 接收线程负责）──
                 if let (Some(ref sock), Some(target)) = (&v6_sock, v6_candidate) {
-                    let _ = sock.send_to(&pkt, target);
+                    match sock.send_to(&pkt, target) {
+                        Ok(_) => { V6_SEND_OK.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => {
+                            let n = V6_SEND_FAIL.fetch_add(1, Ordering::Relaxed);
+                            // 前 3 次打日志（之后静默只计数，避免刷屏）
+                            if n < 3 {
+                                eprintln!("  [P2P-V6] send_to {} failed (#{}): {:#}", target, n + 1, e);
+                            }
+                        }
+                    }
                 }
 
                 // 定期报告（控制台 30 秒一次，状态文件 1 秒一次）
@@ -3002,6 +3127,13 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
                         ("probe_rounds", count.to_string()),
                         ("candidates", candidates.len().to_string()),
                         ("path_switches", path_switches_for_status.lock().unwrap().to_string()),
+                        // 死判定 + 换网源地址（与 keepalive 版同键）
+                        ("dead", dead_for_status.load(Ordering::Relaxed).to_string()),
+                        ("dead_reason", dead_reason_for_status.lock().unwrap().clone()),
+                        ("relay_silent_ms", relay_for_status2.relay_silent_for()
+                            .map(|d| d.as_millis() as u64).unwrap_or(0).to_string()),
+                        ("relay_src", last_src_for_status.lock().unwrap()
+                            .map(|a| a.to_string()).unwrap_or_else(|| "-".to_string())),
                         ("ipv6_candidate", v6_candidate.is_some().to_string()),
                         ("encrypted", enc_for_status.to_string()),
                         ("last_rtt_ms", last_rtt_for_status.lock().unwrap().clone()),
@@ -3043,6 +3175,14 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
                     // forward_targeted 观测（与 keepalive 版同键，避免格式跳变）
                     fields.push(("mf_opened".into(), mf_opened_for_status.load(Ordering::Relaxed).to_string()));
                     fields.push(("mf_last_open".into(), mf_last_info_for_status.lock().unwrap().clone()));
+                    // IPv6 探测发包成败（req>0 rep=0 归因）
+                    fields.push(("v6_send_ok".into(), V6_SEND_OK.load(Ordering::Relaxed).to_string()));
+                    fields.push(("v6_send_fail".into(), V6_SEND_FAIL.load(Ordering::Relaxed).to_string()));
+                    {
+                        let (n, first) = local_v6_snapshot();
+                        fields.push(("v6_local_count".into(), n.to_string()));
+                        fields.push(("v6_local_first".into(), first));
+                    }
                     // ARQ 可观测（RDP 指针卡顿诊断）
                     {
                         let raq = arq_for_status.lock().unwrap();
@@ -4592,6 +4732,10 @@ pub fn start_server_full(
                         }
                     }
                     let delivered = entry.stream.on_packet(&buf[..len]);
+                    if !delivered.is_empty() {
+                        let n: usize = delivered.iter().map(|d| d.len()).sum();
+                        SRV_P2P_RX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                    }
                     // 对端进程换代（P2P 会话公告 TYPE_SESSION）：旧会话的上游流全废。
                     // 不清这张表的话，新会话复用同一 stream id 会被路由到已死的 TcpStream。
                     {
@@ -4865,6 +5009,10 @@ pub fn start_server_full(
                             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100000);
                     }
                     let delivered = entry.stream.on_packet(&buf[..len]);
+                    if !delivered.is_empty() {
+                        let n: usize = delivered.iter().map(|d| d.len()).sum();
+                        SRV_P2P_RX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                    }
                     // 对端进程换代（P2P 会话公告 TYPE_SESSION）：旧会话的上游流全废。
                     {
                         let gen_now = entry.stream.session_generation();
@@ -5242,6 +5390,11 @@ pub fn start_server_full(
                 if let Some(ref ack) = ack_frame {
                     let _ = relay.send_to_peer(src_peer, ack);
                 }
+                // per-path 字节计数（2026-11-13 DSH 判读：relay_rx_bytes 涨 = 数据真走 relay）
+                if !deliver.is_empty() {
+                    let n: usize = deliver.iter().map(|d| d.len()).sum();
+                    SRV_RELAY_RX_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                }
                 for frame in fast_retransmit {
                     let _ = relay.send_to_peer(src_peer, &frame);
                 }
@@ -5565,19 +5718,47 @@ pub fn start_server_full(
                     }
                 }
             }
+            // ── 2026-11-13 P0（本会话引入的回归，已修）──
+            // std::sync::Mutex 不可重入。原实现把 3 次 `p2p_inbound().lock()` 写在
+            // 同一个 `let body = vec![...]` 语句里——Rust 临时值作用域让先创建的
+            // guard 活到整条语句结束，第二次 lock 同一 mutex 就**永久阻塞**，
+            // server 主循环在启动后第 5s（首次状态写入）整体冻结（数据面一起死）。
+            // 真机表现：PC server 状态文件 updated_at 停在旧进程，新进程永不写。
+            // 修法：进 vec 之前一次性加锁，算完所有派生值，guard 在块结束时释放。
+            let (p2p_active, p2p_peer_count, inbound_p2p_str) = {
+                let m = p2p_inbound().lock().unwrap();
+                let win = Duration::from_secs(30);
+                let addrs: Vec<String> = m
+                    .iter()
+                    .filter(|(_, t)| t.elapsed() < win)
+                    .map(|(a, _)| a.clone())
+                    .collect();
+                (!addrs.is_empty(), addrs.len(), addrs.join(","))
+            };
+            let srv_path = {
+                let p2p_b = SRV_P2P_RX_BYTES.load(Ordering::Relaxed);
+                let relay_b = SRV_RELAY_RX_BYTES.load(Ordering::Relaxed);
+                if p2p_b > 0 && relay_b > 0 {
+                    "mixed".to_string()
+                } else if p2p_active && p2p_b > 0 {
+                    "p2p".to_string()
+                } else if p2p_active {
+                    // 有活跃 P2P 对端但还没统计到数据字节：路径已在 P2P
+                    "p2p".to_string()
+                } else {
+                    "relay".to_string()
+                }
+            };
             let body = vec![
                 ("role", "server".to_string()),
                 ("my_peer_id", peer_id.to_string()),
                 ("target_port", target_port.to_string()),
                 ("clients_seen", clients_seen.to_string()),
-                ("inbound_p2p", {
-                    let m = p2p_inbound().lock().unwrap();
-                    m.iter()
-                        .filter(|(_, t)| t.elapsed() < Duration::from_secs(30))
-                        .map(|(a, _)| a.clone())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }),
+                ("path", srv_path),
+                ("p2p_rx_bytes", SRV_P2P_RX_BYTES.load(Ordering::Relaxed).to_string()),
+                ("relay_rx_bytes", SRV_RELAY_RX_BYTES.load(Ordering::Relaxed).to_string()),
+                ("p2p_peers_active", p2p_peer_count.to_string()),
+                ("inbound_p2p", inbound_p2p_str),
                 ("encrypted", relay.is_encrypted().to_string()),
                 ("updated_at", format!("{:?}",
                     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -5742,16 +5923,74 @@ fn get_my_ipv6() -> Option<std::net::SocketAddr> {
     None
 }
 
-/// 枚举本机所有全局 IPv6 地址，按优先级排序（managed > temporary）。
-/// 跨平台：Windows 用 GetAdaptersAddresses，Linux/Android 用 /proc/net/if_inet6 或 getifaddrs。
+/// 本机全局 IPv6 地址快照（getifaddrs，5s 缓存）：(数量, 首个地址)。
+/// 2026-11-13 DSH 判读需求：`v6_send_ok>0` 但 `pipe_v6 req=0 rep=0` 时，
+/// 必须能区分「本机无全局源地址仍发包（对端收不到/回不来）」vs「本机有地址但对端不应答」。
+fn local_v6_snapshot() -> (usize, String) {
+    use std::sync::Mutex;
+    static CACHE: std::sync::OnceLock<Mutex<(std::time::Instant, usize, String)>> =
+        std::sync::OnceLock::new();
+    let m = CACHE.get_or_init(|| {
+        Mutex::new((std::time::Instant::now() - Duration::from_secs(10), 0, String::new()))
+    });
+    let mut g = m.lock().unwrap();
+    if g.0.elapsed() >= Duration::from_secs(5) {
+        let addrs = local_ipv6_addrs().unwrap_or_default();
+        let first = addrs.first().map(|a| a.to_string()).unwrap_or_default();
+        *g = (std::time::Instant::now(), addrs.len(), first);
+    }
+    (g.1, g.2.clone())
+}
+/// 2026-11-13 DSH 审计修复：Android/Unix 用真 getifaddrs 枚举（原注释自称
+/// 「接口枚举」但实际是 UDP connect 探测法——只能发现默认路由所在接口；
+/// WiFi+蜂窝并存或 v6 走非默认路由时探不到，req=0 的观测盲区来源之一）。
+/// Windows 保留 connect 探测（无 libc getifaddrs，行为已在本地验证）。
+#[cfg(unix)]
+fn local_ipv6_addrs() -> anyhow::Result<Vec<std::net::Ipv6Addr>> {
+    let mut result: Vec<(u32, std::net::Ipv6Addr)> = Vec::new();
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            anyhow::bail!("getifaddrs failed");
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET6 {
+                let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                let v6 = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                if !v6.is_loopback()
+                    && !v6.is_unicast_link_local()
+                    && !v6.is_unspecified()
+                    && !v6.is_multicast()
+                {
+                    // sin6_scope_id：全局地址=0，链路本地=接口索引（已过滤）
+                    result.push((sin6.sin6_scope_id, v6));
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+    }
+    // 全局优先（scope 小者优先），去重保序
+    result.sort_by_key(|(scope, _)| *scope);
+    let mut out: Vec<std::net::Ipv6Addr> = Vec::new();
+    for (_, a) in result {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    Ok(out)
+}
+
+/// Windows：保留 UDP connect 探测（无 getifaddrs；单路由表场景足够）。
+#[cfg(not(unix))]
 fn local_ipv6_addrs() -> anyhow::Result<Vec<std::net::Ipv6Addr>> {
     let mut result: Vec<std::net::Ipv6Addr> = Vec::new();
-    // UDP socket 枚举法：绑定 [::]:0 并 connect 到多个目标，收集不同接口的地址
-    // （无需 OS 特定 API，纯 Rust 标准库）
     let probes = [
-        "2001:4860:4860::8888",  // Google (可能走 WiFi 或默认路由)
-        "2400:3200::1",           // 百度 (国内 IPv6 路由)
-        "3fff:1e1::1",            // 电信 IPv6
+        "2001:4860:4860::8888",  // Google
+        "2400:3200::1",          // 百度
+        "3fff:1e1::1",           // 电信
     ];
     for target in probes {
         if let Ok(sock) = UdpSocket::bind("[::]:0") {

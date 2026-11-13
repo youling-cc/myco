@@ -37,7 +37,7 @@ import * as ed from '@noble/ed25519'
 import { accountDidAliases, accountDidCanonical, accountDidEq, convSafe, convSafesAll, didSafeId, restoreDidSafe } from './didUtil'
 // 「点卡就进」的回包投递（share-entry-grant → 唤醒等在 remoteOpen 的调用方）。
 // 无循环依赖：share-entry 只依赖 p2p-tunnel 的类型与纯函数，不引 chat-store。
-import { deliverShareEntryGrant, actionShareCoords } from './share-entry'
+import { actionShareCoords } from './share-entry'
 // 2026-10-25 文案精简：任务卡标题显示时抹掉 127.0.0.1:端口 等技术细节（纯显示层，
 // task-env 只导出纯函数，无循环依赖）。数据与打开链路不动。
 import { cleanCardTitle } from './task-env'
@@ -1623,15 +1623,9 @@ function ingestTaskRename(my: string, m: ServerMsg): boolean {
 export function ingestMsg(my: string, m: ServerMsg): boolean {
   // 2026-10-20 小灵官方通知：验签通过才落「小灵」会话（与 PC ingest_msg 同位置）
   if (m.kind === OFFICIAL_NOTICE_KIND) return ingestOfficialNotice(my, m)
-  // 2026-10-09 跨设备「代打开」控制 kind（与 PC 端 chat_service::ingest_msg 同位置、同语义）：
-  //   · `share-entry-grant`：源设备现签的窄票回来了 → 唤醒在等的「点卡就进」。
-  //     **没有会话语义**，落行会把"收到一张票"变成聊天记录；放在最前面拦掉。
-  //   · `share-entry-request` 的对侧处理在 PC（手机永远不是源设备，收到即丢弃——
-  //     不给探测者当放大器）。
-  if (m.kind === 'share-entry-grant') {
-    return deliverShareEntryGrant(m as unknown as Record<string, unknown>)
-  }
-  if (m.kind === 'share-entry-request') return true
+  // 2026-11-12 取票链整链删除后，`share-entry-grant`/`share-entry-request` 已无发送方：
+  // 收到的都是历史残留/旁路消息——**直接丢弃、不落行**（不给探测者当放大器）。
+  if (m.kind === 'share-entry-grant' || m.kind === 'share-entry-request') return true
   // §3.23 转授闸（与 PC 端 chat_service::ingest_msg 同位置、同语义）：
   //   · `reshare-grant`：主人批/驳了我那张卡的转授申请 → 刷新本地卡的转授能力
   //     （**只改这一张卡的元数据**，不落气泡、不新增卡）；

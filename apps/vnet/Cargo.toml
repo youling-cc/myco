@@ -36,6 +36,11 @@ futures-util = "0.3"
 anyhow = "1"
 base64 = "0.22"
 
+# 2026-11-13 DSH 审计：Android getifaddrs 真接口枚举（UDP connect 探测法找不到
+# 非默认路由接口的全局 IPv6；WiFi+蜂窝并存时尤其明显）
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = true

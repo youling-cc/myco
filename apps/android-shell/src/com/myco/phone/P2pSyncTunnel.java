@@ -67,6 +67,14 @@ public final class P2pSyncTunnel {
     private static final Map<String, Map<Integer, Integer>> DESIRED = new HashMap<>();
     /** 本地回环口 → 上次端到端探活通过的时刻（见 {@link #ALIVE_TTL_MS}）。 */
     private static final Map<Integer, Long> ALIVE_OK_AT = new HashMap<>();
+
+    // ═══ 2026-11-13 期望面持久化（用户立法：卡定需求，重启不失忆）═══
+    // 真机 RED：app 重启 → DESIRED（内存态）清空 → 3389(RDP) 无人挂载，
+    // 直到用户点卡才现场 ensure——PC 重启/手机重启后的第一次点卡必踩
+    // 「隧道重建窗」而失败。期望面必须跨进程重启存活，并在启动后主动拉起。
+    private static android.content.Context appCtx;
+    /** 最近一次 ensure 传入的本机设备 did（恢复线程要用它拼 ensure 请求）。 */
+    private static volatile String myDeviceDid = "";
     /** deviceDid → 上次重建时刻（冷静期判据，见 {@link #REBUILD_GRACE_MS}）。 */
     private static final Map<String, Long> REBUILD_AT = new HashMap<>();
 
@@ -113,6 +121,37 @@ public final class P2pSyncTunnel {
      *  ——读超时 5s，只在 IOException（拒绝/重置）时判死，readTimeout 到点视为
      *  「慢但活」不 evict（避免误杀健康连接引发重建循环）。 */
     private static boolean dataPlaneAlive(int port) {
+        // 2026-11-13 按端口选探活方式（用户立法：探活方式是卡的属性，不是平台的）：
+        // RDP(目标 3389) 是 X.224 二进制协议——HTTP GET 它只会挂到读超时被误判「慢但活」，
+        // 隧道死了也查不出来（幂等分支放行 → 黑洞）。改发 X.224 CR、等 CC 首字节：
+        // 有应答=真活，静默/异常=死。探活包取 returnpath 回归的同款字节。
+        String owner = PORT_OWNER.get(port);
+        if (owner != null && owner.endsWith("|3389")) {
+            return x224Alive(port);
+        }
+        return httpAlive(port);
+    }
+
+    /** X.224 探活：发 CR TPDU，等任意首字节（RDP 服务器会回 CC）。2.5s 内
+     *  无应答/异常 = 死（RDP 应答是即时的，不存在「慢但活」）。 */
+    private static boolean x224Alive(int localPort) {
+        java.net.Socket s = new java.net.Socket();
+        try {
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", localPort), 800);
+            s.setSoTimeout(2500);
+            s.getOutputStream().write(new byte[] {
+                    3, 0, 0, 19, 14, (byte) 0xE0, 0, 0, 0, 0, 0, 1, 0, 8, 0, 3, 0, 0, 0 });
+            s.getOutputStream().flush();
+            int b = s.getInputStream().read();
+            return b == 0x03; // CC TPDU 也以 03 00 00 开头
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            try { s.close(); } catch (Throwable ignored) { }
+        }
+    }
+
+    private static boolean httpAlive(int port) {
         java.net.HttpURLConnection c = null;
         try {
             java.net.URL u = new java.net.URL("http://127.0.0.1:" + port
@@ -201,7 +240,89 @@ public final class P2pSyncTunnel {
             DESIRED.put(targetDevice, want);
         }
         want.put(targetPort, localPort);
+        persistDesired();
         return true;
+    }
+
+    // ═══ 期望面持久化：init 恢复 / armPort 落盘 / 恢复线程主动拉起 ═══
+
+    /** MainActivity.onCreate 调：恢复上次的期望面，并排一个延迟恢复线程。 */
+    public static void init(android.content.Context ctx) {
+        appCtx = ctx.getApplicationContext();
+        try {
+            String s = appCtx.getSharedPreferences("p2p_tunnel", 0).getString("desired", null);
+            if (s != null && !s.isEmpty()) {
+                JSONObject o = new JSONObject(s);
+                myDeviceDid = o.optString("device", "");
+                JSONObject want = o.optJSONObject("desired");
+                if (want != null) {
+                    java.util.Iterator<String> it = want.keys();
+                    while (it.hasNext()) {
+                        String dev = it.next();
+                        JSONObject ports = want.getJSONObject(dev);
+                        Map<Integer, Integer> m = new LinkedHashMap<>();
+                        java.util.Iterator<String> pk = ports.keys();
+                        while (pk.hasNext()) {
+                            String k = pk.next();
+                            m.put(Integer.parseInt(k), ports.getInt(k));
+                        }
+                        DESIRED.put(dev, m);
+                    }
+                }
+                android.util.Log.i("P2pDeviceTunnel", "init: 恢复期望面 devices=" + DESIRED.size());
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("P2pDeviceTunnel", "init: 期望面恢复失败 " + t);
+        }
+        // 恢复线程：等网络/身份就绪（SPA vnet-identity 注入）后把期望面全部拉起。
+        // 25s = 冷启动身份链（presence/注册）实测余量；失败不重试——
+        // 各端口的自然消费者（sync tick / 点卡）会兜底 ensure。
+        Thread t = new Thread(() -> {
+            try { Thread.sleep(25_000); } catch (InterruptedException ignored) { }
+            try { restoreDesired(); } catch (Throwable x) {
+                android.util.Log.w("P2pDeviceTunnel", "restore: " + x);
+            }
+        }, "p2p-restore");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static void restoreDesired() {
+        if (myDeviceDid.isEmpty() || DESIRED.isEmpty()) return;
+        Map<String, Map<Integer, Integer>> snap;
+        synchronized (P2pSyncTunnel.class) { snap = new HashMap<>(DESIRED); }
+        for (Map.Entry<String, Map<Integer, Integer>> e : snap.entrySet()) {
+            for (Map.Entry<Integer, Integer> p : e.getValue().entrySet()) {
+                try {
+                    String r = ensure(new JSONObject()
+                            .put("device", myDeviceDid)
+                            .put("targetDevice", e.getKey())
+                            .put("targetPort", p.getKey())
+                            .put("localPort", p.getValue()).toString());
+                    android.util.Log.i("P2pDeviceTunnel",
+                            "restore " + e.getKey() + ":" + p.getKey() + " -> " + r);
+                } catch (Throwable ignored) { }
+            }
+        }
+    }
+
+    private static void persistDesired() {
+        if (appCtx == null) return;
+        try {
+            JSONObject o = new JSONObject();
+            o.put("device", myDeviceDid);
+            JSONObject want = new JSONObject();
+            for (Map.Entry<String, Map<Integer, Integer>> e : DESIRED.entrySet()) {
+                JSONObject ports = new JSONObject();
+                for (Map.Entry<Integer, Integer> p : e.getValue().entrySet()) {
+                    ports.put(String.valueOf(p.getKey()), p.getValue());
+                }
+                want.put(e.getKey(), ports);
+            }
+            o.put("desired", want);
+            appCtx.getSharedPreferences("p2p_tunnel", 0).edit()
+                    .putString("desired", o.toString()).apply();
+        } catch (Throwable ignored) { }
     }
 
     /**
@@ -287,6 +408,7 @@ public final class P2pSyncTunnel {
             if (targetDevice.isEmpty() || device.isEmpty()) {
                 return err("缺少 targetDevice/device");
             }
+            if (!device.isEmpty()) myDeviceDid = device;
             int targetPort = o.optInt("targetPort", DEFAULT_TARGET_PORT);
             int wantLocal = o.optInt("localPort", 0);
             if (targetPort <= 0 || targetPort > 65535) {

@@ -88,6 +88,9 @@ public class MainActivity extends Activity {
             registerReceiver(screenOnReceiver, sf);
         } catch (Throwable ignored) { }
         super.onCreate(b);
+        // 2026-11-13 期望面持久化：恢复上次的 DESIRED 转发集并排恢复线程
+        // （RDP 3389 不再等点卡才挂——重启后首点失败根修）。
+        try { P2pSyncTunnel.init(this); } catch (Throwable ignored) { }
         // 记录本进程启动时的版本（只首次赋值：同一个旧进程即使 Activity 重建，也不会把新包版号写进来）
         if (sProcessVersionCode < 0) {
             try { sProcessVersionCode = currentVersionCode(); } catch (Throwable ignored) { }

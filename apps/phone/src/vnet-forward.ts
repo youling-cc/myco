@@ -752,7 +752,20 @@ export function bootVnetForwards(): void {
       }
     },
   }
-  for (const f of loadForwards()) {
+  // 2026-11-13 单一 owner（真机 RED：RDP「反复失效」根因）：3389(RDP)/13911(DSH gw)
+  // 的本地转发归 **mf 客户端**（ensureRdpForwardFor/ensureShareEntryForwardFor，
+  // R13 耐久回归锁定）。legacy 表里若有历史残留条目（ensureRdpForwardFor 曾回写），
+  // 启动时**清除且不恢复**——恢复=Java ARM 抢绑 23389/23911，与 mf 赛跑，
+  // legacy 数据面赢了就是黑洞（rc=4 回落那套）。
+  const MF_OWNED_TARGET_PORTS = new Set([3389, 13911])
+  const all = loadForwards()
+  const junk = all.filter((f) => MF_OWNED_TARGET_PORTS.has(f.port))
+  if (junk.length > 0) {
+    const kept = all.filter((f) => !MF_OWNED_TARGET_PORTS.has(f.port))
+    saveForwards(kept)
+    flog('boot: 清除 legacy 表中 mf 专属口条目 ' + junk.map((f) => `${f.localPort}->${f.port}`).join(','))
+  }
+  for (const f of all.filter((x) => !MF_OWNED_TARGET_PORTS.has(x.port))) {
     if (f.enabled === false) continue
     startForward(f)
   }
