@@ -117,6 +117,11 @@ describe('五状态文案与色点（设计 §5）', () => {
     expect(rowStateOf({ state: 'weird', ok: false })).toBe('idle')
     expect(rowStateOf(null)).toBe('idle')
   })
+  it('链路就绪但客户端没起来 → error（自连提示不算失败）', () => {
+    // 2026-11-14：RootFallback 曾把 state=ready 亮成绿点，同时提示行说"入口不可用"——自相矛盾。
+    expect(rowStateOf({ state: 'ready', ok: true, clientStarted: false, error: '坐标不全' })).toBe('error')
+    expect(rowStateOf({ state: 'ready', ok: true, selfTarget: true, error: '自连提示' })).toBe('ready')
+  })
 })
 
 describe('openArgs：卡身份随行（审计可答"谁用哪张卡用了什么"）', () => {
@@ -164,11 +169,51 @@ describe('resultNote：提示行说人话，不再带地址/端口/URL（2026-10
     expect(note).toContain('已启动远程桌面')
     expect(note).not.toContain('127.0.0.1')
   })
+  it('浏览器成功：状态行与 hint 同义时不重复（2026-11-14 真案）', () => {
+    const note = resultNote({
+      ok: true,
+      state: 'ready',
+      tunnel: 'device-origin',
+      localPort: 24011,
+      requestedLocalPort: 23911,
+      clientStarted: true,
+      client: 'browser',
+      hint: '已在系统浏览器打开 http://desktop-kjs1h2l.localhost:24011/dsh/',
+    })
+    expect(note).toBe('已在系统浏览器打开')
+  })
   it('固定口漂移：说"换用临时通道"，不报端口号', () => {
     const note = resultNote({ ok: true, address: '127.0.0.1:24001', localPort: 24001, requestedLocalPort: 23389, clientStarted: false })
     expect(note).toContain('原通道被占用')
     expect(note).not.toContain('23389')
     expect(note).not.toContain('24001')
+  })
+  it('设备域终态：本地口是 viewer 全局 HTTP 口，不报"换用临时通道"（2026-11-14 真案）', () => {
+    const note = resultNote({
+      ok: true,
+      state: 'ready',
+      tunnel: 'device-origin',
+      localPort: 24011,
+      requestedLocalPort: 23911,
+      clientStarted: true,
+      client: 'browser',
+      hint: '已在系统浏览器打开 http://desktop-kjs1h2l.localhost:24011/dsh/',
+    })
+    expect(note).toContain('已在系统浏览器打开')
+    expect(note).not.toContain('临时通道')
+    expect(note).not.toContain('24011')
+  })
+  it('链路就绪但打开失败：不给"已就绪"假绿，直接说卡的问题（2026-11-14 真案）', () => {
+    const note = resultNote({
+      ok: true,
+      state: 'ready',
+      clientStarted: false,
+      client: 'browser',
+      error: '卡坐标无法生成分享入口',
+      hint: '这张卡的入口地址不可用，已避免打开必失败的页面',
+    })
+    expect(note).toContain('入口地址不可用')
+    expect(note).not.toContain('已就绪')
   })
   it('自连（本机是服务端）用 hint；hint 里的地址也要抹掉', () => {
     expect(resultNote({ ok: true, selfTarget: true, address: '127.0.0.1:23389', hint: '这是本机' })).toContain('本机')

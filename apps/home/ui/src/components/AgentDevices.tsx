@@ -331,6 +331,8 @@ export function AgentDevices({ devices, canManage, ownerRootDid, onToast }: {
   const [renameFor, setRenameFor] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
   const [errBy, setErrBy] = useState<Record<string, string>>({})
+  // 2026-11-15：名册里已吊销的历史设备默认折叠（用户"这些还是没删"实拍）
+  const [showRevoked, setShowRevoked] = useState(false)
 
   const refresh = useCallback(async () => {
     // 放行态（本地白名单）：命令不可用（旧 exe）→ 放行态未知，行内按"未授权"降级
@@ -379,11 +381,18 @@ export function AgentDevices({ devices, canManage, ownerRootDid, onToast }: {
     setCopied(false); setConfirmRemove(null); setTtlFor(null); setRenameFor(null)
   }
 
+  // 2026-11-15 用户反馈「这些还是没删」：名册里已吊销的历史设备仍以「已除名」
+  // 逐行铺开（10 台 cloud-mac / ecs-linux / 旧 phone…），把活设备淹掉。
+  // 默认只显示未吊销设备；已除名的折叠成一行可展开摘要（用户要看历史再点开）。
+  const alive = devices.filter((d) => !d.revoked)
+  const revoked = devices.filter((d) => d.revoked)
+  const shownDevices = showRevoked ? devices : alive
+
   return (
     <div>
       <div className="tinyd" style={{ margin: '4px 0 2px' }}>本机 / 我的设备</div>
       {devices.length === 0 && <div className="tinyd" style={{ padding: '2px 0' }}>还没有设备——账号页「添加设备」可加手机/电脑</div>}
-      {devices.map((d) => {
+      {shownDevices.map((d) => {
         const presence = devicePresence(d)
         const auth = authOf(d)
         const ops = deviceOps(d, auth, { canManage })
@@ -424,6 +433,17 @@ export function AgentDevices({ devices, canManage, ownerRootDid, onToast }: {
             }} />
         )
       })}
+      {/* 已除名历史设备折叠行（2026-11-15）：默认收起，避免把活设备淹没 */}
+      {revoked.length > 0 && (
+        <button
+          onClick={() => setShowRevoked((v) => !v)}
+          style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', marginTop: 4,
+            padding: '4px 8px', fontSize: 10, lineHeight: '16px', borderRadius: 6,
+            border: '1px dashed var(--chrome-border)', background: 'transparent',
+            color: 'var(--text-muted)', cursor: 'pointer' }}>
+          {showRevoked ? '▾' : '▸'} 已除名历史设备 {revoked.length} 台（{alive.length} 台在用）
+        </button>
+      )}
       {!canManage && devices.length > 0 && (
         <div className="tinyd" style={{ marginTop: 6 }}>放行/除名需在持有账号钥匙的主设备上操作——本机是成员，可查看状态与复制 DID。</div>
       )}

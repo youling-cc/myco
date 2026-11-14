@@ -1292,18 +1292,45 @@ fn parse_env_input(raw: Option<&serde_json::Value>) -> Result<Vec<ShareEnv>, Str
     Ok(out)
 }
 
-/// **读盘路径的宽松解析**（老记录/他机写坏的数据）：逐条走严格校验，**坏条目单条丢弃**，
-/// 绝不整体失败（否则一条坏 env 会让"分享全消失"——违反兼容红线）。
+/// **读盘路径的宽松解析**（老记录/他机写坏的数据）：**能解析多少留多少**。
+///
+/// 2026-11-15 事故整改（用户 01:32 卡点不开根因链）：原实现逐条重跑**建卡级严格校验**
+/// （`parse_env_input`），任何一条命中保留口/端口非法/同卡重口就**静默丢弃**，
+/// 于是重启后 `Share.env=[]` → `share_card_record` 的 `if !share.env.is_empty()`
+/// 整个分支跳过 → 之后每次广播出去的卡**同时没有 env 和 caps**，接收端点开必
+/// "卡未声明 caps" denied。判定权本应只在执行器（`vnet_env::parse_call`）一处，
+/// 读盘不该二次裁决：这里只丢"结构上不可能用"的条目（缺 kind / 缺 device /
+/// port=0），端口类问题保留原值，开卡时由执行器报人话。
 fn parse_env_stored(v: Option<&serde_json::Value>) -> Vec<ShareEnv> {
     let Some(arr) = v.and_then(|x| x.as_array()) else {
         return Vec::new();
     };
     let mut out: Vec<ShareEnv> = Vec::new();
     for it in arr.iter().take(MAX_CARD_ENVS) {
-        if let Ok(one) = parse_env_input(Some(&serde_json::json!([it]))) {
-            out.extend(one);
+        let Some(obj) = it.as_object() else { continue };
+        let kind = obj.get("kind").and_then(|k| k.as_str()).unwrap_or("").trim();
+        let device = obj.get("device").and_then(|d| d.as_str()).unwrap_or("").trim();
+        // 结构必需项缺失 = 无法执行，丢弃（这是"坏数据"的唯一定义）
+        if kind.is_empty() || !device.starts_with("did:") {
+            eprintln!("[dsh-share] env 条目结构缺失（kind/device），丢弃: {it}");
+            continue;
         }
+        let port = env_u16(obj.get("port")).unwrap_or(0);
+        if port == 0 {
+            eprintln!("[dsh-share] env 条目 port=0，丢弃: {it}");
+            continue;
+        }
+        let local_port = env_u16(obj.get("localPort")).unwrap_or(0);
+        out.push(ShareEnv {
+            kind: kind.to_string(),
+            device: device.to_string(),
+            port,
+            local_port,
+            label: obj.get("label").and_then(|l| l.as_str()).map(|s| s.to_string()),
+            requires: obj.get("requires").cloned(),
+        });
     }
+    // 同卡同 localPort 保留第一条（后条与它抢同一个本地口，执行器也只会绑一个）
     let mut seen = std::collections::HashSet::new();
     out.retain(|e| seen.insert(e.local_port));
     out
@@ -3519,37 +3546,54 @@ fn detect_dsh_port(old: u16) -> Option<u16> {
 }
 
 /// 插件 listener 状态文件（插件唯一写者；myco 纯读者）。
+///
+/// `MYCO_WEB_LISTENER_JSON` 可显式指定路径：测试隔离（不读宿主真实 profile 的
+/// 插件口）与多 profile 运维用；未设时按契约走 `%USERPROFILE%\.dsh\web-listener.json`。
 fn plugin_listener_file() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("MYCO_WEB_LISTENER_JSON") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
     std::env::var("USERPROFILE")
         .map(|h| std::path::PathBuf::from(h).join(".dsh").join("web-listener.json"))
         .unwrap_or_else(|_| std::path::PathBuf::from(r"C:\Users\you\.dsh\web-listener.json"))
 }
 
 /// 插件 listener 口（带 5s 缓存 + TCP 探活）。插件不在/死了 → None（回退直连）。
+///
+/// 缓存键含状态文件路径：换了 profile/隔离目录不得复用上一个路径确认过的口
+/// （2026-11-14 真案：全量跑时进程级缓存把宿主真实的 :17878 泄漏给了隔离用例）。
 fn plugin_listener_port_cached() -> Option<u16> {
-    static CACHE: std::sync::Mutex<(Option<u16>, u64, bool)> = std::sync::Mutex::new((None, 0, false));
+    static CACHE: std::sync::Mutex<(String, Option<u16>, u64, bool)> =
+        std::sync::Mutex::new((String::new(), None, 0, false));
+    let file = plugin_listener_file();
+    let key = file.to_string_lossy().to_string();
     let now = now_ms();
     let mut g = CACHE.lock().unwrap();
-    let (port, until, logged) = *g;
-    if let Some(p) = port {
-        if now <= until {
-            return Some(p);
+    let (cached_file, port, until, logged) = g.clone();
+    if cached_file == key {
+        if let Some(p) = port {
+            if now <= until {
+                return Some(p);
+            }
         }
     }
-    let read = std::fs::read_to_string(plugin_listener_file()).ok()?;
+    let read = std::fs::read_to_string(&file).ok()?;
     let p: u16 = serde_json::from_str::<serde_json::Value>(&read)
         .ok()?
         .get("port")?
         .as_u64()?
         .min(u16::MAX as u64) as u16;
     if p == 0 || !tcp_alive(p, NATIVE_PORT_PROBE_MS) {
-        *g = (None, now + NATIVE_PORT_MISS_CACHE_MS, logged);
+        *g = (key, None, now + NATIVE_PORT_MISS_CACHE_MS, logged);
         return None;
     }
-    if !logged || port != Some(p) {
+    if !logged || port != Some(p) || cached_file != key {
         eprintln!("[dsh-port] DSH 插件 listener 优先: :{p}（web-listener.json）");
     }
-    *g = (Some(p), now + 5_000, true);
+    *g = (key, Some(p), now + 5_000, true);
     Some(p)
 }
 
@@ -5036,7 +5080,9 @@ try{{
 fn static_cache_policy(rest: &str, content_type: Option<&str>) -> Option<&'static str> {
     const IMMUTABLE: &str = "public, max-age=86400, immutable";
     if content_type.is_some_and(|t| t.contains("text/html")) {
-        return None; // 页面外壳永远新鲜（续票/SPA 更新即取即用）
+        // 2026-11-14 真案（PC 点卡黑屏）：不设头 ≠ 永不缓存——浏览器启发式缓存会驻留
+        // 旧壳，DSH 升级后旧壳+旧 JS = 深色空壳零请求。HTML 必须显式 no-cache。
+        return Some("no-cache, must-revalidate");
     }
     let (path, query) = match rest.split_once('?') {
         Some((p, q)) => (p, Some(q)),
@@ -6028,6 +6074,10 @@ struct Shares {
 /// 2026-11-13 卡驱动放行：活跃（非 suspend/closed）分享卡声明的目标端口 → vnet mf 白名单。
 /// 与静态 `VNET_TARGET_PORTS` 并集；默认拒绝语义保留（既不在 env 也不在卡上 → 拒）。
 /// 连接层已有 DID 认证兜底同账号，卡端口集即授权面——新服务端口随建卡即时生效。
+///
+/// 2026-11-14 h. 点卡 keep 化（用户立法总目标：卡自含端口配置，与 myco 启动解耦）：
+/// 同一条缝同时驱动 vnet DESIRED——卡活 ⇒ 每 env 口一条 kept 条目（重启后 keeper
+/// 重放，口仍在）；卡 suspend/closed/删除 ⇒ 收回。与白名单同点收口，不另设生命周期。
 fn refresh_mf_card_ports(arr: &[Share]) {
     let mut ports: Vec<u16> = arr
         .iter()
@@ -6037,6 +6087,59 @@ fn refresh_mf_card_ports(arr: &[Share]) {
     ports.sort_unstable();
     ports.dedup();
     crate::vnet::connection::set_mf_card_ports(ports);
+    // **删除检测（红例 card_lifecycle ④ 抓出的缺口）**：被删除的卡不在当前快照里，
+    // 上面循环摸不到它——用"上轮见过"差集补发 on_card_closed（幂等，多发无害）。
+    static PREV_CARD_IDS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let prev_ids = PREV_CARD_IDS.lock().unwrap().take().unwrap_or_default();
+    for s in arr {
+        if s.state != ST_SUSPENDED && s.state != ST_CLOSED {
+            for e in s.env.iter() {
+                // device/port/localPort 缺项（老卡或非隧道形态）由被调方幂等跳过
+                crate::vnet_lease::on_card_activated(&s.id, &e.device, &e.kind, e.port, e.local_port);
+            }
+        } else {
+            crate::vnet_lease::on_card_closed(&s.id);
+        }
+    }
+    let seen_now: std::collections::HashSet<String> = arr.iter().map(|s| s.id.clone()).collect();
+    for gone in prev_ids.difference(&seen_now) {
+        crate::vnet_lease::on_card_closed(gone);
+    }
+    *PREV_CARD_IDS.lock().unwrap() = Some(seen_now);
+}
+
+/// 账号切换通知入口（2026-11-14 立法：切账号 = 卡集切换 = 端口集重建）。
+/// identity.account_switch 成功后经钩子调到这里（见 lib.rs setup 注册）。
+/// 做法：当前卡集快照重跑 refresh_mf_card_ports → PREV_CARD_IDS 差集自动
+/// 收回旧账号卡驱动的口 + 新账号卡激活。
+/// TODO(e 升格)：按 ownerAccount 过滤卡集快照（Share 加 owner 字段后收紧）。
+pub fn on_account_switched() {
+    let arr = shares()
+        .shares
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let acc = myco_core::identity::account_did().unwrap_or_default();
+    eprintln!(
+        "[dsh-share] account switched → reloading {} shares ({} in-scope for {acc}, refresh_cards_scoped)",
+        arr.len(),
+        arr.iter().filter(|s| share_owned_by_account(s, &acc)).count()
+    );
+    refresh_cards_scoped(&arr, &acc);
+}
+
+/// 账号切换 ⇒ 卡集快照切换（用户 2026-11-14 20:2x 立法）：只把**归属当前账号**的卡
+/// 喂给 refresh_mf_card_ports——其他账号的卡对本账号"不存在"，其口由 PREV_CARD_IDS
+/// 差集自动收回。`ownerAccount=None` 的存量行按 ★2 语义不排他（行为等同今天）。
+/// 纯入参版（单测直击 account_switch_swaps_card_port_set）。
+fn refresh_cards_scoped(arr: &[Share], acc: &str) {
+    let scoped: Vec<Share> = arr
+        .iter()
+        .filter(|s| share_owned_by_account(s, acc))
+        .cloned()
+        .collect();
+    refresh_mf_card_ports(&scoped);
 }
 
 fn save_registry(shares: &Shares) {
@@ -6045,7 +6148,8 @@ fn save_registry(shares: &Shares) {
     // 2026-11-13 卡驱动放行（用户立法「端口由任务卡决定」）：
     // 注册表每次落盘 = 卡集合可能变了 → 把活跃卡声明的目标端口注入 vnet mf 白名单。
     // 建卡/撤卡/暂停/恢复全部经过 save_registry，单点收口。
-    refresh_mf_card_ports(&arr);
+    // 2026-11-14 账号切换立法：刷新一律走**账号过滤**视图（其他账号的卡不驱动本账号的口）。
+    refresh_cards_scoped(&arr, &myco_core::identity::account_did().unwrap_or_default());
     let insts = shares.instances.lock().unwrap().clone();
     let doc = json!({
         "shares": arr.iter().map(|s| json!({
@@ -6392,9 +6496,10 @@ fn load_registry(shares: &Shares) {
     *shares.shares.lock().unwrap() = list;
     *shares.instances.lock().unwrap() = insts;
     // 2026-11-13 卡驱动放行：启动加载后也注入一次（此后变更经 save_registry 单点收口）
+    // 2026-11-14 账号切换立法：同走账号过滤视图
     {
         let arr = shares.shares.lock().unwrap().clone();
-        refresh_mf_card_ports(&arr);
+        refresh_cards_scoped(&arr, &myco_core::identity::account_did().unwrap_or_default());
     }
     if migrated > 0 {
         // 只做内存迁移并审计；**不在加载路径写盘**（task-35 ⑥：绝不因启动迁移写真实 registry）。
@@ -10959,10 +11064,14 @@ fn mux_gate_client_text(
                 ("t", &t_open.to_string()),
             ],
         );
-        // 2026-11-11 A/B 实验：workspace 回放也禁用（Playwright 证据：SPA 在
-        // workspace 基线处理期间决定是否开 session/control——回放缓存可能
-        // 干扰决策时序。禁用后如果 session/control 稳定打开 = 回放是根因）
-        let hit = false;
+        // 2026-11-11 的「A/B 实验」在本分支写死过 `let hit = false;`（4f6c0941），
+        // 但同一次 d9f135ac 的决策原文是「control 流不做回放；**workspace/follow 的
+        // 回放不受影响**」，且该实验的假设（回放干扰 SPA 决策 session/control 的时序）
+        // 从未被证实——真因是同提交修掉的「缓存命中路径谎报 content-encoding: br」。
+        // 2026-11-14 恢复回放（唯一调用点）。实验能力保留：MYCO_WS_REPLAY=0 即关。
+        // 真机验收判据（实验自己写的）：重连后审计须同时出现 ws-replay-inject hit:1
+        // 且 session/control 仍稳定打开、baseline 仍到达；否则按回滚纪律回退并正式退役。
+        let hit = ws_replay_take(share_id, &authz.vis.space, &stream_id, inject);
         audit(
             "ws-replay-inject",
             &[
@@ -16484,6 +16593,35 @@ fn is_rpc_error_envelope(body: &[u8]) -> bool {
         == Some(false)
 }
 
+/// 缓存体归一化：**缓存只存 identity 明文**（2026-11-15 P0，用户「点 DSH 黑屏」真病灶）。
+///
+/// 事故链（myco网络 proof-stale.cjs 100% 证据）：上游回 gzip 字节 → `StaleResp` 只有
+/// `{status, content_type, body}`，**没有 content-encoding 字段** → 压缩体原样入缓存 →
+/// 命中时 `cached_http_response` 只带回 content-type（无 CE）→ 出站压缩层看见"没压过"
+/// 就合法地再压一层 br → 浏览器解 br 得 gzip 字节 → JSON.parse 全炸（12/30 且全部带
+/// `x-myco-stale: 1`）。同端点新鲜=CE:gzip 正常、命中=CE:br 全坏，就是这一条。
+///
+/// 归一化规则：
+/// · gzip 魔数 `1f 8b` → 解成明文再存（顺带治好 `is_rpc_error_envelope` 对压缩体
+///   恒误放行的暗病）；
+/// · zstd 魔数 `28 b5 2f fd` → 本进程无解码器 → **不缓存**（宁可回源，不存坏体）；
+/// · 其余原样（明文 JSON / HTML 壳）。
+fn cache_identity_body(body: axum::body::Bytes) -> Option<axum::body::Bytes> {
+    use std::io::Read as _;
+    let b = body.as_ref();
+    if b.len() >= 2 && b[0] == 0x1f && b[1] == 0x8b {
+        let mut out = Vec::new();
+        if flate2::read::MultiGzDecoder::new(b).read_to_end(&mut out).is_ok() {
+            return Some(axum::body::Bytes::from(out));
+        }
+        return None;
+    }
+    if b.len() >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd {
+        return None;
+    }
+    Some(body)
+}
+
 fn proxy_cache_put(
     key: String,
     status: u16,
@@ -16493,6 +16631,10 @@ fn proxy_cache_put(
     if !(200..300).contains(&status) || body.len() > PROXY_CACHE_MAX_BODY {
         return;
     }
+    // 2026-11-15 P0：压缩体先解成明文再进缓存（见 cache_identity_body 的事故注释）
+    let Some(body) = cache_identity_body(body) else {
+        return;
+    };
     // 2026-10-24：RPC 错误 envelope 也是 HTTP 200——不能进缓存（否则同 key 请求回放错误）
     if is_rpc_error_envelope(&body) {
         return;
@@ -17147,8 +17289,16 @@ mod proxy_cache_tests {
     #[test]
     #[ignore = "pre-existing/unstable in source baseline, tracked internally"]
     fn body_agnostic_reads_whitelisted() {
+        // 2026-11-09（6651ec09d）真案：session/list 已移出「体无关」白名单——它是
+        // **1.6MB 大响应 + 随 viewer 权限变化**，缓存既有跨 viewer 泄漏风险，又和
+        // 压缩后的 rpcId patch 冲突（只有纯透传才敢开压缩）。它仍按**精确 body 键**
+        // 可缓存（见 cacheable_only_read_apis_and_documents），但不得走宽松键命中。
+        // 本断言锁死该决策：谁把 session/list 加回白名单，这里必须红。
+        assert!(
+            !is_body_agnostic_read("api/session/list"),
+            "session/list 不得体无关：宽松键会跨 viewer 串味，且破坏压缩后的 rpcId patch"
+        );
         for r in [
-            "api/session/list",
             "api/settings/describe",
             "api/session/modelCatalog",
             "api/agentPresets/list",
@@ -21725,6 +21875,17 @@ async fn create_share_impl(
         .unwrap_or("")
         .trim()
         .to_string();
+    // 2026-11-15 入口卫生（用户实拍 `SSH-?????(???)`）：中文被控制台按 ANSI 写成 `?`
+    // 后**已经存进签名卡**，再投递只会复制坏值。这里在创建口直接拒：宁可报错让用户
+    // 重填，也不把坏字节写进卡面。判据只认"连续 ?? "（真正的写坏指纹），不误伤
+    // 英文标题里的单个问号。
+    if title.contains("??") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            json!({ "ok": false,
+                "error": "标题含连续 `??`——中文疑似被控制台编码写坏（应传 UTF-8）。请改标题后重试" }),
+        ));
+    }
     let granularity = body
         .get("granularity")
         .and_then(|v| v.as_str())
@@ -26849,6 +27010,36 @@ fn vnet_status_device_name(did: &str) -> String {
     }
 }
 
+/// `vnet_peer_status` Tauri command（2026-11-15 PC 连接状态显示，vnet 需求/jason「现在就做」）：
+/// 返回 device_did → { path, direct, rttMs } 的设备级聚合。
+/// 数据源 = vnet 状态文件（%TEMP%\vnet-status-client-{peer_id}.txt），与 HTTP 端点同源。
+/// 聚合规则：同一设备多条转发取最优（直连 > 中继；同层级取最低 RTT）。
+#[cfg(feature = "gui")]
+#[tauri::command]
+pub async fn vnet_peer_status() -> Result<serde_json::Value, String> {
+    let kept = vnet_load_kept();
+    let mut live = crate::p2p_tunnel::tunnel_list_snapshot();
+    crate::vnet_forward::merge_into_live_snapshot(&mut live);
+    let merged = vnet_status_merge_forwards(&kept, &live);
+    let mut map = serde_json::Map::new();
+    for (dev, port, _, _) in merged {
+        if let Some((path, _, rtt)) = crate::vnet_forward::vnet_path_info_rtt(&dev, port) {
+            let direct = path.to_ascii_uppercase().contains("P2P");
+            let is_better = !map.contains_key(&dev)
+                || (direct && !map[&dev]["direct"].as_bool().unwrap_or(false))
+                || (direct == map[&dev]["direct"].as_bool().unwrap_or(false)
+                    && rtt.unwrap_or(u64::MAX) < map[&dev]["rttMs"].as_u64().unwrap_or(u64::MAX));
+            if is_better {
+                map.insert(
+                    dev.clone(),
+                    serde_json::json!({ "path": path, "direct": direct, "rttMs": rtt }),
+                );
+            }
+        }
+    }
+    Ok(serde_json::json!({ "peers": map }))
+}
+
 /// `GET /api/vnet/status` —— 统一状态面（网络指纹 + S 层统计 + 转发口全表 + 隧道健康）。
 /// 只读；`/api/vnet/forwards` 保留不动，本端点是其超集。
 #[cfg(feature = "gui")]
@@ -26887,7 +27078,10 @@ async fn handle_vnet_status() -> Response {
             let r = route_of(&dev);
             // vnet 隧道的实际数据路径（P2P IPv6 / P2P UDP / Relay）。
             // "直连还是中继"只能从传输层拿，靠"能连上"是分不出来的（中继一样能连）。
-            let path_info = crate::vnet_forward::vnet_path_info(&dev, port);
+            // 2026-11-15 PC 连接状态显示（vnet 需求）：带 RTT 的增强版。
+            let path_info_rtt = crate::vnet_forward::vnet_path_info_rtt(&dev, port);
+            let path_info = path_info_rtt.as_ref().map(|(p, a, _)| (p.clone(), a.clone()));
+            let rtt_ms = path_info_rtt.as_ref().and_then(|(_, _, r)| *r);
             json!({
                 "localPort": listening_local.unwrap_or(kept_local),
                 "listening": listening_local.is_some(),
@@ -26903,6 +27097,7 @@ async fn handle_vnet_status() -> Response {
                     .as_ref()
                     .map(|(p, _)| p.to_ascii_uppercase().contains("P2P"))
                     .unwrap_or(false),
+                "rttMs": rtt_ms,
                 "label": kept.iter()
                     .find(|k| k.get("device").and_then(|d| d.as_str()) == Some(dev.as_str())
                         && k.get("port").and_then(|p| p.as_u64()) == Some(port as u64))
@@ -27976,8 +28171,34 @@ pub fn public_router() -> Router<()> {
         tower_http::compression::CompressionLayer::new()
             .gzip(true)
             .br(true)
-            .quality(tower_http::compression::CompressionLevel::Fastest),
+            .quality(tower_http::compression::CompressionLevel::Fastest)
+            // 2026-11-15 P0（用户「点 DSH 一直黑屏」根因）：**已压缩的响应禁止再压**。
+            // tower-http 0.5 的 DefaultPredicate 只看 size/content-type，**不看
+            // content-encoding**——于是反代透传的上游 gzip 字节被二次压成 br、CE 被
+            // 覆盖成 br，浏览器只解一层拿到 gzip 魔数 1f 8b，JSON.parse 炸（实测
+            // 30 个 /dsh/api/* 响应里 12 个双压缩、每轮 2 个 Unexpected token）。
+            // 谓词：只有"没有 CE 或 CE=identity"才允许网关压缩。
+            .compress_when(SkipPreEncodedResponse),
     )
+}
+
+/// 网关压缩谓词：响应已带 `content-encoding`（上游自己压过了）→ 一律不再压。
+///
+/// 反代路径（`/gw/*`、`/dsh/*`、根兜底）把上游字节原样透传并保留 CE 头，这里必须让路；
+/// 本地面（SPA 壳、`/myco-assets`、管理面 JSON）没有 CE，仍按原策略压缩。
+#[derive(Clone, Copy, Default)]
+struct SkipPreEncodedResponse;
+
+impl tower_http::compression::predicate::Predicate for SkipPreEncodedResponse {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool {
+        let ce = response
+            .headers()
+            .get(axum::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        ce.is_empty() || ce == "identity"
+    }
 }
 
 /// 网关上的 /p2p/msg：转发到 P2P 服务器的 handle_msg（同一鉴权/同一 wire 形状）。
@@ -28331,12 +28552,17 @@ async fn sync_device_names() {
             let mut count = 0;
             for d in &overview.devices {
                 if !d.did.is_empty() && !d.name.is_empty() {
-                    crate::share_auth::shared()
-                        .upsert_device(&d.did, &d.name, None, None, None, None);
-                    count += 1;
+                    // 2026-11-15 事故整改：这里只是**署名用的名字缓存**，绝不能
+                    // 创建授权行（原来 upsert_device 的缺省是 Allowed + ["*"]，
+                    // 于是每次启动把名册里早已除名/换机的历史设备全量写回成全权
+                    // 放行——用户清白名单无效 + 授权面被污染）。
+                    // cache_device_name：只更新已存在行，不存在就跳过。
+                    if crate::share_auth::shared().cache_device_name(&d.did, &d.name) {
+                        count += 1;
+                    }
                 }
             }
-            tracing::info!("[dsh-share] 设备名同步：{} 台（署名用）", count);
+            tracing::info!("[dsh-share] 设备名同步：{count} 台（仅更新已授权行，不新建）");
         }
         Err(e) => {
             tracing::warn!("[dsh-share] 设备名同步失败（署名将用 DID 尾）: {e}");
@@ -30115,7 +30341,8 @@ mod tests {
                 _ => None,
             }
         };
-        // 项目内 → 放行
+        // 项目内 → 放行（fixture 见 cwd_of：s-in=C:\dev\alpha；2026-11-12 27cba5934
+        // 中性化 fixture 时漏改这两处字面量，导致「项目内」被当成「项目外」误拦）
         assert_eq!(
             project_session_violation(&["s-in".to_string()], &[r"C:\dev\alpha"], &cwd_of),
             None
@@ -30125,7 +30352,7 @@ mod tests {
             project_session_violation(&["s-in".to_string()], &["c:/dev/ALPHA/"], &cwd_of),
             None
         );
-        // 项目外 → 拦（返回该 id + 人话原因）
+        // 项目外 → 拦（返回该 id + 人话原因）；s-in 在项目内，只有 s-out 越界
         let got = project_session_violation(
             &["s-in".to_string(), "s-out".to_string()],
             &[r"C:\dev\alpha"],
@@ -35470,6 +35697,175 @@ mod tests {
         vnet_save_kept(&list);
     }
 
+    /// h. 点卡 keep 化（2026-11-14 用户立法总目标：「授权任务卡所依赖的连接端口等
+    /// 配置都在任务卡自己的配置中，充分与 myco 程序启动解耦」）：
+    /// 卡活 ⇒ kept 自动含其 env 口（重启 myco 后 keeper 重放，口仍在）；
+    /// 卡 suspend/closed/删除 ⇒ kept 收回。全部经 save_registry 单点收口，
+    /// 与卡驱动白名单（refresh_mf_card_ports）同一条生命周期缝。
+    #[test]
+    fn card_lifecycle_drives_vnet_kept_entries() {
+        let _g = test_isolated_config_dir();
+        let dev = "did:myco:CARD-KEEP-DEV";
+        // 规则 5：adb 白名单口 = 5555（44039 无线调试随机口会被正确拒绝）
+        let port = 5555u16;
+        let lp = 25055u16;
+        let sid = "sh-card-keep-e2e";
+        // 防御：清同 did 旧条目
+        let mut list = vnet_load_kept();
+        list.retain(|v| v.get("device").and_then(|d| d.as_str()) != Some(dev));
+        vnet_save_kept(&list);
+
+        let mut s = test_share(vec![]);
+        s.id = sid.into();
+        s.env = vec![ShareEnv {
+            kind: "adb".into(),
+            device: dev.into(),
+            port,
+            local_port: lp,
+            label: None,
+            requires: None,
+        }];
+        // ① 建卡（活跃）→ save_registry → kept 含 (dev,44039,localPort=lp,shareId=sid)
+        {
+            let sh = shares();
+            sh.shares.lock().unwrap().push(s.clone());
+            save_registry(&sh);
+        }
+        let kept_has = |want: bool, why: &str| {
+            let got = vnet_load_kept().iter().any(|v| {
+                v.get("device").and_then(|d| d.as_str()) == Some(dev)
+                    && v.get("port").and_then(|p| p.as_u64()) == Some(port as u64)
+                    && v.get("shareId").and_then(|x| x.as_str()) == Some(sid)
+                    // localPort 是 keeper 重放的固定口契约（keeper 每拍读 kept 灌
+                    // preferred_local 并重建——单测层不跑 keeper，断言落在契约字段上）
+                    && v.get("localPort").and_then(|x| x.as_u64()) == Some(lp as u64)
+            });
+            assert_eq!(got, want, "{why}");
+        };
+        kept_has(true, "活跃卡的 env 口应自动进 kept（点卡 keep 化，含固定口契约）");
+
+        // ② suspend → 收回（锁纪律：save_registry 内部再锁 shares.shares，std Mutex
+        // 不可重入——状态变更走临时守卫，语句末即释放，不得具名持有跨 save_registry）
+        {
+            let sh = shares();
+            sh.shares
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|x| x.id == sid)
+                .map(|x| x.state = ST_SUSPENDED.into());
+            save_registry(&sh);
+        }
+        kept_has(false, "suspend 后应收回 kept");
+
+        // ③ 恢复 → 回来（同上临时守卫）
+        {
+            let sh = shares();
+            sh.shares
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|x| x.id == sid)
+                .map(|x| x.state = ST_ACTIVE.into());
+            save_registry(&sh);
+        }
+        kept_has(true, "恢复后 kept 应回来");
+
+        // ④ 删卡 → 收回
+        {
+            let sh = shares();
+            sh.shares.lock().unwrap().retain(|x| x.id != sid);
+            save_registry(&sh);
+        }
+        kept_has(false, "删卡后应收回");
+        crate::p2p_tunnel::set_preferred_local(dev, port, None);
+
+        // ⑤ 规则 5 负例（2026-11-14 手机 16:56 真案）：kind=dsh 配 http 的口 9000
+        //    → 必须被拒绝，kept 不得出现该条（错配卡不进隧道维护）。
+        {
+            let sid2 = "sh-card-keep-badkind";
+            let mut s2 = test_share(vec![]);
+            s2.id = sid2.into();
+            s2.env = vec![ShareEnv {
+                kind: "dsh".into(),
+                device: dev.into(),
+                port: 9000,
+                local_port: 23912,
+                label: None,
+                requires: None,
+            }];
+            let sh = shares();
+            sh.shares.lock().unwrap().push(s2);
+            save_registry(&sh);
+            let bad = vnet_load_kept().iter().any(|v| {
+                v.get("device").and_then(|d| d.as_str()) == Some(dev)
+                    && v.get("port").and_then(|p| p.as_u64()) == Some(9000u64)
+                    && v.get("shareId").and_then(|x| x.as_str()) == Some(sid2)
+            });
+            assert!(!bad, "kind=dsh + port=9000（http 口）必须被规则 5 拒绝，不进 kept");
+            sh.shares.lock().unwrap().retain(|x| x.id != sid2);
+            save_registry(&sh);
+        }
+    }
+
+    /// 账号切换 ⇒ 卡集快照切换（用户 2026-11-14 20:2x 立法）：
+    /// 切到账号 B 后，账号 A 的卡驱动的 kept 口必须收回、B 的激活。
+    /// 纯函数直击 refresh_cards_scoped；差集收回由 PREV_CARD_IDS 承担。
+    #[test]
+    fn account_switch_swaps_card_port_set() {
+        let _g = test_isolated_config_dir();
+        let dev = "did:myco:ACCT-SWAP-DEV";
+        let acc_a = "did:youling:ACCT-A";
+        let acc_b = "did:youling:ACCT-B";
+        // 防御清场
+        let mut list = vnet_load_kept();
+        list.retain(|v| v.get("device").and_then(|d| d.as_str()) != Some(dev));
+        vnet_save_kept(&list);
+        let mut card_a = test_share(vec![]);
+        card_a.id = "sh-acct-a".into();
+        card_a.owner_account = Some(acc_a.into());
+        card_a.env = vec![ShareEnv {
+            kind: "ssh".into(),
+            device: dev.into(),
+            port: 22,
+            local_port: 22001,
+            label: None,
+            requires: None,
+        }];
+        let mut card_b = test_share(vec![]);
+        card_b.id = "sh-acct-b".into();
+        card_b.owner_account = Some(acc_b.into());
+        card_b.env = vec![ShareEnv {
+            kind: "ssh".into(),
+            device: dev.into(),
+            port: 22,
+            local_port: 22002,
+            label: None,
+            requires: None,
+        }];
+        let all = vec![card_a, card_b];
+        // 账号 A 视角：只有 A 的口
+        refresh_cards_scoped(&all, acc_a);
+        let kept_a: Vec<u16> = vnet_load_kept()
+            .iter()
+            .filter(|v| v.get("device").and_then(|d| d.as_str()) == Some(dev))
+            .filter_map(|v| v.get("localPort").and_then(|x| x.as_u64()).map(|x| x as u16))
+            .collect();
+        assert_eq!(kept_a, vec![22001], "账号 A 视角只应有 A 的口");
+        // 切到 B：A 的收回、B 的激活
+        refresh_cards_scoped(&all, acc_b);
+        let kept_b: Vec<u16> = vnet_load_kept()
+            .iter()
+            .filter(|v| v.get("device").and_then(|d| d.as_str()) == Some(dev))
+            .filter_map(|v| v.get("localPort").and_then(|x| x.as_u64()).map(|x| x as u16))
+            .collect();
+        assert_eq!(kept_b, vec![22002], "切到 B 后 A 的口必须收回、B 的在场");
+        // 收尾
+        crate::p2p_tunnel::set_preferred_local(dev, 22, None);
+        let mut list = vnet_load_kept();
+        list.retain(|v| v.get("device").and_then(|d| d.as_str()) != Some(dev));
+        vnet_save_kept(&list);
+    }
     #[cfg(feature = "gui")]
     #[test]
     fn chat_share_autogrant_needs_share_id() {
@@ -36409,16 +36805,22 @@ mod tests {
         // `WS_UPSTREAM_KEEPALIVE` Ping；否则上游空闲 ~6.5 分钟会 Close(None)。
         let upstream_pings = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let upstream_pongs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // 拨号计数：万一上游端口源又被别的优先级劫持（2026-11-08 插件 listener 真案），
+        // 红点要指向「这条 WS 根本没连到假上游」，而不是误报「Pong 没转 Ping」。
+        let upstream_conns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let up_pings_outer = upstream_pings.clone();
         let up_pongs_outer = upstream_pongs.clone();
+        let up_conns_outer = upstream_conns.clone();
         let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_port = up.local_addr().unwrap().port();
         tokio::spawn(async move {
             while let Ok((s, _)) = up.accept().await {
                 let up_pings = up_pings_outer.clone();
                 let up_pongs = up_pongs_outer.clone();
+                let up_conns = up_conns_outer.clone();
                 tokio::spawn(async move {
                     if let Ok(mut ws) = tokio_tungstenite::accept_async(s).await {
+                        up_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let (mut up_tx, mut up_rx) = ws.split();
                         // 模拟 DSH api-gateway stream-server：持续 Ping。
                         tokio::spawn(async move {
@@ -36455,9 +36857,16 @@ mod tests {
         });
         let old_native = std::env::var("DSH_NATIVE_PORT").ok();
         let old_native_cache = *NATIVE_PORT_CACHE.lock().unwrap();
+        // 2026-11-14 假红真因：`native_port()` 自 2026-11-08（bdd9ccd9）起**插件 listener
+        // 优先**（读 %USERPROFILE%\.dsh\web-listener.json），优先级高于下面显式设置的
+        // DSH_NATIVE_PORT —— 全量跑时 WS 被拨到宿主真实插件口（:17878），假上游一次连接
+        // 都没收到，于是「Pong 没转 Ping」是假象而非回归。把插件状态文件指到不存在的
+        // 路径（隔离目录），保证本用例的上游只可能是假上游。
+        let old_listener = std::env::var("MYCO_WEB_LISTENER_JSON").ok();
         struct NativePortGuard {
             old: Option<String>,
             old_cache: Option<(u16, u64)>,
+            old_listener: Option<String>,
         }
         impl Drop for NativePortGuard {
             fn drop(&mut self) {
@@ -36465,14 +36874,23 @@ mod tests {
                     Some(v) => std::env::set_var("DSH_NATIVE_PORT", v),
                     None => std::env::remove_var("DSH_NATIVE_PORT"),
                 }
+                match &self.old_listener {
+                    Some(v) => std::env::set_var("MYCO_WEB_LISTENER_JSON", v),
+                    None => std::env::remove_var("MYCO_WEB_LISTENER_JSON"),
+                }
                 *NATIVE_PORT_CACHE.lock().unwrap() = self.old_cache;
             }
         }
         let _native_guard = NativePortGuard {
             old: old_native,
             old_cache: old_native_cache,
+            old_listener,
         };
         std::env::set_var("DSH_NATIVE_PORT", up_port.to_string());
+        std::env::set_var(
+            "MYCO_WEB_LISTENER_JSON",
+            std::env::temp_dir().join(format!("myco-no-web-listener-{:x}.json", now_ms())),
+        );
         // native_port 有 30s 进程级缓存；全量并行时可能拿到上一测试确认过的端口，
         // 导致这条 WS 根本没连到本用例的假上游（定向绿/全量红的差异来源）。
         *NATIVE_PORT_CACHE.lock().unwrap() = None;
@@ -36621,6 +37039,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(
+            upstream_conns.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "上游 WS 必须拨到本用例的假上游（≥1 次握手）；为 0 = native_port 被别的端口源劫持（如插件 listener），不是 Pong 转换回归"
+        );
+        assert!(
             pings.load(std::sync::atomic::Ordering::Relaxed) >= 3,
             "必须收到过探针（续命的载体）"
         );
@@ -36755,6 +37177,94 @@ mod tests {
         assert_eq!(s.env.len(), 2, "坏条目（bogus）单条丢弃，好条目照常");
         assert_eq!(s.env[0].label.as_deref(), Some("本机桌面"));
         assert_eq!(s.env[1].kind, "dsh");
+    }
+
+    /// 2026-11-15 P0 回归（预热缓存丢 CE → 命中被二次压缩）：缓存体必须归一化成
+    /// **identity 明文**——gzip 解成明文、zstd 拒绝入缓存、明文原样。
+    #[test]
+    fn cache_identity_body_normalizes_compressed_payloads() {
+        use std::io::Write as _;
+        let plain = br#"{"result":{"ok":true,"value":{"x":1}}}"#.to_vec();
+        // ① 明文原样
+        let out = cache_identity_body(axum::body::Bytes::from(plain.clone())).expect("明文要保留");
+        assert_eq!(out.as_ref(), plain.as_slice());
+        // ② gzip → 解成明文（否则命中时无 CE，被压缩层再压一层）
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&plain).expect("gzip 写");
+        let gz = enc.finish().expect("gzip 收尾");
+        assert_eq!(&gz[..2], &[0x1f, 0x8b], "确实是 gzip 魔数");
+        let out = cache_identity_body(axum::body::Bytes::from(gz)).expect("gzip 要能解");
+        assert_eq!(out.as_ref(), plain.as_slice(), "缓存里必须是明文");
+        // ③ zstd 魔数 → 不解也不缓存（宁可回源，不存"无 CE 的压缩体"）
+        let zstd_like = axum::body::Bytes::from(vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x01]);
+        assert!(cache_identity_body(zstd_like).is_none(), "zstd 体必须拒绝入缓存");
+        // ④ 坏 gzip（魔数对但字节烂）→ 拒绝（fail-closed）
+        let broken = axum::body::Bytes::from(vec![0x1f, 0x8b, 0x00, 0x01, 0x02]);
+        assert!(cache_identity_body(broken).is_none(), "解不开就别缓存");
+    }
+
+    /// 2026-11-15 P0 回归（用户「点 DSH 黑屏」）：网关**不得**二次压缩已带
+    /// `content-encoding` 的反代响应——否则浏览器只解一层拿到压缩魔数，JSON 全炸。
+    #[test]
+    fn compression_skips_pre_encoded_responses() {
+        use tower_http::compression::predicate::Predicate;
+        let mk = |ce: Option<&str>| {
+            let mut b = axum::http::Response::builder().status(200);
+            if let Some(c) = ce {
+                b = b.header(axum::http::header::CONTENT_ENCODING, c);
+            }
+            b.body(axum::body::Body::empty()).expect("构造响应")
+        };
+        for enc in ["gzip", "br", "deflate", "zstd", "GZIP"] {
+            assert!(
+                !SkipPreEncodedResponse.should_compress(&mk(Some(enc))),
+                "上游已用 {enc} 压缩 → 网关必须让路（再压一层 = 浏览器解不开）"
+            );
+        }
+        assert!(
+            SkipPreEncodedResponse.should_compress(&mk(None)),
+            "没有 CE 的本地面响应仍要压缩（省隧道带宽）"
+        );
+        assert!(
+            SkipPreEncodedResponse.should_compress(&mk(Some("identity"))),
+            "CE=identity 等于没压，仍可压"
+        );
+    }
+
+    /// 2026-11-15 事故回归（用户 01:32 卡点不开的"数组丢失"机制）：
+    /// 读盘**不得**用建卡级严格校验二次裁决——保留口/端口冲突的条目必须原样留住，
+    /// 否则 `Share.env` 变空 → 之后每次广播的卡同时没有 env 和 caps（接收端必 denied）。
+    #[test]
+    fn parse_share_env_load_keeps_reserved_local_port() {
+        let with_reserved = json!({
+            "id": "sh-env-keep", "title": "保留口卡", "grants": [],
+            "env": [
+                // localPort 撞 vnet 平台保留口 24011（建卡时会拒，但读盘必须留）
+                {"kind": "dsh", "device": "did:myco:abc123456789", "port": 13911, "localPort": 24011},
+                // 同卡重复 localPort（执行器只会绑一个，但读盘不能因此清空整段）
+                {"kind": "http", "device": "did:myco:abc123456789", "port": 9000, "localPort": 23912}
+            ]
+        });
+        let s = parse_share(&with_reserved).unwrap();
+        assert_eq!(
+            s.env.len(),
+            2,
+            "读盘必须保留（单条丢弃会清空整段 → env+caps 双双消失）"
+        );
+        assert_eq!(s.env[0].local_port, 24011, "保留口原值不许被改写");
+        // 结构确实不可用的条目仍要丢弃（kind 缺/device 非 did/port=0）
+        let broken = json!({
+            "id": "sh-env-broken", "title": "结构坏", "grants": [],
+            "env": [
+                {"kind": "", "device": "did:myco:abc123456789", "port": 1, "localPort": 23389},
+                {"kind": "rdp", "device": "not-a-did", "port": 3389, "localPort": 23390},
+                {"kind": "rdp", "device": "did:myco:abc123456789", "port": 0, "localPort": 23391}
+            ]
+        });
+        assert!(
+            parse_share(&broken).unwrap().env.is_empty(),
+            "结构坏（缺 kind / device 非 did / port=0）必须丢弃"
+        );
     }
 
     /// 落盘形状（camelCase）+ 读回一致：`save_registry` → 文件 → `parse_share`。
@@ -36993,6 +37503,23 @@ mod tests {
             .collect();
         DEVICE_ORIGINS.lock().unwrap().clear();
         let new_alias = "myco".to_string();
+        // 同款隔离（2026-11-14 全量红真因）：DEVICE_SHARE_ALIASES 也是进程级
+        // LazyLock（首次访问读盘后常驻），同进程其它用例（register_device_origin →
+        // 回落纯名 "myco"）会留下 ("myco","dsh")→sh-xxx。本用例迁移目标名恰是 myco，
+        // 不摘掉就撞上别人的短名（实测「迁移设备别名时分享短名发生冲突」）。
+        // 只摘 myco 名下条目、跑完原样恢复，不打扰并行用例的其它设备名。
+        let share_alias_snapshot: Vec<(DeviceShareAliasKey, String)> = {
+            let mut m = DEVICE_SHARE_ALIASES.lock().unwrap();
+            let owned: Vec<(DeviceShareAliasKey, String)> = m
+                .iter()
+                .filter(|((d, _), _)| d == &new_alias)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (k, _) in &owned {
+                m.remove(k);
+            }
+            owned
+        };
         DEVICE_ORIGINS.lock().unwrap().insert(
             old_alias.clone(),
             DeviceOriginTarget { did: did.into(), target_port: 13911 },
@@ -37018,6 +37545,13 @@ mod tests {
         let mut map = DEVICE_ORIGINS.lock().unwrap();
         map.clear();
         map.extend(snapshot);
+        drop(map);
+        {
+            let mut m = DEVICE_SHARE_ALIASES.lock().unwrap();
+            for (k, v) in share_alias_snapshot {
+                m.entry(k).or_insert(v);
+            }
+        }
     }
 
     #[test]
@@ -37403,8 +37937,46 @@ mod tests {
         let my_dev = myco_core::identity::device_identity()
             .map(|(d, _)| d)
             .expect("本机设备域测试需要设备身份");
-        let sid = "sh-local-vnetp-e2e";
-        let mut share = test_share(vec![Grant {
+        // 2026-11-14 契约漂移修复：`eed09e1a`（2026-11-11 viewer policy 根治）之后插件对
+        // 任意未派发 DID 一律 403 `viewer policy missing` 且**必须原样透传**；而本机自拨的
+        // 最终上游自 `bdd9ccd9`（2026-11-08）起走「插件 listener 优先」→ 活体插件口
+        // （宿主 :17878）→ 本用例永远拿不到 200（CI 上无插件则是 503 loading 页）。
+        // 用 MYCO_WEB_LISTENER_JSON 把上游钉到本用例自己的 200 假上游：既保住
+        // 「302→内部跟随→200」端到端语义，又不碰宿主真实插件、也不放宽任何断言。
+        let fake_up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fake_up_port = fake_up.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = fake_up.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut b = vec![0u8; 16384];
+                    let _ = s.read(&mut b).await;
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+        let listener_json =
+            std::env::temp_dir().join(format!("myco-fake-web-listener-{:x}.json", now_ms()));
+        std::fs::write(&listener_json, format!(r#"{{"port":{fake_up_port}}}"#)).unwrap();
+        let old_listener_json = std::env::var("MYCO_WEB_LISTENER_JSON").ok();
+        std::env::set_var("MYCO_WEB_LISTENER_JSON", &listener_json);
+        struct ListenerJsonGuard(std::path::PathBuf, Option<String>);
+        impl Drop for ListenerJsonGuard {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var("MYCO_WEB_LISTENER_JSON", v),
+                    None => std::env::remove_var("MYCO_WEB_LISTENER_JSON"),
+                }
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _lg = ListenerJsonGuard(listener_json, old_listener_json);
+        let sid = "sh-local-vnetp-e2e";        let mut share = test_share(vec![Grant {
             label: "owner".into(),
             did: Some(my_dev.clone()),
             ro: false,
@@ -38748,6 +39320,23 @@ mod tests {
         #[test]
         #[ignore = "pre-existing/unstable in source baseline, tracked internally"]
         fn bootstrap_main_granularity_only_nudges_sidebar() {
+            // 2026-10-31 契约（见 [`seed_session_for`]）：main/机器档在**拿到最近活跃会话**
+            // 时会预置指针（手机黑屏真案）。所以「不预置任何选中」只在**无种子**时成立，
+            // 而 MOST_RECENT_SESSION 是进程级全局：同进程其它用例（如 ④）会填它，全量
+            // 跑时本用例就假红（定向绿/全量红）。这里自己造出「无种子」环境再恢复。
+            let prev = {
+                let mut g = MOST_RECENT_SESSION.lock().unwrap();
+                let prev = g.clone();
+                *g = None;
+                prev
+            };
+            struct SeedGuard(Option<(String, i64)>);
+            impl Drop for SeedGuard {
+                fn drop(&mut self) {
+                    *MOST_RECENT_SESSION.lock().unwrap() = self.0.take();
+                }
+            }
+            let _sg = SeedGuard(prev);
             let s = bootstrap_share(None, visibility_default());
             let js = entry_bootstrap_script(&s, &owner_authz(vis_all())).expect("仍应注入");
             assert!(!js.contains("localStorage.setItem(K"), "{js}");
@@ -39638,8 +40227,11 @@ mod tests {
             );
             assert_eq!(
                 static_cache_policy("", Some("text/html; charset=utf-8")),
-                None,
-                "HTML 永不缓存"
+                Some("no-cache, must-revalidate"),
+                // 2026-11-14 真案（用户 PC 点卡黑屏）：HTML 不设 Cache-Control ≠ 永不缓存——
+                // 浏览器按 RFC 7234 启发式缓存驻留旧壳；DSH 升级（资产基座根绝对化）后，
+                // Edge 持续用改版前的旧壳+旧 JS → SPA 零请求 → 深色空壳。HTML 必须显式
+                // no-cache 强制每次回源校验（壳 ~75KB 本地网关，代价可忽略）。
             );
             assert_eq!(static_cache_policy("index.html", None), None);
             assert_eq!(

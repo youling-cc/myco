@@ -251,6 +251,9 @@ export function dotColor(state: EnvRowState): string {
 
 /** 后端 state 字符串 → 行状态（未知一律回 idle，绝不假绿）。 */
 export function rowStateOf(res: EnvOpenResult | null | undefined): EnvRowState {
+  // 链路就绪但客户端没起来（入口坐标不全 / 浏览器拉起失败）→ 打开失败，不能亮绿点。
+  // 自连提示（selfTarget）不算失败，照旧走 state。
+  if (res?.ok && !res.selfTarget && asString(res.error)) return 'error'
   const s = asString(res?.state)
   const known: EnvRowState[] = ['ready', 'building', 'offline', 'no-service', 'denied', 'error']
   if (known.includes(s as EnvRowState)) return s as EnvRowState
@@ -285,7 +288,37 @@ export function openArgs(
   const taskId = asString(c.taskId) || asString(c.task_id)
   if (cardId) args.cardId = cardId
   if (taskId) args.taskId = taskId
-  if (caps !== undefined && caps !== null) args.caps = caps
+  // 2026-11-15 真案（用户 01:32「DSH 卡点开没反应」，两端全 denied）：
+  // 原来把分享记录的 caps **原样**发出，而分享记录上的 caps 是 O/A 能力集对象
+  // （`{o:[…],a:[…]}`）——里面根本没有 `vnet.forward`，后端卡闸必拒。修法：
+  // 归一化成扁平词表，并补上 env 卡隐含的隧道权限（有 env 即隐含可开隧道，
+  // 与 `share_card_record` 落盘时给 env 卡补 `caps:["vnet.forward"]` 同一口径）。
+  const flatCaps: string[] = (() => {
+    const raw = caps
+    if (raw === undefined || raw === null) return []
+    if (Array.isArray(raw)) return raw.map((x) => asString(x)).filter(Boolean)
+    if (typeof raw === 'object') {
+      const o = raw as Record<string, unknown>
+      const out: string[] = []
+      for (const k of ['o', 'a', 'caps']) {
+        const v = o[k]
+        if (Array.isArray(v)) out.push(...v.map((x) => asString(x)).filter(Boolean))
+      }
+      return out
+    }
+    return asString(raw)
+      .split(/[\s,]+/)
+      .filter(Boolean)
+  })()
+  // 2026-11-15 修正：只在**真卡**（有 cardId/taskId）或卡上本来声明过 caps 时才补
+  // `vnet.forward`。调试卡（`openArgs({}, env)`：无卡号、无 caps）必须保持"不带 caps"
+  // ——Rust 侧 `parse_call` 的调试闸正是"debug:true 且不带 cardId 且无 caps 声明"，
+  // 这里硬塞 caps 会让它从调试路径变成"声明卡但缺签名"的语义（并打破既有单测契约）。
+  const isRealCard = Boolean(cardId || taskId)
+  const capsDeclared = caps !== undefined && caps !== null
+  if (isRealCard || capsDeclared) {
+    args.caps = Array.from(new Set([...flatCaps, 'vnet.forward']))
+  }
   const sig = asString(c.signature)
   if (sig) args.signature = sig
   return args
@@ -298,9 +331,18 @@ export function resultNote(res: EnvOpenResult | null | undefined): string {
   if (res.selfTarget) {
     return cleanTechText(res.hint || '') || '这是本机发起的分享，请在对方设备上打开'
   }
-  // 固定口漂移（端口被占自动换口）：只说发生了什么，不报端口号
+  // 链路就绪但客户端没起来：入口坐标不全 / 浏览器拉起失败 → 说"打开失败"，不给假绿。
+  if (res.ok && res.error) {
+    return cleanTechText(res.hint || '') || `打开失败：${cleanTechText(res.error)}`
+  }
+  // 固定口漂移（端口被占自动换口）：只说发生了什么，不报端口号。
+  // 设备域终态的"本地口"是 viewer 的全局 HTTP 口（24011），与卡上的固定口本就不同源，
+  // 那不是漂移——不能报成「原通道被占用，已自动换用临时通道」（2026-11-14 用户真案）。
   const drift =
-    res.requestedLocalPort && res.localPort && res.requestedLocalPort !== res.localPort
+    res.tunnel !== 'device-origin' &&
+    res.requestedLocalPort &&
+    res.localPort &&
+    res.requestedLocalPort !== res.localPort
       ? '（原通道被占用，已自动换用临时通道）'
       : ''
   if (res.ok) {
@@ -316,7 +358,9 @@ export function resultNote(res: EnvOpenResult | null | undefined): string {
               : res.client === 'rustdesk'
                 ? 'RustDesk 已就绪'
                 : '已打开'
-    const hint = res.hint ? ` · ${cleanTechText(res.hint)}` : ''
+    // hint 与状态行同义时不重复（真案：浏览器成功 → "已在系统浏览器打开 · 已在系统浏览器打开"）。
+    const hintText = res.hint ? cleanTechText(res.hint) : ''
+    const hint = hintText && hintText !== started ? ` · ${hintText}` : ''
     return `${started}${drift}${hint}`
   }
   return cleanTechText(res.message || res.error || res.launchError || '') || '打不开（未知错误）'

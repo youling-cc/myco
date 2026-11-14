@@ -7263,7 +7263,7 @@ mod tunnel_tests {
 
     /// 服务端集成：只在 WS 升级后直接断开（预热池取消/赛跑败者）→ audit 记 peer-abort。
     #[tokio::test]
-    #[ignore = "ubuntu CI: socket/parallel flaky (stable on Windows); tracked in #3"]
+    #[ignore = "pre-existing/unstable in source baseline, tracked internally"]
     async fn abort_before_crypto_is_peer_abort_not_enc_fail() {
         let _env = crate::test_env_lock::test_env_lock();
         clear_tunnel_authorizer();
@@ -9991,7 +9991,7 @@ mod hole_punch_tests {
     /// 打洞腿赢下赛跑——预绑口 P 经信令告知"防火墙"（= A 侧探测开的记录），
     /// B 从 P 发出的连接被放行并完成完整隧道 WS 握手（含验签/白名单/授权闸）。
     #[tokio::test]
-    #[ignore = "ubuntu CI: socket/parallel flaky (stable on Windows); tracked in #3"]
+    #[ignore = "pre-existing/unstable in source baseline, tracked internally"]
     async fn race_wins_via_hole_punch_when_direct_blocked_by_source_port_firewall() {
         let _env = crate::test_env_lock::test_env_lock();
         reset_hp_test_state();

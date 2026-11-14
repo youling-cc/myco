@@ -1113,6 +1113,46 @@ pub fn vnet_path_info(device: &str, target_port: u16) -> Option<(String, String)
     }
 }
 
+/// (path, peer_addr, rtt_ms)：vnet_path_info 的 RTT 增强版。
+/// RTT 来源：P2P pipe 的 `pipe_v6=v=true ... rtt=Some(3)` / `pipe_v4 ... rtt=Some(N)`，
+/// 无 P2P 管道时退 `relay_rtt_ms=N`。都没写 = None（连接刚建/诊断不可用）。
+pub fn vnet_path_info_rtt(device: &str, target_port: u16) -> Option<(String, String, Option<u64>)> {
+    let peer = {
+        let m = VNET_FORWARDS.lock().unwrap();
+        m.get(&vnet_key(device, target_port)).map(|h| h.client_peer_id)?
+    };
+    let path = crate::vnet::status_file_path_for("client", peer);
+    let body = std::fs::read_to_string(path).ok()?;
+    let mut p = String::new();
+    let mut peer_addr = String::new();
+    let mut rtt: Option<u64> = None;
+    let mut relay_rtt: Option<u64> = None;
+    for line in body.lines() {
+        let l = line.trim();
+        if let Some(v) = l.strip_prefix("path=") {
+            p = v.to_string();
+        } else if let Some(v) = l.strip_prefix("p2p_peer=") {
+            peer_addr = v.to_string();
+        } else if let Some(v) = l.strip_prefix("relay_rtt_ms=") {
+            relay_rtt = v.parse().ok();
+        } else if (l.starts_with("pipe_v4=") || l.starts_with("pipe_v6=")) && rtt.is_none() {
+            // pipe_v6=v=true req=2164 rep=5402 fr=0 ack=0.00 rtt=Some(3)
+            if let Some(pos) = l.find("rtt=Some(") {
+                let rest = &l[pos + 9..];
+                if let Some(end) = rest.find(')') {
+                    rtt = rest[..end].parse().ok();
+                }
+            }
+        }
+    }
+    if p.is_empty() {
+        None
+    } else {
+        let final_rtt = rtt.or(relay_rtt);
+        Some((p, peer_addr, final_rtt))
+    }
+}
+
 /// 这条 vnet 隧道是否**直连**（P2P），而不是走中继。
 pub fn vnet_is_direct(device: &str, target_port: u16) -> bool {
     vnet_path_info(device, target_port)

@@ -162,6 +162,23 @@ fn apply_decision(
             return;
         }
     }
+    // ── P2P 升级冷却（2026-11-13 RDP 卡顿：60 次振荡根因）──
+    // 质量降级后的指数退避期内拒绝升级，杜绝「短暂恢复→升级→又掉→降级」循环。
+    if pick != PipeKind::Relay && cur_kind == PipeKind::Relay {
+        let cd = p2p_cooldown_remaining();
+        if !cd.is_zero() {
+            // 静默拒绝（每 30s 打一条防刷屏）
+            use std::sync::atomic::AtomicU64;
+            static LAST_CD_LOG: AtomicU64 = AtomicU64::new(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+            if now - LAST_CD_LOG.load(Ordering::Relaxed) >= 30 {
+                LAST_CD_LOG.store(now, Ordering::Relaxed);
+                println!("  [PATH] P2P upgrade blocked: cooldown {}s remaining", cd.as_secs());
+            }
+            return;
+        }
+    }
     // 黑盒回归修复：只认**已通过双向验证的通道**（REQUEST 敲门创建的未验证通道
     // 不承载业务——管道级 verified 可能来自另一个 socket 的证据，不能背书槽内通道）
     // 不再要求 active：active 只在 EXP2 verify PASS 设置，打洞胜出的已验证通道
@@ -742,6 +759,54 @@ static STABLE_PICK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 static STABLE_PENDING_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const HYSTERESIS_N: u32 = 3;
 
+/// ── P2P 升级冷却（2026-11-13 RDP 卡顿根因：v6 质量差时 60 次振荡）──
+/// 模式：v6 探测短暂恢复 → 3s 滞回后升级 → 数据流掉包 → 立即降级 relay
+///        → v6 又短暂恢复 → 再升级 → 无限循环。
+/// 修法：**质量触发的降级**后进入指数退避冷却，冷却期内拒绝升级。
+///   第 1 次降级 → 冷却 30s；第 2 次 → 60s；第 3 次 → 120s；上限 300s。
+///   P2P 稳定持有 >60s 不降级 → 计数清零（冷却重置）。
+///   手动/网络变化触发的降级不计入（只有 pick 管道质量裁决引发的才算）。
+static P2P_DOWNGRADE_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+static P2P_DOWNGRADE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static P2P_LAST_UPGRADE_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+fn p2p_cooldown_remaining() -> std::time::Duration {
+    let at = *P2P_DOWNGRADE_AT.lock().unwrap();
+    let count = P2P_DOWNGRADE_COUNT.load(Ordering::Relaxed);
+    if at.is_none() || count == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let base_secs: u64 = 30u64.saturating_mul(1u64.checked_shl(count.min(4)).unwrap_or(16));
+    let cooldown = std::time::Duration::from_secs(base_secs.min(300));
+    let elapsed = at.unwrap().elapsed();
+    if elapsed >= cooldown {
+        std::time::Duration::ZERO
+    } else {
+        cooldown - elapsed
+    }
+}
+
+fn note_p2p_upgrade() {
+    *P2P_LAST_UPGRADE_AT.lock().unwrap() = Some(std::time::Instant::now());
+}
+
+fn note_p2p_downgrade() {
+    // 稳定持有 >60s 的升级不算「连续失败」——清零重新计
+    let upgrade_at = *P2P_LAST_UPGRADE_AT.lock().unwrap();
+    if let Some(at) = upgrade_at {
+        if at.elapsed() > std::time::Duration::from_secs(60) {
+            P2P_DOWNGRADE_COUNT.store(0, Ordering::Relaxed);
+        }
+    }
+    let n = P2P_DOWNGRADE_COUNT.fetch_add(1, Ordering::Relaxed);
+    *P2P_DOWNGRADE_AT.lock().unwrap() = Some(std::time::Instant::now());
+    let base_secs: u64 = 30u64.saturating_mul(1u64.checked_shl((n + 1).min(4)).unwrap_or(16));
+    println!("  [PATH] P2P->Relay quality downgrade #{} (cooldown {}s)",
+        n + 1, base_secs.min(300));
+}
+
 /// relay 路径按流分块的上限：ARQ chunk 上限扣掉 3 字节内层头。
 /// 「先按此切块再包装」保证每个 ARQ 交付项恰好一个内层头（边界不被内部分块打断）。
 /// 跟随 `VNET_CHUNK` 运行时联动（缺省 1000-3=997）。
@@ -929,10 +994,10 @@ fn mf_target_allowed(port: u16, default_port: u16) -> bool {
     if port == default_port {
         return true;
     }
-    // 2026-11-13 卡驱动放行（用户立法「端口由任务卡决定」）：宿主（dsh_share）经
-    // set_mf_card_ports 注入活跃卡声明的目标端口，与静态 env 白名单取并集。
-    // 连接层已有 DID 认证兜底同账号，卡端口集即授权面；默认拒绝不变。
-    // 注：vendored 同步会覆盖本块——改动需同步进 apps/vnet（见 mf_card_ports 段）。
+    // 2026-11-13 卡驱动放行（宿主立法「端口由任务卡决定」，dsh_share 注入）：
+    // 活跃分享卡声明的目标端口与静态 env 白名单取并集；默认拒绝语义不变。
+    // 本块与 vendored 副本（apps/home/src-tauri/src/vnet）保持逐字一致，
+    // 同步脚本不再覆盖丢失（历史：vendored 同步曾吞掉宿主侧新增）。
     if mf_card_ports_contains(port) {
         return true;
     }
@@ -949,7 +1014,7 @@ fn mf_target_allowed(port: u16, default_port: u16) -> bool {
 /// 卡声明端口集（宿主注入；RwLock 而非 OnceLock——建卡/撤卡会变）。
 static MF_CARD_PORTS: std::sync::RwLock<Option<Vec<u16>>> = std::sync::RwLock::new(None);
 
-/// 宿主注入活跃分享卡声明的目标端口全集（dsh_share 在建卡/撤卡/启动时调）。
+/// 宿主注入活跃分享卡声明的目标端口全集（myco dsh_share 建卡/撤卡/启动时调）。
 pub fn set_mf_card_ports(ports: Vec<u16>) {
     if let Ok(mut g) = MF_CARD_PORTS.write() {
         *g = Some(ports);
@@ -1717,7 +1782,10 @@ impl Connection {
         let listen_sock = UdpSocket::bind(format!("0.0.0.0:{}", p2p_port))
             .or_else(|_| UdpSocket::bind("0.0.0.0:0"))
             .ok()
-            .map(Arc::new);
+            .map(|s| {
+                crate::vnet::relay::apply_tunable_buffers(&s); // CONNRESET 禁用 + buffer（同 v6/relay socket）
+                Arc::new(s)
+            });
         // IPv6 监听：PC→笔记本 的 IPv6 方向是通的（家宽拦入站只拦反方向），
         // 但必须真有 IPv6 socket 在这个端口上听，否则对端发来的 v6 包全被内核丢弃。
         // 注意：必须 IPV6_V6ONLY，否则与上面的 0.0.0.0:port 冲突（Linux/Android 上直接崩溃）
@@ -2303,6 +2371,8 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
 
         self.threads_alive.fetch_add(1, Ordering::Relaxed);
         let ka_relay = self.relay.clone();
+        // 滚动历史日志需要 pipe 统计（v6 ack 比）
+        let ka_pipes = self.pipes.clone();
         // 换网自愈（2026-11-13）：记住上一次到 relay 的实际源 **IP**（不比端口），
         // 变化即触发重注册。探测 socket 每次 bind(0) 端口都不同，比 SocketAddr 会
         // 每秒误判「变化」→ 每秒重注册（已踩）。
@@ -2561,6 +2631,151 @@ P2P path may be alive while relay probe fails); forward 127.0.0.1:{} -> remote:{
                         body.push_str(&format!("v6_local_count={}\nv6_local_first={}\n", n, first));
                     }
                     let _ = std::fs::write(status_file_path_for("client", ka_id), body);
+                    // ── 滚动历史日志（2026-11-14 RDP 卡顿排障需求）──
+                    // 状态文件每 5s 覆写只有快照——事后无法回溯"什么时候掉的"。
+                    // 这里追加一行到 .hist.log，保留 24h（>17200 行时截断头一半）。
+                    // 格式：ts|path|sw|v6ack|v6rtt|retrans|stall|rsilent|dead
+                    {
+                        let hist_path = status_file_path_for("client", ka_id)
+                            .with_extension("hist.log");
+                        let v6_pipe = {
+                            let ps = ka_pipes.lock().unwrap();
+                            let p6 = &ps[index_of(PipeKind::P2pV6)];
+                            format!("v={:?} ack={:.2} rtt={:?}", p6.o_verified_bidi, p6.o_ack_ratio, p6.rtt_evidence_ms())
+                        };
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_secs();
+                        let raq = ka_relay_arq.lock().unwrap();
+                        let line = format!(
+                            "{}|{}|sw={}|v6[{}]|retrans={}|stall={}|rsilent={}|dead={}\n",
+                            ts,
+                            ka_path.lock().unwrap().name(),
+                            ka_sw.lock().unwrap(),
+                            v6_pipe,
+                            raq.retransmit_count,
+                            raq.max_stall_ms,
+                            ka_relay.relay_silent_for()
+                                .map(|d| d.as_millis() as u64).unwrap_or(0),
+                            ka_dead.load(Ordering::Relaxed));
+                        drop(raq);
+                        // ── 异常检测 → 告警日志（vnet-alert.log，只记事件不刷屏）──
+                        // 触发条件（任一）：
+                        //   ack < 0.5 持续 2 个采样周期（10s）
+                        //   stall > 5s（用户可感知的卡顿）
+                        //   path_switches 1 分钟内增量 > 5（振荡）
+                        //   dead=true（连接死判定）
+                        // 同类告警 60s 内不重复（防刷屏）；恢复正常时记 RECOVER。
+                        {
+                            use std::sync::atomic::AtomicU64;
+                            static LAST_ACK_ALERT: AtomicU64 = AtomicU64::new(0);
+                            static LAST_STALL_ALERT: AtomicU64 = AtomicU64::new(0);
+                            static LAST_OSC_ALERT: AtomicU64 = AtomicU64::new(0);
+                            static LOW_ACK_STREAK: AtomicU64 = AtomicU64::new(0);
+                            static PREV_SWITCHES: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+                            static PREV_SWITCH_TIME: std::sync::Mutex<Option<std::time::Instant>> =
+                                std::sync::Mutex::new(None);
+
+                            let alert_path = status_file_path_for("client", ka_id)
+                                .with_extension("alert.log");
+                            let now_s = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_secs();
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_secs();
+
+                            // 1. v6 P2P ACK 低
+                            let v6_ack = {
+                                let ps = ka_pipes.lock().unwrap();
+                                ps[index_of(PipeKind::P2pV6)].o_ack_ratio
+                            };
+                            if v6_ack < 0.5 {
+                                let n = LOW_ACK_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n >= 2 && now_s - LAST_ACK_ALERT.load(Ordering::Relaxed) > 60 {
+                                    LAST_ACK_ALERT.store(now_s, Ordering::Relaxed);
+                                    let line = format!("{}|ALERT|LOW_ACK|v6_ack={:.2} streak={}\n", ts, v6_ack, n);
+                                    use std::io::Write;
+                                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&alert_path) {
+                                        let _ = f.write_all(line.as_bytes());
+                                    }
+                                }
+                            } else if LOW_ACK_STREAK.load(Ordering::Relaxed) >= 2 {
+                                LOW_ACK_STREAK.store(0, Ordering::Relaxed);
+                                let line = format!("{}|RECOVER|LOW_ACK|v6_ack={:.2}\n", ts, v6_ack);
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&alert_path) {
+                                    let _ = f.write_all(line.as_bytes());
+                                }
+                            } else {
+                                LOW_ACK_STREAK.store(0, Ordering::Relaxed);
+                            }
+
+                            // 2. ARQ stall > 5s
+                            let raq2 = ka_relay_arq.lock().unwrap();
+                            if raq2.max_stall_ms > 5000 && now_s - LAST_STALL_ALERT.load(Ordering::Relaxed) > 60 {
+                                LAST_STALL_ALERT.store(now_s, Ordering::Relaxed);
+                                let line = format!("{}|ALERT|STALL|{}ms retrans={}\n", ts, raq2.max_stall_ms, raq2.retransmit_count);
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&alert_path) {
+                                    let _ = f.write_all(line.as_bytes());
+                                }
+                            }
+
+                            // 3. 振荡（1 分钟内 > 5 次切换）
+                            let cur_sw = *ka_sw.lock().unwrap();
+                            {
+                                let mut prev = PREV_SWITCHES.lock().unwrap();
+                                let mut prev_time = PREV_SWITCH_TIME.lock().unwrap();
+                                let delta = cur_sw.saturating_sub(*prev);
+                                if let Some(pt) = *prev_time {
+                                    if pt.elapsed() >= Duration::from_secs(60) {
+                                        if delta > 5 && now_s - LAST_OSC_ALERT.load(Ordering::Relaxed) > 60 {
+                                            LAST_OSC_ALERT.store(now_s, Ordering::Relaxed);
+                                            let line = format!("{}|ALERT|OSCILLATION|{} switches in 60s (total={})\n", ts, delta, cur_sw);
+                                            use std::io::Write;
+                                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&alert_path) {
+                                                let _ = f.write_all(line.as_bytes());
+                                            }
+                                        }
+                                        *prev = cur_sw;
+                                        *prev_time = Some(std::time::Instant::now());
+                                    }
+                                } else {
+                                    *prev = cur_sw;
+                                    *prev_time = Some(std::time::Instant::now());
+                                }
+                            }
+
+                            // 4. dead
+                            if ka_dead.load(Ordering::Relaxed) {
+                                let line = format!("{}|ALERT|DEAD|{}\n", ts, ka_dead_reason.lock().unwrap());
+                                use std::io::Write;
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&alert_path) {
+                                    let _ = f.write_all(line.as_bytes());
+                                }
+                            }
+                        }
+
+                        // 写 hist.log（上面的滚动历史）
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true).open(&hist_path)
+                        {
+                            let _ = f.write_all(line.as_bytes());
+                        }
+                        // 24h 截断（~17280 行 @5s）：超过 20000 行时保留后 10000
+                        if let Ok(md) = std::fs::metadata(&hist_path) {
+                            if md.len() > 2_000_000 { // ~2MB
+                                if let Ok(content) = std::fs::read_to_string(&hist_path) {
+                                    let lines: Vec<&str> = content.lines().collect();
+                                    if lines.len() > 20000 {
+                                        let keep = &lines[lines.len() - 10000..];
+                                        let _ = std::fs::write(&hist_path, keep.join("\n") + "\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 {
                         // relay ARQ：重传 + 流控 flush

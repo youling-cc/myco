@@ -333,6 +333,16 @@ impl RelayArq {
                 retries: 0,
             });
             self.sent += 1;
+            // ── 2026-11-15 28MB 断连修复 ──
+            // stream_pending_since 在首帧入 pending 时设置后原版永不刷新——
+            // 高吞吐（2.4MB/s）下窗口满→pending 排队是正常流控，不是卡死。
+            // 12 秒持续传输后 exhausted_streams 误杀健康流（2.4MB/s×12s≈28.8MB，
+            // 与实测断连点精确吻合）。修法：帧实际被发送（pending→inflight）=
+            // 该流在推进 → 刷新计时器。真正卡死的流（窗口全关 12s 无任何帧发出）
+            // 仍然会超时——流控行为不变，误杀消除。
+            if let Some((_, sid, _)) = transport::parse_stream_frame(&chunk) {
+                self.stream_pending_since.insert(sid, Instant::now());
+            }
         }
 
         // 可观测：数据间隙 = 本次 flush 距上次的间隔（>1000ms 记录）
@@ -565,6 +575,18 @@ impl RelayArq {
         if self.inflight.len() < inflight_before {
             self.acked += (inflight_before - self.inflight.len()) as u64;
             self.last_progress = Instant::now();
+            // ── 2026-11-15 11s 停摆修复 ──
+            // 路径刚刚证明健康（ACK 清了帧），但剩余在途帧可能带着数据流
+            // 空窗期累积的高退避（retries=5 → 下次重传要等 3.2s+）。
+            // 新数据到达时这些帧卡在长退避后面 = 感知为 ~11 秒停摆。
+            // 修法（TCP 同款）：路径有进展 → 重置退避到基线，sent_at 刷新
+            // → 下一轮 flush 用基础 RTO 检查（~200ms），不再等累积退避。
+            for f in self.inflight.values_mut() {
+                if f.retries > 0 {
+                    f.retries = 0;
+                    f.sent_at = Instant::now();
+                }
+            }
             // per-stream 预算收尾（Phase 1）：有进展时清掉已无 pending 帧的流锚点——
             // 该流本轮积压已全部离队，预算计时不跨健康回合（否则健康流会带着
             // 陈旧锚点在下一轮静默中被误判「卡了 12s」）。

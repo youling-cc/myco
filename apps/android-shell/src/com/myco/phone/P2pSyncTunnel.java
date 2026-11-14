@@ -484,6 +484,36 @@ public final class P2pSyncTunnel {
             if (localPort <= 0) return err("本地口耗尽（" + PORT_BASE + "-" + PORT_MAX + " 全被占）");
             String owner = PORT_OWNER.get(localPort);
             if (owner != null && !owner.equals(key(targetDevice, targetPort))) {
+                // 2026-11-13 陈旧期望淘汰（真机 RED：DESIRED 持久化把旧 15200→23912
+                // 重放回来，占住固定口，新路由 24011→23912 被「自己人」挡路 →
+                // ensure 报 unreachable 而隧道本身是活的）。同设备的旧目标占着
+                // 本条要用的固定口 = 期望面已演进（老网关→新路由）→ 从 DESIRED
+                // 删旧条目并整设备重建（连接级释放全部口，按新期望面重放），
+                // 然后重挂本条。跨设备占用仍如实报错（不抢别人的口）。
+                if (owner.startsWith(targetDevice + "|")) {
+                    int staleTarget = -1;
+                    try { staleTarget = Integer.parseInt(owner.substring(owner.indexOf('|') + 1)); } catch (Throwable ignored) { }
+                    Map<Integer, Integer> want = DESIRED.get(targetDevice);
+                    if (want != null && staleTarget > 0 && want.containsKey(staleTarget)) {
+                        want.remove(staleTarget);
+                        persistDesired();
+                    }
+                    android.util.Log.w("P2pDeviceTunnel",
+                            "stale-port-owner " + owner + " 占 " + localPort + " → 淘汰并重建 " + targetDevice);
+                    rebuildDevice(device, targetDevice, relay, secret, "stale-port-owner:" + owner);
+                    Integer cpRe = DEVICE_CLIENT.get(targetDevice);
+                    if (cpRe == null) {
+                        return err("淘汰陈旧映射后重建失败 " + lastErr);
+                    }
+                    if (!armPort(cpRe, targetDevice, targetPort, localPort)) {
+                        return err("淘汰后重挂失败 " + lastErr);
+                    }
+                    lastErr = "";
+                    lastDevice = targetDevice;
+                    lastTargetPort = targetPort;
+                    lastLocalPort = localPort;
+                    return okJson(localPort, targetPort, true);
+                }
                 return err("本地口 " + localPort + " 已被 " + owner + " 占用");
             }
             if (!armPort(clientPeer, targetDevice, targetPort, localPort)) {

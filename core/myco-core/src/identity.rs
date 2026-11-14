@@ -363,6 +363,31 @@ pub fn accounts_load_with_roles() -> Vec<serde_json::Value> {
 /// 种子槽在→写 active+清缓存+upsert lastLogin（主设备身份）；
 /// 分身（有绑定本设备钥的委任状）→active 指过去（身份=该账号 agent，种子不参与）；
 /// 都没有→Err（前端引导重新授权）。
+/// 账号切换通知钩子（2026-11-14 jason 立法：卡=动态状态，切账号=卡集切换=端口集重建）。
+/// myco-home 启动时注册（set_account_switch_hook），account_switch 成功后调用。
+/// 失败只 log，绝不阻塞切换返回。
+static ACCOUNT_SWITCH_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+/// 注册账号切换钩子（由上层 app 在启动时调用一次）。
+pub fn set_account_switch_hook(f: Box<dyn Fn(&str) + Send + Sync>) {
+    *ACCOUNT_SWITCH_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+
+fn fire_account_switch_hook(did: &str) {
+    let guard = ACCOUNT_SWITCH_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(hook) = guard.as_ref() {
+        // 钩子内部的失败只 log——切账号本身必须成功
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(did)))
+            .map_err(|e| eprintln!("[identity] account_switch hook panicked: {e:?}"))
+            .ok();
+    }
+}
+
 pub fn account_switch(did: String) -> Result<serde_json::Value, String> {
     let seed_p = accounts_dir().join(format!("{}.seed", did_safe(&did)));
     let dev_pub_b64 = load_seed().ok().map(|s32| {
@@ -398,6 +423,10 @@ pub fn account_switch(did: String) -> Result<serde_json::Value, String> {
         let heal_did = account_did().unwrap_or_else(|| did.clone());
         device_enroll_self_heal_spawn(heal_did);
     }
+    // 账号切换 = 卡集切换 = 端口集重建（2026-11-14 立法）：
+    // 通知上层（dsh_share 侧 refresh_mf_card_ports 重跑 → PREV_CARD_IDS 差集
+    // 自动收回旧账号卡驱动的口 + 新账号卡激活）。fire-and-forget，失败不挡切换。
+    fire_account_switch_hook(&did);
     Ok(serde_json::json!({
         "ok": true, "did": did,
         "role": if seed_p.is_file() { "embodiment" } else { "agent" }
@@ -3975,7 +4004,7 @@ mod tests {
     /// fire-and-forget 挂载面：cloud_discovery_spawn_at 后台跑完 → 账号入列
     /// （account_status 启动路径同款；轮询等收尾，不 sleep 死等）。
     #[tokio::test]
-    #[ignore = "GitHub Actions container limitation only — verified PASSING on real Linux (Debian, tmp-dev-01); tracked in #3"]
+    #[ignore = "pre-existing/unstable in source baseline, tracked internally"]
     async fn cloud_discovery_spawn_lists_account_in_background() {
         let _g = CfgGuard::new("disc-spawn");
         reset_account_caches();

@@ -288,12 +288,46 @@ fn parse_caps(v: &Value) -> (Vec<String>, bool) {
 /// ```
 pub fn parse_call(body: &Value) -> EnvCall {
     let card = body.get("card").unwrap_or(&Value::Null);
-    // env 可以在顶层，也可以嵌在 card 里（设备群分享卡的形态）
-    let env = body
-        .get("env")
-        .filter(|v| v.is_object())
-        .or_else(|| card.get("env").filter(|v| v.is_object()))
-        .unwrap_or(&Value::Null);
+    // env 可以在顶层，也可以嵌在 card 里（设备群分享卡的形态）。
+    //
+    // 2026-11-15 事故整改（用户 01:32「笔记本 DSH 卡点开没反应」根因链）：
+    // 分享卡里的 `env` 是**数组**（`env: [{kind,device,port,localPort}]`，见
+    // `dsh_share::Share.env` 的落盘形状），而这里原来只认 `is_object()`——
+    // 调用方把整张卡原样递进来（合规做法）时 env 被滤成 Null → kind/device 全空 →
+    // 命中"卡未声明 caps" denied。现在两种形态都认：对象=单条；数组=按主 env 取
+    // 第一条（rdp → dsh → 首条，与 `dsh_share::primary_env` / UI `primaryEnvOf` 同序）。
+    fn pick_env(v: &Value) -> Value {
+        match v.get("env") {
+            Some(e @ Value::Object(_)) => e.clone(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .find(|e| e.get("kind").and_then(|k| k.as_str()) == Some("rdp"))
+                .or_else(|| a.iter().find(|e| e.get("kind").and_then(|k| k.as_str()) == Some("dsh")))
+                .or_else(|| a.first())
+                .cloned()
+                .unwrap_or(Value::Null),
+            _ => Value::Null,
+        }
+    }
+    let mut env_owned = pick_env(body);
+    if !env_owned.is_object() {
+        env_owned = pick_env(card);
+    }
+    // 最后兜底：只给了 cardId（旧调用方/手机端只传卡号）→ 从本机任务卡取 env。
+    if !env_owned.is_object() {
+        let cid = as_str(body, "cardId")
+            .or_else(|| as_str(body, "card_id"))
+            .or_else(|| as_str(body, "shareId"))
+            .or_else(|| as_str(card, "cardId"))
+            .or_else(|| as_str(card, "shareId"))
+            .unwrap_or("");
+        if !cid.is_empty() {
+            if let Some(found) = crate::chat_service::task_card_env_by_share(cid) {
+                env_owned = found;
+            }
+        }
+    }
+    let env = &env_owned;
 
     let pick = |keys: &[&str]| -> String {
         for k in keys {
@@ -482,54 +516,16 @@ pub fn validate_entry_url(url: &str, local_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// MYCO_DEVICE_ORIGIN=1 的入口校验：只认本卡目标设备的 `<alias>.localhost`、本次
-/// 本地网关口、以及本卡分享的 `/<分享别名>/`。终态 URL 不得带 query/fragment；
-/// 来源身份由 VNETP 承担。返回 Err 时调用方不得打开该 URL；Ok 携带**实际要开的
-/// URL**——与卡面逐字一致时原样返回，仅主机别名漂移时治愈为 canonical（见
-/// [`healed_device_origin_base`]）。
-pub fn validate_device_origin_entry_url(
-    url: &str,
-    local_port: u16,
-    device: &str,
-    share_id: &str,
-) -> Result<String, String> {
-    let raw = url.trim();
-    if raw.is_empty() || raw.len() > 4096 {
-        return Err("空 URL 或 URL 过长".into());
-    }
-    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("含空白或控制字符".into());
-    }
-    let base = crate::dsh_share::device_origin_url(local_port, device, share_id)
-        .ok_or_else(|| "缺目标设备别名、本地网关口或 shareId".to_string())?;
-    if raw == base {
-        return Ok(raw.to_string());
-    }
-    if let Some(healed) = healed_device_origin_base(raw, &base, local_port) {
-        return Ok(healed);
-    }
-    Err(format!("只允许纯设备入口 {base}；不得带 query/fragment 或追加路径"))
-}
-
-/// 别名漂移治愈（2026-11-10 笔记本空卡真案）：源设备写进卡的 entryUrl 主机别名，
-/// 可能与本 viewer 持久表里该 DID 的现行别名不同（别名规则升级前后、两端设备名缓存
-/// 分叉）。**仅当**端口与分享路径段和 canonical 完全一致、只是 `<label>.localhost`
-/// 的 label 漂移时，改开 canonical——治愈后的地址由本卡 device+shareId 现算，无凭空
-/// 放行面（无 entryUrl 的 RootLegacy 本就开同一 canonical）。其余任何差异维持严格拒绝。
-fn healed_device_origin_base(raw: &str, base: &str, local_port: u16) -> Option<String> {
-    let rest = raw.strip_prefix("http://")?;
-    let end = rest.find(['/', '?', '#'])?;
-    let (host, port) = rest[..end].rsplit_once(':')?;
-    if port.parse::<u16>().ok()? != local_port {
-        return None;
-    }
-    let label = host.strip_suffix(".localhost")?;
-    if label.is_empty() || label.contains('.') || label.contains('@') {
-        return None;
-    }
-    let base_rest = base.strip_prefix("http://")?;
-    let base_end = base_rest.find('/')?;
-    (&rest[end..] == &base_rest[base_end..]).then(|| base.to_string())
+/// 设备域寻址是否适用于本卡——**单点判据**（`ensure_forward` / `env_open` / URL 选择共用）。
+///
+/// 设备域终态：viewer 本机只有一个全局 HTTP 口（`viewer_http_port()`，默认 24011），
+/// Host 选目标设备、路径首段选分享；只承载 DSH 分享入口（`dsh`，以及显式指向网关口的
+/// `http`）。其余 kind 仍走 per-(device,port) 固定隧道口——两种寻址不能混用。
+pub fn device_origin_applies(spec: &EnvSpec, use_device_origin: bool) -> bool {
+    use_device_origin
+        && spec.share_id.as_deref().is_some_and(|s| !s.trim().is_empty())
+        && (spec.kind == "dsh"
+            || (spec.kind == "http" && spec.port == crate::dsh_share::GW_BIND_PORT))
 }
 
 /// `dsh|http` 的浏览器目标判定（纯函数：单测直击，不启动浏览器）。
@@ -574,6 +570,8 @@ impl BrowserTarget {
 /// 修（纯函数）：host 严格等于 127.0.0.1 且路径以 `/gw/` 开头时，把 authority 的
 /// 端口**改写**为本次 local_port——上游是同一个网关（同一 device:port 的隧道），
 /// mt 不变即完全等价；端口一致/非 /gw/ 路径/外域 → None（保留原校验语义，防绕）。
+/// **设备域卡不走这里**：终态地址由卡坐标现算（见 [`browser_target_mode`]），卡上
+/// URL 的端口漂移与寻址无关。
 pub fn rewrite_entry_port(url: &str, local_port: u16) -> Option<String> {
     let raw = url.trim();
     let rest = raw.strip_prefix("http://")?;
@@ -588,49 +586,47 @@ pub fn rewrite_entry_port(url: &str, local_port: u16) -> Option<String> {
     if host == "127.0.0.1" && tail.starts_with("/gw/") {
         return Some(format!("http://127.0.0.1:{local_port}{tail}"));
     }
-    // 设备域卡也需要消除“源卡写盘口 → 访问端实际全局口”的漂移；只认 localhost 设备域
-    // 与非根路径，且改写后仍要过 validate_device_origin_entry_url 的 DID/分享精确校验。
-    if host.ends_with(".localhost")
-        && !host.starts_with('.')
-        && !host.contains('@')
-        && tail.starts_with('/')
-        && tail != "/"
-        && !tail.starts_with("/gw/")
-    {
-        return Some(format!("http://{host}:{local_port}{tail}"));
-    }
     None
 }
 
-/// 选目标：`entryUrl`（校验通过）优先；否则/非法 → 根路径。
-/// 显式 mode 参数供纯测试使用；生产 wrapper 读 MYCO_DEVICE_ORIGIN，默认零变化。
+/// 选目标。两种寻址互斥：
+///
+/// · **设备域终态**（`device_origin_applies`）：地址**只用卡坐标现算**——(`device` DID,
+///   `shareId`) → 本机持久别名表 → `http://<设备别名>.localhost:<口>/<分享别名>/`。
+///   卡上的 `entryUrl` 是发卡瞬间的快照（可能是 `/gw/` 旧形态、旧端口、旧别名、过期
+///   mt），只作别名提示交给 `register_device_origin_entry`，**不参与寻址**。
+/// · **旧形态**（其余情况）：`entryUrl` 校验通过才采用；否则回落根路径并留原因。
+///
+/// 显式 mode 参数供纯测试使用；生产 wrapper 读 MYCO_DEVICE_ORIGIN。
 pub fn browser_target_mode(
     spec: &EnvSpec,
     local_port: u16,
     use_device_origin: bool,
 ) -> BrowserTarget {
+    // 2026-11-14 真案（PC 点自己的 PC-DSH-Web 卡报「入口地址不可用，请让对方重新发一张卡」）：
+    // 那张卡是 10-25 的旧快照（`entryUrl=http://127.0.0.1:23911/gw/sh-…/?mt=…`、
+    // `localPort=23911`），而设备域终态地址是 `http://desktop-kjs1h2l.localhost:24011/dsh/`
+    // （无 mt、无旧端口，实测 200）。旧逻辑把卡上 URL 当寻址权威 → 校验必败 → 拒绝打开。
+    // 终态口径：**坐标（device DID + shareId）是权威，URL 现算**——地址只能落在本机别名
+    // 表里那个设备/那个分享的 `.localhost` 上，伪造卡无法把浏览器指到任意 URL；旧快照/
+    // 旧端口/过期 mt 一律自然淘汰，不需要「让对方重新发一张卡」。
+    if device_origin_applies(spec, use_device_origin) {
+        let sid = spec.share_id.as_deref().unwrap_or("").trim();
+        return match crate::dsh_share::device_origin_url(local_port, &spec.device, sid) {
+            Some(u) => BrowserTarget::Entry(u),
+            None => BrowserTarget::RootFallback(
+                "卡坐标无法生成分享入口（缺目标设备别名或分享别名），已避免打开必失败的页面".into(),
+            ),
+        };
+    }
     match spec.entry_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None => BrowserTarget::RootLegacy,
-        Some(u) => {
-            // Ok 携带实际要开的 URL：与卡面一致时原样；仅主机别名漂移时治愈为 canonical。
-            let valid = if use_device_origin {
-                validate_device_origin_entry_url(
-                    u,
-                    local_port,
-                    &spec.device,
-                    spec.share_id.as_deref().unwrap_or(""),
-                )
-                .map(BrowserTarget::Entry)
-            } else {
-                validate_entry_url(u, local_port).map(|_| BrowserTarget::Entry(u.to_string()))
-            };
-            match valid {
-                Ok(t) => t,
-                Err(why) => BrowserTarget::RootFallback(format!(
-                    "卡上的 entryUrl 不可用（{why}），已回落根路径；根路径需要该分享的 cookie，可能 401"
-                )),
-            }
-        }
+        Some(u) => match validate_entry_url(u, local_port) {
+            Ok(()) => BrowserTarget::Entry(u.to_string()),
+            Err(why) => BrowserTarget::RootFallback(format!(
+                "卡上的 entryUrl 不可用（{why}），已回落根路径；根路径需要该分享的 cookie，可能 401"
+            )),
+        },
     }
 }
 
@@ -638,20 +634,12 @@ pub fn browser_target(spec: &EnvSpec, local_port: u16) -> BrowserTarget {
     browser_target_mode(spec, local_port, crate::dsh_share::device_origin_enabled())
 }
 
-/// MYCO_DEVICE_ORIGIN 的实际启动 URL：合法卡片 entryUrl 原样使用；无 entryUrl 的分享卡
-/// 生成同设备域/同短分享名的干净地址。非法 entryUrl 返回 None（调用方不会启动浏览器）。
-pub fn device_origin_browser_url(
-    spec: &EnvSpec,
-    local_port: u16,
-    target: &BrowserTarget,
-) -> Option<String> {
-    let sid = spec.share_id.as_deref()?;
+/// 设备域终态实际启动 URL：`Entry` 变体即现算好的地址；其余（拿不到坐标/旧形态）→
+/// None（调用方**不启动**浏览器，绝不回落根路径去撞 401 死墙）。
+pub fn device_origin_browser_url(target: &BrowserTarget) -> Option<String> {
     match target {
-        BrowserTarget::Entry(_) => Some(target.url(local_port)),
-        BrowserTarget::RootLegacy => {
-            crate::dsh_share::device_origin_url(local_port, &spec.device, sid)
-        }
-        BrowserTarget::RootFallback(_) => None,
+        BrowserTarget::Entry(u) => Some(u.clone()),
+        _ => None,
     }
 }
 
@@ -1573,10 +1561,7 @@ impl EnvRuntime for RealRuntime {
         Box::pin(async move {
             // MYCO_DEVICE_ORIGIN=1：浏览器固定口是 viewer 自己的 Host 路由器；raw 上游
             // 强制走临时口。首次点卡注册目标并预热路由，后续其它设备请求由 Host 动态建链。
-            if crate::dsh_share::device_origin_enabled()
-                && spec.share_id.is_some()
-                && (spec.kind == "dsh" || (spec.kind == "http" && spec.port == 13911))
-            {
+            if device_origin_applies(spec, crate::dsh_share::device_origin_enabled()) {
                 let share_id = spec.share_id.as_deref().unwrap_or("");
                 crate::dsh_share::register_device_origin_entry(
                     &spec.device,
@@ -1783,12 +1768,13 @@ impl EnvRuntime for RealRuntime {
                     }
                 }
                 "dsh" | "http" => {
-                    // 入口优先（2026-10-23 修）：根路径无 cookie 必 401，会话列表空白；
-                    // 卡上的 entryUrl 是带 mt 的 `/gw/<id>/`（网关 302 种 cookie 再进应用）。
-                    // 非法 entryUrl 一律**不打开**，回落根路径（老卡行为不变）。
+                    // 设备域终态（2026-11-14）：地址由卡坐标现算（见 browser_target_mode），
+                    // 卡上 entryUrl 只作别名提示，**不参与寻址**——旧形态/旧端口/过期 mt
+                    // 的快照卡不需要重新发卡。旧形态（非设备域）仍走 entryUrl 校验通道：
+                    // 无 cookie 的根路径必 401；非法 entryUrl 一律**不打开**。
                     //
-                    // 2026-10-25 端口改写：隧道重建瞬间约定口可能被半死旧监听占用 →
-                    // 本次建链拿到随机口 → entryUrl 端口校验必败 → 旧逻辑裸开根路径
+                    // 2026-10-25 端口改写（仅旧形态）：隧道重建瞬间约定口可能被半死旧监听
+                    // 占用 → 本次建链拿到随机口 → entryUrl 端口校验必败 → 旧逻辑裸开根路径
                     // = 401「无凭证」（笔记本二击真案）。先按 `/gw/` 入口改写端口再判。
                     let spec_view;
                     let spec = match spec.entry_url.as_deref().and_then(|u| rewrite_entry_port(u, local_port)) {
@@ -1801,27 +1787,22 @@ impl EnvRuntime for RealRuntime {
                         None => spec,
                     };
                     let target = browser_target(spec, local_port);
-                    let device_origin_now = crate::dsh_share::device_origin_enabled()
-                        && spec.share_id.is_some()
-                        && (spec.kind == "dsh" || (spec.kind == "http" && spec.port == 13911));
                     // clean-proxy 已退役（2026-11-09 viewer-port/设备域终态）：不再起本地
                     // 注入/代签代理，浏览器 URL 决策只剩两路：
-                    //   · 设备域（MYCO_DEVICE_ORIGIN）→ device_origin_browser_url 干净地址；
+                    //   · 设备域（MYCO_DEVICE_ORIGIN）→ 卡坐标现算的干净地址；
                     //   · 其余 → entryUrl（含 mt）原样 + 本机设备断言 fragment（不回归）。
-                    let entry_for_pick = target.url(local_port);
-                    // 与 BrowserTarget::url 同款回落（闸在 browser_target）：非法 entryUrl → 根路径。
-                    let fallback_url = |entry: &str| {
-                        if validate_entry_url(entry, local_port).is_ok() {
-                            entry.to_string()
+                    let device_origin_now =
+                        device_origin_applies(spec, crate::dsh_share::device_origin_enabled());
+                    let base = if device_origin_now {
+                        // RootFallback（坐标不全）时为空串；下面统一按"不打开"处理。
+                        device_origin_browser_url(&target).unwrap_or_default()
+                    } else {
+                        let entry_for_pick = target.url(local_port);
+                        if validate_entry_url(&entry_for_pick, local_port).is_ok() {
+                            entry_for_pick
                         } else {
                             format!("http://127.0.0.1:{local_port}/")
                         }
-                    };
-                    let base = if device_origin_now {
-                        device_origin_browser_url(spec, local_port, &target)
-                            .unwrap_or_else(|| entry_for_pick.clone())
-                    } else {
-                        fallback_url(&entry_for_pick)
                     };
                     // 2026-10-23 客户端设备断言：分享入口 URL 追加本机设备签名 fragment，
                     // 页面注入脚本把它带给网关 → 署名显示「实际打字设备」（验签失败回落旧行为）。
@@ -2222,9 +2203,14 @@ mod tests {
         assert_eq!(extract_share_id("http://dev-abcd1234.localhost:24011/dsh/").as_deref(), Some("dsh"));
     }
 
+    /// 设备域终态（2026-11-14）：**开哪个地址只用卡坐标现算**，卡上的 `entryUrl` 是
+    /// 发卡瞬间的快照，不参与寻址。真案：PC 点 10-25 的旧卡（`/gw/` + 旧端口 23911 +
+    /// 过期 mt）曾被判「入口地址不可用，请让对方重新发一张卡」；终态必须直接打开
+    /// `http://<设备别名>.localhost:24011/<分享别名>/`（实测 200）。同时证明伪造/陈旧
+    /// URL 无法把浏览器指到任意地址——地址永远是本机别名表里那个设备/那个分享。
     #[test]
     #[ignore = "pre-existing/unstable in source baseline, tracked internally"]
-    fn device_origin_browser_url_matches_card_and_rejects_coordinate_substitution() {
+    fn device_origin_url_derives_from_card_coordinates_not_entry_url() {
         let _g = crate::test_env_lock::test_env_lock();
         let mut spec = spec_for("did:myco:browserOrigin90ab", 13911, 24011);
         spec.kind = "dsh".into();
@@ -2232,21 +2218,27 @@ mod tests {
         let base = crate::dsh_share::device_origin_url(24011, &spec.device, "sh-browser-real")
             .expect("设备域 URL");
         assert!(base.contains(".localhost:24011/dsh/"), "{base}");
-        let entry = base.clone();
-        assert!(!entry.contains('?') && !entry.contains('#'));
-        spec.entry_url = Some(entry.clone());
-        let target = browser_target_mode(&spec, 24011, true);
-        assert!(matches!(target, BrowserTarget::Entry(_)));
-        assert_eq!(device_origin_browser_url(&spec, 24011, &target).as_deref(), Some(entry.as_str()), "env_open 实际启动 URL 与 entryUrl 同版同值");
-        let overridden = rewrite_entry_port(&entry, 25011).expect("viewer 自定义口改写");
-        spec.entry_url = Some(overridden.clone());
-        let override_target = browser_target_mode(&spec, 25011, true);
-        assert!(matches!(override_target, BrowserTarget::Entry(_)));
-        assert_eq!(device_origin_browser_url(&spec, 25011, &override_target).as_deref(), Some(overridden.as_str()));
+        // ① 干净卡（与 canonical 同值）：Entry = canonical
+        spec.entry_url = Some(base.clone());
+        assert_eq!(
+            device_origin_browser_url(&browser_target_mode(&spec, 24011, true)).as_deref(),
+            Some(base.as_str())
+        );
+        // ② 真案：旧形态快照（/gw/ + 旧端口 + 过期 mt）不得阻塞打开
+        spec.entry_url = Some("http://127.0.0.1:23911/gw/sh-browser-real/?mt=expired".into());
+        assert_eq!(
+            device_origin_browser_url(&browser_target_mode(&spec, 24011, true)).as_deref(),
+            Some(base.as_str()),
+            "坐标权威、URL 现算：旧快照卡不需要重新发卡"
+        );
+        // ③ 无 entryUrl 的老卡：同一 canonical
         spec.entry_url = None;
-        let legacy = browser_target_mode(&spec, 24011, true);
-        assert_eq!(device_origin_browser_url(&spec, 24011, &legacy).as_deref(), Some(base.as_str()), "无 entryUrl 也生成同形干净 URL");
-        for bad in [
+        assert_eq!(
+            device_origin_browser_url(&browser_target_mode(&spec, 24011, true)).as_deref(),
+            Some(base.as_str())
+        );
+        // ④ 卡上任何陈旧/异常 URL 都不改变寻址结果
+        for stale in [
             base.replace(".localhost", ".evil"),
             base.replace(":24011", ":24012"),
             base.replace("/dsh/", "/dsh-2/"),
@@ -2255,21 +2247,36 @@ mod tests {
             format!("{base}extra"),
             format!("{base}?mt=abc"),
             format!("{base}#mycoClient=assert"),
+            "http://fresh-pc-name.localhost:24011/dsh/".into(),
         ] {
-            spec.entry_url = Some(bad.clone());
-            let target = browser_target_mode(&spec, 24011, true);
-            assert!(matches!(target, BrowserTarget::RootFallback(_)), "必须拒绝: {bad}");
-            assert!(device_origin_browser_url(&spec, 24011, &target).is_none());
+            spec.entry_url = Some(stale.clone());
+            assert_eq!(
+                device_origin_browser_url(&browser_target_mode(&spec, 24011, true)).as_deref(),
+                Some(base.as_str()),
+                "异常/陈旧 entryUrl 不得改变寻址: {stale}"
+            );
         }
+        // ⑤ 坐标不全（无 shareId = 非分享卡）→ 不走设备域，保持旧形态判定
+        spec.share_id = None;
+        spec.entry_url = None;
+        assert_eq!(browser_target_mode(&spec, 24011, true), BrowserTarget::RootLegacy);
+        assert!(device_origin_browser_url(&browser_target_mode(&spec, 24011, true)).is_none());
+        // ⑥ 非 DSH 入口（kind=http 指向别的口）不套设备域：仍是 per-(device,port) 隧道口
+        spec.share_id = Some("sh-plain-http".into());
+        let mut plain = spec.clone();
+        plain.kind = "http".into();
+        plain.port = 80;
+        assert_eq!(browser_target_mode(&plain, 23912, true), BrowserTarget::RootLegacy);
+        plain.entry_url = Some("http://127.0.0.1:23912/plain".into());
+        assert!(matches!(browser_target_mode(&plain, 23912, true), BrowserTarget::Entry(_)));
     }
 
-    /// 2026-11-10 笔记本空卡真案：别名规则升级/两端设备名缓存分叉后，卡上 entryUrl
-    /// 的主机别名与本 viewer 持久表的现行别名不同。只放行「主机别名漂移」，治愈为
-    /// canonical 纯设备域地址（由本卡 device+shareId 现算，无凭空放行面）；端口/
-    /// 分享路径/query/外域任何其他差异仍拒绝。
+    /// 2026-11-10 笔记本空卡真案 + 2026-11-14 终态：卡上主机别名可能与本地表不同
+    /// （别名规则升级/两端设备名缓存分叉）。终态里这不再有"治愈分支"——地址本来就
+    /// 现算，本地持久表权威；卡上别名只经 `register_device_origin_entry` 作提示对齐。
     #[test]
     #[ignore = "pre-existing/unstable in source baseline, tracked internally"]
-    fn device_origin_stale_card_alias_heals_to_canonical_url() {
+    fn device_origin_stale_card_alias_does_not_override_local_table() {
         let _g = crate::test_env_lock::test_env_lock();
         let did = "did:myco:staleCardHeal90";
         let mut spec = spec_for(did, 13911, 24011);
@@ -2277,25 +2284,19 @@ mod tests {
         spec.share_id = Some("sh-stale-real".into());
         let base = crate::dsh_share::device_origin_url(24011, did, "sh-stale-real").expect("canonical");
         let port_path = base.split_once(".localhost").expect("含 .localhost").1; // ":24011/dsh/"
-        let stale = format!("http://fresh-pc-name.localhost{port_path}");
-        spec.entry_url = Some(stale);
-        let target = browser_target_mode(&spec, 24011, true);
-        match &target {
-            BrowserTarget::Entry(u) => assert_eq!(u, &base, "别名漂移治愈为 canonical 纯设备域地址"),
-            other => panic!("必须 Entry（治愈）: {other:?}"),
-        }
-        assert_eq!(device_origin_browser_url(&spec, 24011, &target).as_deref(), Some(base.as_str()));
-        for bad in [
-            "http://fresh.localhost:24011/dsh-2/",
-            "http://fresh.localhost:24012/dsh/",
-            "http://fresh.localhost:24011/dsh/?mt=x",
-            "http://fresh.localhost:24011/gw/sh-stale-real/",
-            "http://fresh.localhost.evil:24011/dsh/",
+        for stale in [
+            format!("http://fresh-pc-name.localhost{port_path}"),
+            "http://fresh.localhost:24011/gw/sh-stale-real/".into(),
+            "http://fresh.localhost:24011/dsh-2/".into(),
+            "http://fresh.localhost:24012/dsh/".into(),
+            "http://fresh.localhost:24011/dsh/?mt=x".into(),
+            "http://fresh.localhost.evil:24011/dsh/".into(),
         ] {
-            spec.entry_url = Some(bad.into());
-            assert!(
-                matches!(browser_target_mode(&spec, 24011, true), BrowserTarget::RootFallback(_)),
-                "必须拒绝: {bad}"
+            spec.entry_url = Some(stale.clone());
+            assert_eq!(
+                device_origin_browser_url(&browser_target_mode(&spec, 24011, true)).as_deref(),
+                Some(base.as_str()),
+                "本地别名表权威: {stale}"
             );
         }
     }
@@ -2313,11 +2314,9 @@ mod tests {
         assert_eq!(rewrite_entry_port("http://evil.com:1/gw/sh-1/?mt=abc", 23911), None);
         assert_eq!(rewrite_entry_port("http://127.0.0.1:1/other/?mt=abc", 23911), None);
         assert_eq!(rewrite_entry_port("not-a-url", 23911), None);
-        // 设备域：旧卡 23911 → 独立 viewer 24011；mt/路径原样，外域/错路径仍拒绝。
-        assert_eq!(
-            rewrite_entry_port("http://myco-abcd1234.localhost:23911/dsh/", 24011),
-            Some("http://myco-abcd1234.localhost:24011/dsh/".into())
-        );
+        // 设备域卡不走端口改写：终态地址由卡坐标现算（见 browser_target_mode），
+        // 卡上 URL 的端口漂移与寻址无关——一律 None（不产生第二套寻址口径）。
+        assert_eq!(rewrite_entry_port("http://myco-abcd1234.localhost:23911/dsh/", 24011), None);
         assert_eq!(rewrite_entry_port("http://myco-abcd1234.localhost:24011/dsh/", 24011), None);
         assert_eq!(rewrite_entry_port("http://evil.example:23911/dsh/", 24011), None);
         assert_eq!(rewrite_entry_port("http://myco-abcd1234.localhost:23911/gw/sh-1/", 24011), None);
@@ -2656,7 +2655,7 @@ mod tests {
 
     /// 自连（目标 DID == 本机 DID）→ SelfTarget，且**不查隧道、不查名册**。
     #[tokio::test]
-    #[ignore = "ubuntu CI: socket/parallel flaky (stable on Windows); tracked in #3"]
+    #[ignore = "pre-existing/unstable in source baseline, tracked internally"]
     async fn presence_self_did_hit_is_self_target_without_roster() {
         let (probe, calls) = FakeProbe::new(
             Some("did:myco:zSELF"),
@@ -2767,7 +2766,7 @@ mod tests {
             if self.use_real_lease {
                 let target = browser_target_mode(_spec, _l, true);
                 l.hint = Some(
-                    device_origin_browser_url(_spec, _l, &target)
+                    device_origin_browser_url(&target)
                         .expect("租约专项卡必须生成新设备域 URL"),
                 );
                 l.client = "browser".into();
@@ -2895,6 +2894,32 @@ mod tests {
         assert_eq!(c.presence.load(Ordering::SeqCst), 0, "denied 不该触网");
         assert_eq!(c.launch.load(Ordering::SeqCst), 0);
         assert!(out["error"].as_str().unwrap().contains("vnet.forward"));
+    }
+
+    /// 2026-11-15 回归：卡里的 `env` 是**数组**（分享卡落盘形状），把整张卡原样递进来
+    /// 必须能开——原实现只认 `is_object()`，数组被滤成 Null → 误报"卡未声明 caps"
+    /// （用户 01:32「笔记本 DSH 卡点开没反应」的直接形态）。
+    #[tokio::test]
+    async fn env_open_accepts_card_env_array() {
+        let (rt, c) = mock(Presence::Online, true, true);
+        let call = json!({
+            "cardId": "sh-pc-env-dsh",
+            "caps": ["vnet.forward"],
+            "card": {
+                "shareId": "sh-pc-env-dsh",
+                "caps": ["vnet.forward"],
+                "env": [
+                    {"kind": "dsh", "device": "did:myco:z6MkPC", "port": 13911, "localPort": 23911}
+                ]
+            }
+        });
+        let parsed = parse_call(&call);
+        assert!(parsed.denial.is_none(), "数组形态 env 必须被解析：{:?}", parsed.denial);
+        assert_eq!(parsed.kind, "dsh");
+        assert_eq!(parsed.local_port, 23911);
+        let out = env_open_with(&rt, &call).await;
+        assert_eq!(out["state"], "ready", "整卡下发（env 为数组）必须可开: {out}");
+        assert_eq!(c.forward.load(Ordering::SeqCst), 1);
     }
 
     /// R24 / V20.1：在线 + 有服务 + 有权限 → ready，客户端启动，地址=固定口。
