@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.myco.phone" android:versionCode="275" android:versionName="0.3.362">
+    package="com.myco.phone" android:versionCode="276" android:versionName="0.3.363">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- 2026-10-25 閸ョ偛缍婃穱顔碱槻閿?.3.172 閺堝鈧?.3.173 閸欐垹澧楁稉顫啊娑撱倖娼?WiFi 閺夊啴妾洪妴?         KeepAliveService 閻?WIFI_MODE_FULL_HIGH_PERF WifiLock 娓氭繆绂嗙€瑰啩婊戦敍?         娑撱垹銇戦崥搴＄磽鐢瓕顫﹂棃娆撶帛閸氱偞甯€閿涘苯顦婚柈?RDP 閸撳秴褰?閻斿嫬鐫嗛弮?WiFi 鐏忓嫰顣舵导鎴犳耿閿?         闂呇囦壕 JS 濞夐潧浠犻幗?閳?閻㈠娼版鎴濈潌閻╂潙鍩岄弬顓炵磻閵嗗倹顒滅敮鍛婃綀闂勬劧绱濋弮鐘虹箥鐞涘本妞傚鍦崶閵?-->

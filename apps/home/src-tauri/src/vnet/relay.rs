@@ -202,6 +202,47 @@ pub fn apply_tunable_buffers(socket: &UdpSocket) {
         .saturating_mul(crate::vnet::relay_arq::chunk_size())
         .saturating_mul(4);
     let s = socket2::SockRef::from(socket);
+    // ── Windows UDP 陷阱（2026-11-14 P2P ack=0.33 根因 P0 修复）──
+    // Windows 默认行为：send_to 到已关闭的 UDP 端口后，ICMP Port Unreachable
+    // 会被内核关联到本 socket；下一次 recv_from 返回 WSAECONNRESET(10054)
+    // 而非已到达的数据帧——帧被消费但未交付 = 随机丢帧。
+    // 禁用该行为后 recv_from 只返回真实数据或 WouldBlock。
+    // （这是 Winsock2 文档化的标准配置，Microsoft 官方建议长连接 UDP 必须禁用。
+    //   参考：MSDN SIO_UDP_CONNRESET ioctl 文档）
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawSocket;
+        const SIO_UDP_CONNRESET: u32 = 0x9800_000C; // winsock2.h
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn WSAIoctl(
+                s: usize,
+                code: u32,
+                in_buf: *const core::ffi::c_void,
+                in_len: u32,
+                out_buf: *mut core::ffi::c_void,
+                out_len: u32,
+                ret_len: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+                completion: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        let disable: u32 = 0; // FALSE = 禁用 CONNRESET 上报
+        let mut bytes_ret: u32 = 0;
+        let _ = unsafe {
+            WSAIoctl(
+                socket.as_raw_socket() as usize,
+                SIO_UDP_CONNRESET,
+                &disable as *const u32 as *const core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_ret,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+    }
     let rcv = std::env::var("VNET_RCVBUF")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())

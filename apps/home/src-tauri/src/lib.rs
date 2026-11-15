@@ -1335,6 +1335,7 @@ pub fn run() {
             usage_week_by_project,
             prod_update_info,
             kill_member,
+            crate::dsh_share::vnet_peer_status,
             get_build_info,
             take_pending_auth_uri,
             take_pending_chat_did,
@@ -1414,6 +1415,7 @@ pub fn run() {
             chat_service::chat_accept_task,
             chat_service::chat_set_task_status,
             chat_service::chat_rename_task,
+            chat_service::chat_remove_task,
             chat_service::chat_presence,
             chat_service::chat_typing,
             chat_service::chat_device_group_info,
@@ -1453,6 +1455,12 @@ pub fn run() {
             crate::startup_trace::mark("setup-enter");
             register_myco_protocol();
             crate::startup_trace::mark("protocol-registered");
+            // 账号切换 = 卡集切换 = 端口集重建（2026-11-14 立法）：
+            // 注册钩子 → 切账号成功后 dsh_share 侧重载卡集（refresh_mf_card_ports +
+            // PREV_CARD_IDS 差集自动收旧建新）。见 identity.rs fire_account_switch_hook。
+            myco_core::identity::set_account_switch_hook(Box::new(|_did| {
+                crate::dsh_share::on_account_switched();
+            }));
             // ═══ 2026-10-15 启动提速（用户目标：myco 重启 → 页面 3s 内重连）═══
             // 实测分段：proc→mgmt ≈2.3s 的元凶是**配置窗口在 setup 之前初始化 WebView**，
             // 把下面的服务器全挡在后面。改法：窗口清出配置（windows:[]）、此处**先起

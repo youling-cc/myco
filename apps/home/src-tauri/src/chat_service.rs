@@ -853,6 +853,109 @@ pub(crate) fn load_tasks() -> Vec<Value> {
     }
 }
 
+/// 卡内容指纹（无 shareId 的卡去重用）：title + 来源署名 + env 签名排序。
+///
+/// 2026-11-15 事故（用户实拍两张一模一样的「ADB 调试」）：原来只有 taskId 幂等，
+/// 换个 taskId 重投就是第二张卡。有 shareId 的卡必须按 shareId 收敛；没有 shareId
+/// （手工/脚本建的散卡）只能按内容判同一张——这里给出稳定指纹，调用方按它去重。
+fn task_content_key(t: &Value) -> String {
+    let title = t.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if title.is_empty() {
+        return String::new();
+    }
+    let from = t.get("fromName").and_then(|v| v.as_str()).unwrap_or("");
+    let mut envs: Vec<String> = t
+        .get("env")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|e| {
+                    format!(
+                        "{}|{}|{}",
+                        e.get("kind").and_then(|v| v.as_str()).unwrap_or(""),
+                        e.get("device").and_then(|v| v.as_str()).unwrap_or(""),
+                        e.get("port").and_then(|v| v.as_u64()).unwrap_or(0)
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    envs.sort();
+    format!("{title}\u{1}{from}\u{1}{}", envs.join(";"))
+}
+
+/// 落库前去重：**有 shareId 按 shareId**，**无 shareId 按内容指纹**。
+///
+/// 两条纪律（2026-11-15）：
+/// ① `status=shared` 行是「我发出去的卡」的记录，不是收到的卡——永不参与去重删除
+///    （UI 侧本来就过滤 status!=='shared'，删了会丢发送历史）。
+/// ② 只删"同一张卡的旧副本"，不跨 shareId 误杀。
+fn dedupe_task_records(tasks: &mut Vec<Value>, rec: &Value) {
+    let is_shared = rec.get("status").and_then(|v| v.as_str()) == Some("shared");
+    if is_shared {
+        return;
+    }
+    let sid = rec
+        .get("shareId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let keep_shared = |t: &Value| t.get("status").and_then(|v| v.as_str()) == Some("shared");
+    if !sid.is_empty() {
+        tasks.retain(|t| {
+            keep_shared(t)
+                || t.get("shareId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim() != sid.as_str())
+                    .unwrap_or(true)
+        });
+        return;
+    }
+    let key = task_content_key(rec);
+    if key.is_empty() {
+        return;
+    }
+    tasks.retain(|t| {
+        if keep_shared(t) {
+            return true;
+        }
+        // 有 shareId 的卡与散卡不是同一张（同一张卡在源端有 shareId、在收端可能没有）
+        if t.get("shareId")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        task_content_key(t) != key
+    });
+}
+
+/// 按 shareId 从本机任务卡里取 **主 env（对象）**——执行器 env/open 的最后一道兜底。
+///
+/// 2026-11-15 事故整改：旧调用方/手机端有时只传 `cardId`，不带 env/caps；执行器
+/// 于是判"卡未声明 caps"直接 denied（用户看到的就是"点卡没反应"）。卡在本地任务库里
+/// 明明有 env，没理由开不了。这里按 shareId 找到卡，取 env[] 的主条目
+/// （rdp → dsh → 首条，与 `dsh_share::primary_env` 同序）返回给 `vnet_env::parse_call`。
+///
+/// 只读、不审计、无副作用；找不到返回 None（保持原有 denied 语义）。
+pub(crate) fn task_card_env_by_share(share_id: &str) -> Option<Value> {
+    let sid = share_id.trim();
+    if sid.is_empty() {
+        return None;
+    }
+    for t in load_tasks() {
+        if t.get("shareId").and_then(|v| v.as_str()) != Some(sid) {
+            continue;
+        }
+        let arr = t.get("env").and_then(|v| v.as_array())?;
+        let pick = |k: &str| arr.iter().find(|e| e.get("kind").and_then(|x| x.as_str()) == Some(k));
+        return pick("rdp").or_else(|| pick("dsh")).or_else(|| arr.first()).cloned();
+    }
+    None
+}
+
 /// 读任务库并保留“读失败/坏 JSON”信号：clean URL 生命周期必须以**已知**
 /// 无卡片为回收前提，不能把瞬时读失败当成“卡片已删除”（fail-open 会误杀入口）。
 pub(crate) fn load_tasks_result() -> Result<Vec<Value>, String> {
@@ -3877,6 +3980,9 @@ fn upsert_device_group_task(card: &Value, status: &str, from_device: &str, from_
     }
     let rec = Value::Object(obj);
     tasks.retain(|t| t.get("taskId").and_then(|v| v.as_str()) != Some(task_id.as_str()));
+    // 2026-11-15 去重（用户实拍「两张一模一样的 ADB 调试」）：
+    // 只按 taskId 幂等不够——同一张卡换个 taskId 再投递就是两张。
+    dedupe_task_records(&mut tasks, &rec);
     tasks.push(rec);
     save_tasks(&tasks);
 }
@@ -5466,6 +5572,9 @@ async fn ingest_msg(my: &str, m: &Value) -> bool {
                             "target": "window",
                         }));
                 }
+                // 2026-11-15 去重（好友/群发卡路径同款）：有 shareId 按 shareId 收敛，
+                // 无 shareId 按内容指纹收敛——避免"换 taskId 重投 = 第二张卡"。
+                dedupe_task_records(&mut tasks, &rec);
                 tasks.push(rec);
                 save_tasks(&tasks);
             } else {
@@ -6673,6 +6782,20 @@ pub async fn chat_share_task(
             payload["env"] = env;
             payload["caps"] = json!([crate::vnet_env::CAP_VNET_FORWARD]);
             payload["owner"] = json!(owner);
+        } else if let Some(env0) = task_card_env_by_share(sid) {
+            // 2026-11-15 健壮性补口（转授/转发场景）：本机注册表没有这条分享
+            // （转发别人的卡）→ `share_env_for_card` 返回 None → 出站卡只有 shareId，
+            // 接收方落一张点不动的卡。兜底：本机任务库里若存着这张卡的 env[]
+            // （作为收卡方曾经收到过），按同样口径取主条目原样转发。
+            payload["env"] = json!([env0]);
+            payload["caps"] = json!([crate::vnet_env::CAP_VNET_FORWARD]);
+            if let Some(owner) = load_tasks()
+                .iter()
+                .find(|t| t.get("shareId").and_then(|v| v.as_str()) == Some(sid))
+                .and_then(|t| t.get("owner").cloned())
+            {
+                payload["owner"] = owner;
+            }
         }
     }
     // 批二：群 conv → 群会话一条 task-share（to=grp-*，p2p_send_raw 按 members 端侧扇出，
@@ -7272,6 +7395,28 @@ fn ingest_task_rename(my: &str, m: &Value) -> bool {
         }),
     );
     true
+}
+
+/// 用户主动删除一张任务卡（2026-11-15：用户被重复卡缠住，只能停机改 JSON）。
+///
+/// 语义：删本地任务行 + 打 tombstone（防对账/迟到重投把它复活），不发网络包——
+/// 删的是"我这台设备上的这张卡"，不动源设备的分享。
+#[tauri::command]
+pub fn chat_remove_task(task_id: String) -> Result<Value, String> {
+    let tid = task_id.trim().to_string();
+    if tid.is_empty() {
+        return Err("缺 taskId".into());
+    }
+    let mut tasks = load_tasks();
+    let before = tasks.len();
+    tasks.retain(|t| t.get("taskId").and_then(|v| v.as_str()) != Some(tid.as_str()));
+    let removed = before - tasks.len();
+    if removed > 0 {
+        save_tasks(&tasks);
+    }
+    // tombstone 复用既有机制：对账预热/群同步/迟到重投命中 tombstone 一律不落库
+    tombstone_task(&tid, "user-remove");
+    Ok(json!({ "ok": true, "taskId": tid, "removed": removed }))
 }
 
 /// owner 端改名入口（任务卡菜单「改名」）：本地更新 → P2P 发 task-rename 到任务
@@ -9179,7 +9324,53 @@ mod task_revoke_tests {
 
     /// task-24 tombstone：写入幂等 + 三个落库口拒复活 + 快照双滤 + 批量 API 内核。
     #[test]
-    fn tombstone_blocks_revive_and_is_idempotent() {
+    /// 2026-11-15 回归（用户实拍「两张一模一样的 ADB 调试」）：落库前必须收敛同卡。
+/// ① 无 shareId 的散卡：内容指纹相同 → 只留后到的这张；
+/// ② 有 shareId：同 shareId 收敛，但 `status=shared`（我发出去的记录）永不删。
+#[test]
+fn dedupe_task_records_by_content_and_share() {
+    // ① 散卡内容重复
+    let mut tasks = vec![
+        json!({"taskId":"t1","title":"ADB 调试","fromName":"我·koGc",
+               "env":[{"kind":"adb","device":"did:myco:zPhone","port":5555}]}),
+        json!({"taskId":"t0-other","title":"别的卡","fromName":"我·koGc"}),
+    ];
+    let rec = json!({"taskId":"t2","title":"ADB 调试","fromName":"我·koGc",
+                     "env":[{"kind":"adb","device":"did:myco:zPhone","port":5555}]});
+    dedupe_task_records(&mut tasks, &rec);
+    assert_eq!(
+        tasks.len(),
+        1,
+        "去重后只剩「别的卡」——同内容散卡已收敛（新卡由调用方 push）"
+    );
+    assert!(
+        tasks.iter().all(|t| t.get("taskId").and_then(|v| v.as_str()) != Some("t1")),
+        "同内容散卡必须被收敛"
+    );
+
+    // ② 同 shareId 收敛，shared 历史行保留
+    let mut tasks2 = vec![
+        json!({"taskId":"s1","shareId":"sh-a","title":"A","status":"todo"}),
+        json!({"taskId":"s-sent","shareId":"sh-a","title":"A","status":"shared"}),
+        json!({"taskId":"s-other","shareId":"sh-b","title":"B","status":"todo"}),
+    ];
+    let rec2 = json!({"taskId":"s2","shareId":"sh-a","title":"A","status":"todo"});
+    dedupe_task_records(&mut tasks2, &rec2);
+    assert!(
+        tasks2.iter().all(|t| t.get("taskId").and_then(|v| v.as_str()) != Some("s1")),
+        "同 shareId 的旧副本应被收敛"
+    );
+    assert!(
+        tasks2.iter().any(|t| t.get("taskId").and_then(|v| v.as_str()) == Some("s-sent")),
+        "status=shared 是发送历史，绝不参与去重删除"
+    );
+    assert!(
+        tasks2.iter().any(|t| t.get("taskId").and_then(|v| v.as_str()) == Some("s-other")),
+        "不同 shareId 不得误杀"
+    );
+}
+
+fn tombstone_blocks_revive_and_is_idempotent() {
         let _g = env();
         // 干净起点（隔离目录下也应幂等清场）
         save_tombstones(&[]);

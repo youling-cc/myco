@@ -414,6 +414,31 @@ impl Authorized {
         format!("…{}", &did[did.len().saturating_sub(4)..])
     }
 
+    /// **装饰性**名字同步：只更新**已存在**行的显示名，**绝不创建授权行**。
+    ///
+    /// 2026-11-15 事故（越权面 + 设备清不掉，两端实证）：
+    /// 启动路径 `dsh_share::sync_device_names` 原用 `upsert_device(.., None, None, None)`
+    /// 同步账号名册里的设备名——缺省 `allowed=None → unwrap_or(true)` + `scopes=None
+    /// → ["*"]`，于是名册里**早已除名/换机的历史设备**在每次启动时被重新写成本机
+    /// 全权放行（addedAt=lastSeen=启动那一秒）。用户清理白名单无效，且任何名册
+    /// 设备都自动拿到 "*" 权限——这是授权面被装饰路径污染的典型。
+    /// 现在：名字只在已有行上更新；返回是否命中（false = 不在白名单，不建）。
+    pub fn cache_device_name(&self, did: &str, name: &str) -> bool {
+        if name.trim().is_empty() {
+            return false;
+        }
+        let mut devices = self.devices.lock().unwrap();
+        let Some(d) = devices.iter_mut().find(|d| d.did == did) else {
+            return false;
+        };
+        d.name = name.to_string();
+        // 锁纪律（2026-11-15 实测自死锁）：save() 内部会再取 self.devices，
+        // 必须先放锁再落盘——同本文件其它写方法（drop(devices); self.save();）。
+        drop(devices);
+        self.save();
+        true
+    }
+
     /// 本地 upsert 设备（分享授权用：不存在则建，存在则合并 scopes/归属）。
     pub fn upsert_device(
         &self,
@@ -456,10 +481,20 @@ impl Authorized {
                 last_seen: now_ms(),
                 last_addr: None,
                 owner_root_did,
-                auth_state: if allowed.unwrap_or(true) { AuthState::Allowed } else { AuthState::Denied },
+                // 2026-11-15 事故整改（同 `cache_device_name` 注释）：新建行的缺省
+                // **不再是"Allowed + 全权"**——新设备必须显式放行/授权；缺省 =
+                // Pending + 空 scope（等用户在设备列表点「放行」）。
+                auth_state: match allowed {
+                    Some(true) => AuthState::Allowed,
+                    Some(false) => AuthState::Denied,
+                    None => AuthState::Pending,
+                },
                 client_ip: None,
                 auth_expires_at: None,
-                scopes: normalize_scopes(scopes.unwrap_or_else(default_scopes)),
+                scopes: match scopes {
+                    Some(s) => normalize_scopes(s),
+                    None => Vec::new(),
+                },
                 origin,
                 issued_by: None,
             });
@@ -522,6 +557,56 @@ mod tests {
         // 例外优先：具体条目收窄为 ro，不得被项目通配覆盖
         assert!(!task_scopes_allow(&scopes, "proj-x-h1"));
         assert!(task_scopes_allow_read(&scopes, "proj-x-h1"));
+    }
+
+    /// 2026-11-15 事故回归（设备清不掉 + 授权面被装饰路径污染）：
+    /// 署名用的名字缓存**绝不创建授权行**；`upsert_device` 缺省不再自动 Allowed/["*"]。
+    #[test]
+    fn name_cache_never_creates_authorization_rows() {
+        // 全局 env（MYCO_CONFIG_DIR）是进程级状态：与其它用例串行，避免并发污染。
+        let _g = crate::test_env_lock::test_env_lock();
+        let tmp = std::env::temp_dir().join(format!(
+            "myco-share-auth-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&tmp).expect("建临时配置目录");
+        std::env::set_var("MYCO_CONFIG_DIR", &tmp);
+
+        let a = Authorized::load();
+        assert!(a.list().is_empty(), "空目录起步");
+
+        // ① 名册里存在但本机从未授权的设备：只尝试缓存名字 → 不建行
+        assert!(
+            !a.cache_device_name("did:myco:zHistoric", "历史设备"),
+            "未授权设备不得因名字同步被创建"
+        );
+        assert!(a.list().is_empty(), "装饰性路径绝不产生授权行");
+
+        // ② 显式 upsert 但缺省 allowed/scopes：必须 Pending + 空 scope（不再全权）
+        a.upsert_device("did:myco:zNew", "新设备", None, None, None, None);
+        let rows = a.list();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].auth_state, AuthState::Pending, "缺省不得自动放行");
+        assert!(rows[0].scopes.is_empty(), "缺省不得自动给 *");
+
+        // ③ 已存在行：放行后再改名字 → 授权状态与 scope 一字不动
+        a.upsert_device(
+            "did:myco:zNew",
+            "新设备",
+            None,
+            Some(true),
+            Some(v(&["*"])),
+            None,
+        );
+        assert!(a.cache_device_name("did:myco:zNew", "改名后"));
+        let rows = a.list();
+        assert_eq!(rows[0].name, "改名后", "名字要更新");
+        assert_eq!(rows[0].auth_state, AuthState::Allowed, "授权状态不许被改名动");
+        assert_eq!(rows[0].scopes, v(&["*"]), "scope 不许被改名动");
+
+        std::env::remove_var("MYCO_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

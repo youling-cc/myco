@@ -175,6 +175,24 @@ export function MycoDevices({ myYoulingDid, myYoulingName, localDid, isEmbodimen
   const [busy, setBusy] = useState<string | null>(null)
   // 成员设备委任状剩余（pubkey → 剩余）：主设备视角的"30 天授权数字"（2026-10-13）
   const [delegByPub, setDelegByPub] = useState<DelegByDevice>({})
+  // vnet 连接状态（2026-11-15 vnet 需求 / jason「现在就做」）：device did → { path, direct, rttMs }
+  // 来源：/api/vnet/status forwards 的设备级聚合（5s 轮询）
+  const [vnetPeer, setVnetPeer] = useState<Record<string, { path: string; direct: boolean; rttMs: number | null }>>({})
+
+  // vnet 连接状态轮询：每 5s 拉 /api/vnet/status，从 forwards 聚合每设备最优路径
+  useEffect(() => {
+    let alive = true
+    const poll = async () => {
+      try {
+        const st = await client.invoke<{ peers: Record<string, { path: string; direct: boolean; rttMs: number | null }> }>('vnet_peer_status')
+        const peers = st?.peers ?? {}
+        if (alive && Object.keys(peers).length > 0) setVnetPeer(peers)
+      } catch { /* vnet 未跑/接口不可用 = 无状态，静默 */ }
+    }
+    void poll()
+    const t = setInterval(poll, 5000)
+    return () => { alive = false; clearInterval(t) }
+  }, [])
 
   const refresh = async () => {
     try {
@@ -598,38 +616,50 @@ export function MycoDevices({ myYoulingDid, myYoulingName, localDid, isEmbodimen
               <div key={d.did}>
               <ExpandableRow
                 summary={
-                  <>
-                    <span className="shrink-0 text-[var(--text-muted)]">
-                      {/phone|手机|iphone|android/i.test(d.name) ? <Smartphone size={14} /> : <Monitor size={14} />}
-                    </span>
-                    {/* 2026-10-13 P1 可读性：窄窗（home 默认 ~420px）下这行同时挂了
-                        名称/DID/来源/委任状徽标/放行开关——名称此前被压成「小…」。
-                        改：名称保底 64px（识别优先），DID 让位（完整 DID 展开即见）。 */}
-                    <span className="text-[12px] font-medium text-[var(--text-primary)] truncate" style={{ minWidth: 64 }}>{d.name || '未命名'}</span>
-                    <span className="text-[9px] font-mono text-[var(--text-muted)] min-w-0 truncate select-text">{shortDid(d.did)}</span>
-                    {d.origin && <span className="text-[9px] px-1 rounded bg-[var(--chrome-border)]/60 text-[var(--text-muted)] shrink-0">{d.origin}</span>}
-                    {!(d.scopes?.length ? d.scopes : ['*']).includes('*') && (
-                      <span className="text-[9px] px-1 rounded bg-violet-100 text-violet-700 shrink-0" title="受限作用域(展开可调)">限权限</span>
-                    )}
-                    {/* 成员设备委任状剩余（2026-10-13："30 天授权数字"上主设备视角；>3 天绿/≤3 天橙/过期红） */}
-                    {delegByPub[d.pubkeyB64] && (
-                      <span className="text-[9px] font-semibold px-1 rounded shrink-0"
-                        style={{ color: delegDaysLeft(delegByPub[d.pubkeyB64].remainingMs).color }}
-                        title="本设备委任状（授权）剩余有效期">
-                        {delegDaysLeft(delegByPub[d.pubkeyB64].remainingMs).label}
+                  <span className="flex w-full min-w-0 flex-col gap-0.5">
+                    {/* 2026-11-15 用户实拍整改：窄窗下单行塞 名称+DID+徽标+开关 → 名称被压成「DE…」。
+                        改为两行：第一行 图标+完整名称+开关；第二行 DID/连接/委任状等徽标。 */}
+                    <span className="flex w-full min-w-0 items-center gap-1.5">
+                      <span className="shrink-0 text-[var(--text-muted)]">
+                        {/phone|手机|iphone|android|华为|npn|dd9f/i.test(d.name + ' ' + d.did) ? <Smartphone size={14} /> : <Monitor size={14} />}
                       </span>
-                    )}
-                    <span className="ml-auto flex items-center gap-1.5 shrink-0">
-                      {/* 2026-10-13 P1 去重：**只读在线点（●在线/○离线）已从账号页移除**——
-                          设备名单与在线态统一由底部「🤖 智能体」Tab（AgentDevices）呈现，
-                          本页只留"放行/拒绝"这类**管理**控件，避免同一运行态两处显示。 */}
-                      {d.authState === 'denied' && <span className="text-[9px] px-1 rounded bg-red-100 text-[#ff8a80]">已拒</span>}
-                      <button onClick={(e) => { e.stopPropagation(); void toggle(d) }} disabled={busy !== null} title={d.authState === 'allowed' ? '关闭授权' : '放行（可选时限）'}
-                        className={`relative w-8 h-4 rounded-full transition-colors ${d.authState === 'allowed' ? 'bg-emerald-500' : 'bg-[var(--chrome-border)]'}`}>
-                        <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${d.authState === 'allowed' ? 'translate-x-4' : ''}`} />
-                      </button>
+                      <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-[var(--text-primary)]" title={d.name || '未命名'}>{d.name || '未命名'}</span>
+                      <span className="ml-auto flex shrink-0 items-center gap-1.5">
+                        {d.authState === 'denied' && <span className="text-[9px] px-1 rounded bg-red-100 text-[#ff8a80]">已拒</span>}
+                        <button onClick={(e) => { e.stopPropagation(); void toggle(d) }} disabled={busy !== null} title={d.authState === 'allowed' ? '关闭授权' : '放行（可选时限）'}
+                          style={{ width: 32, height: 16, borderRadius: 9999, padding: 0, border: 'none', background: d.authState === 'allowed' ? '#10b981' : 'var(--chrome-border)' }}
+                          className="relative shrink-0 transition-colors">
+                          <span className="absolute rounded-full bg-white transition-transform"
+                            style={{ width: 12, height: 12, top: 2, left: 2, transform: d.authState === 'allowed' ? 'translateX(16px)' : 'none' }} />
+                        </button>
+                      </span>
                     </span>
-                  </>
+                    <span className="flex w-full min-w-0 items-center gap-1.5 overflow-hidden">
+                      <span className="min-w-0 truncate font-mono text-[9px] text-[var(--text-muted)] select-text">{shortDid(d.did)}</span>
+                      {/* 2026-11-15 vnet 需求：连接状态标记（⚡直连/🔄中转 + RTT），5s 轮询 */}
+                      {vnetPeer[d.did] && (
+                        <span className="shrink-0 rounded px-1 font-mono text-[9px]"
+                          style={{
+                            background: vnetPeer[d.did].direct ? 'rgba(16,185,129,0.12)' : 'rgba(245,158,11,0.12)',
+                            color: vnetPeer[d.did].direct ? '#059669' : '#d97706',
+                          }}
+                          title={`传输路径: ${vnetPeer[d.did].path}${vnetPeer[d.did].rttMs != null ? ` · RTT ${vnetPeer[d.did].rttMs}ms` : ''}`}>
+                          {vnetPeer[d.did].direct ? '⚡直连' : '🔄中转'}{vnetPeer[d.did].rttMs != null ? ` ${vnetPeer[d.did].rttMs}ms` : ''}
+                        </span>
+                      )}
+                      {d.origin && <span className="shrink-0 rounded bg-[var(--chrome-border)]/60 px-1 text-[9px] text-[var(--text-muted)]">{d.origin}</span>}
+                      {!(d.scopes?.length ? d.scopes : ['*']).includes('*') && (
+                        <span className="shrink-0 rounded bg-violet-100 px-1 text-[9px] text-violet-700" title="受限作用域(展开可调)">限权限</span>
+                      )}
+                      {delegByPub[d.pubkeyB64] && (
+                        <span className="shrink-0 rounded px-1 text-[9px] font-semibold"
+                          style={{ color: delegDaysLeft(delegByPub[d.pubkeyB64].remainingMs).color }}
+                          title="本设备委任状（授权）剩余有效期">
+                          {delegDaysLeft(delegByPub[d.pubkeyB64].remainingMs).label}
+                        </span>
+                      )}
+                    </span>
+                  </span>
                 }
                 details={
                   <>
@@ -644,24 +674,29 @@ export function MycoDevices({ myYoulingDid, myYoulingName, localDid, isEmbodimen
                         return (
                           <button key={sc} onClick={() => void toggleScope(d, sc)} disabled={busy !== null}
                             title={sc === '*' ? '全量(所有作用域)' : `作用域 ${sc}`}
-                            className={`h-5 px-2 text-[10px] rounded-full border transition-colors ${
-                              on
-                                ? 'bg-violet-100 border-violet-300 text-violet-700'
-                                : 'bg-white border-[var(--chrome-border)] text-[var(--text-muted)] hover:border-violet-300'
-                            }`}>{label}</button>
+                            /* 2026-11-15 用户实拍：全局 .sec button 的 padding/字号覆盖 tailwind，
+                               徽标互相重叠——改内联样式根治（与 ExpandableRow 同一手法）。 */
+                            style={{
+                              height: 22, padding: '0 8px', fontSize: 10, lineHeight: '20px',
+                              borderRadius: 9999, border: '1px solid',
+                              background: on ? '#ede9fe' : '#fff',
+                              borderColor: on ? '#c4b5fd' : 'var(--chrome-border)',
+                              color: on ? '#6d28d9' : 'var(--text-muted)',
+                            }}>{label}</button>
                         )
                       })}
                     </div>
                     {d.origin && (
                       <button onClick={() => void revokeByOrigin(d.origin as string)} disabled={busy !== null}
                         title={`吊销来源「${d.origin}」名下全部 agent(丢设备一键清)`}
-                        className="h-5 px-1.5 text-[10px] rounded border border-red-200 text-[#ff8a80] hover:bg-red-50 disabled:opacity-50">
+                        style={{ height: 22, padding: '0 8px', fontSize: 10, lineHeight: '20px', borderRadius: 4, border: '1px solid #fecaca', background: '#fff', color: '#ff8a80' }}>
                         吊销「{d.origin}」全部授权
                       </button>
                     )}
                     <input defaultValue={d.name} placeholder="备注名"
                       onBlur={(e) => { const v = e.target.value.trim(); if (v !== (d.name || '')) void renameDevice(d.did, v) }}
-                      className="w-full h-7 px-2 text-[11px] bg-white border border-[var(--chrome-border)] rounded focus:outline-none focus:border-[var(--accent)]" />
+                      /* 2026-11-15 实拍：全局 input 样式把它撑成巨块——内联收紧。 */
+                      style={{ width: '100%', height: 28, padding: '0 8px', fontSize: 11, lineHeight: '26px', border: '1px solid var(--chrome-border)', borderRadius: 6, background: '#fff' }} />
                     <div className="text-[10px] text-[var(--text-muted)]">
                       {relTime(d.lastSeen) && relTime(d.lastSeen) + '活跃' || '从未活跃' }{d.lastAddr ? ` · ${shortAddr(d.lastAddr)}${c ? `/${c}` : ''}` : ''} · {new Date(d.addedAt).toLocaleDateString('zh-CN')} 添加
                     </div>
@@ -672,17 +707,17 @@ export function MycoDevices({ myYoulingDid, myYoulingName, localDid, isEmbodimen
                           <span className="flex flex-col items-end gap-1">
                             <span className="flex items-center gap-1.5">
                               <button onClick={() => void removeDevice(d, false)} disabled={busy !== null} title="它连不上本机了，但仍是账号成员"
-                                className="h-5 px-1.5 text-[10px] rounded bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50">断开本机授权</button>
+                                style={{ height: 22, padding: '0 8px', fontSize: 10, lineHeight: '20px', borderRadius: 4, border: 'none', background: '#d97706', color: '#fff' }}>断开本机授权</button>
                               {isEmbodiment && d.ownerRootDid === myYoulingDid && (
                                 <button onClick={() => void removeDevice(d, true)} disabled={busy !== null} title="名册吊销——它不再是这个账号的设备（手机丢了/退役用这个）"
-                                  className="h-5 px-1.5 text-[10px] rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50">断开并从账号除名</button>
+                                  style={{ height: 22, padding: '0 8px', fontSize: 10, lineHeight: '20px', borderRadius: 4, border: 'none', background: '#dc2626', color: '#fff' }}>断开并从账号除名</button>
                               )}
-                              <button onClick={() => setDelFor(null)} className="h-5 px-1.5 text-[10px] rounded border border-[var(--chrome-border)] text-[var(--text-muted)]">取消</button>
+                              <button onClick={() => setDelFor(null)} style={{ height: 22, padding: '0 8px', fontSize: 10, lineHeight: '20px', borderRadius: 4, border: '1px solid var(--chrome-border)', background: '#fff', color: 'var(--text-muted)' }}>取消</button>
                             </span>
                           </span>
                         ) : (
                           <button onClick={() => setDelFor(d.did)} title="删除此设备记录（可重新配对）"
-                            className="flex items-center gap-1 h-5 px-1.5 text-[10px] rounded text-[var(--text-muted)] hover:text-[#ff8a80] hover:bg-red-50">
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 4, height: 22, padding: '0 8px', fontSize: 10, lineHeight: '20px', borderRadius: 4, border: 'none', background: 'transparent', color: 'var(--text-muted)' }}>
                             <Trash2 size={11} /> 删除设备
                           </button>
                         )}

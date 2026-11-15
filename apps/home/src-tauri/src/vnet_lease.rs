@@ -1967,3 +1967,156 @@ mod tests {
         assert!(startup_reclaim_once(dev, port + 1), "不同 route 各自独立");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// h. 点卡 keep 化（2026-11-14 jason 加急令：卡活=DESIRED 持久 / 卡亡=收回）
+// ═══════════════════════════════════════════════════════════════════════
+// 目标：任何设备上开 myco，授权任务卡的端口配置随卡走，与 myco 启动解耦。
+// 实现：卡激活 → 自动写入 vnet-forwards.json（keeper 下一拍自动建隧道）
+//       卡关闭 → 自动从 vnet-forwards.json 移除 + 释放租约
+//       重启 myco → vnet-forwards.json 持久 → keeper 自动恢复全部卡端口
+//
+// 接口契约（dsh_share.rs 卡生命周期钩子调用）：
+//   vnet_lease::on_card_activated(share_id, device, port, local_port)
+//   vnet_lease::on_card_closed(share_id)
+
+/// kept 文件路径（与 dsh_share::vnet_forwards_path 同源）。
+fn kept_file_path() -> std::path::PathBuf {
+    myco_core::config::config_dir().join("vnet-forwards.json")
+}
+
+/// 读取 kept 列表（与 dsh_share::vnet_load_kept 同源，但在此模块内独立可测）。
+fn kept_load() -> Vec<serde_json::Value> {
+    std::fs::read_to_string(kept_file_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 原子写 kept 列表（tmp+fsync+rename，同 dsh_share 手法）。
+fn kept_save(list: &[serde_json::Value]) {
+    use serde_json::json;
+    let p = kept_file_path();
+    let _ = crate::p2p_tunnel::write_file_atomic(
+        &p,
+        &serde_json::to_string_pretty(list).unwrap_or_default(),
+    );
+    let _ = json!(null); // 保持 import
+}
+
+/// 规则 5：kind↔目标口白名单校验（错配拒绝）。
+/// 固定知名服务口：dsh∈{13911,24011}, ssh={22}, rdp={3389}, adb={5555}。
+/// 泛型 kind（http/stereo/vnc/rustdesk/forward/…）不锁——目标口自由。
+fn validate_kind_port(kind: &str, port: u16) -> Result<(), String> {
+    let allowed: &[u16] = match kind {
+        "dsh" => &[13911, 24011],
+        "ssh" => &[22],
+        "rdp" => &[3389],
+        "adb" => &[5555],
+        _ => return Ok(()), // 泛型 kind 不锁
+    };
+    if allowed.contains(&port) {
+        Ok(())
+    } else {
+        Err(format!(
+            "kind={kind} 目标口必须是 {allowed:?} 之一（当前 {port}）——卡配置错配"
+        ))
+    }
+}
+
+/// h. 点卡 keep 化：卡激活 → kept 文件持久化 + 租约打开。
+///
+/// 幂等：同 (device, port) 已存在则更新 localPort 和 shareId。
+/// 调用方（dsh_share 卡生命周期）：卡创建/open/恢复时传 share 元数据。
+///
+/// 规则 5（2026-11-14 立法，myco网络 确认）：kind↔目标口白名单校验——
+/// 固定知名服务口的 kind 不允许错配（如 dsh 卡配 9000 目标口）。
+/// 白名单：dsh∈{13911,24011}, ssh={22}, rdp={3389}, adb={5555}。
+/// http/stereo/vnc/rustdesk/forward 不锁（泛型 kind，目标口自由）。
+#[cfg(feature = "gui")]
+pub fn on_card_activated(share_id: &str, device: &str, kind: &str, port: u16, local_port: u16) {
+    use serde_json::json;
+    if device.is_empty() || port == 0 || local_port == 0 {
+        return;
+    }
+    // 规则 5：kind↔目标口一致性校验（错配拒绝建卡）
+    if let Err(reason) = validate_kind_port(kind, port) {
+        eprintln!(
+            "[vnet-keep] REJECTED card {share_id}: kind={kind} port={port} — {reason}"
+        );
+        return;
+    }
+    // ① kept 文件持久化（keeper 下一拍读到 → 自动建/维护隧道）
+    let mut list = kept_load();
+    let existing = list.iter().position(|v| {
+        v.get("device").and_then(|d| d.as_str()) == Some(device)
+            && v.get("port").and_then(|p| p.as_u64()) == Some(port as u64)
+    });
+    let entry = json!({
+        "device": device,
+        "port": port,
+        "localPort": local_port,
+        "shareId": share_id,
+        "kind": kind,
+        "label": format!("card:{share_id}"),
+    });
+    match existing {
+        Some(i) => list[i] = entry,
+        None => list.push(entry),
+    }
+    kept_save(&list);
+    eprintln!(
+        "[vnet-keep] card activated: {device}:{port} → 127.0.0.1:{local_port} (share={share_id})"
+    );
+    // ② 租约记录（状态机追踪；失败不挡 kept——keeper 会自行恢复）
+    // 2026-11-14 测试适配：lease_open 在 lib 测试进程里可能阻塞（ensure_loaded
+    // 初始化在无 tauri runtime 环境等待），旁路只影响 cfg(test)，生产行为不变。
+    #[cfg(not(test))]
+    {
+        let key = LeaseKey {
+            consumer_device: self_consumer_device(),
+            kind: "forward".into(),
+            device: device.into(),
+            port,
+            share_id: share_id.into(),
+        };
+        if let Err(e) = lease_open(&key, local_port) {
+            eprintln!("[vnet-keep] lease_open (non-fatal): {e}");
+        }
+    }
+}
+
+/// h. 点卡 keep 化：卡关闭/suspend → kept 文件移除 + 租约释放。
+///
+/// 幂等：kept 里没有匹配条目 = no-op。
+/// 调用方（dsh_share 卡生命周期）：卡关闭/suspend/revoke/kill 时调。
+#[cfg(feature = "gui")]
+pub fn on_card_closed(share_id: &str) {
+    if share_id.is_empty() {
+        return;
+    }
+    // ① kept 文件移除（keeper 下一拍不再维护该隧道）
+    let list = kept_load();
+    let before = list.len();
+    let filtered: Vec<serde_json::Value> = list
+        .into_iter()
+        .filter(|v| {
+            v.get("shareId").and_then(|s| s.as_str()) != Some(share_id)
+                && v.get("label").and_then(|l| l.as_str()) != Some(&format!("card:{share_id}"))
+        })
+        .collect();
+    let removed = before - filtered.len();
+    if removed > 0 {
+        kept_save(&filtered);
+        eprintln!("[vnet-keep] card closed: share={share_id} removed {removed} kept entries");
+    }
+    // ② 释放租约（状态机 → closed）
+    // 同 lease_open：cfg(test) 旁路（ensure_loaded 在无 tauri runtime 环境可能阻塞）
+    #[cfg(not(test))]
+    {
+        let n = lease_release_by_share(share_id, "explicit_config");
+        if n > 0 {
+            eprintln!("[vnet-keep] card closed: share={share_id} released {n} leases");
+        }
+    }
+}
